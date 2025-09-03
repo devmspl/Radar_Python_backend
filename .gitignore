@@ -12,8 +12,6 @@ venv/
 *.db
 *.sqlite3
 
-# Environment variables
-
 
 # IDE settings
 .vscode/
