@@ -13,7 +13,7 @@ venv/
 *.sqlite3
 
 # Environment variables
-.env
+
 
 # IDE settings
 .vscode/
