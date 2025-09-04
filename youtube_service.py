@@ -15,7 +15,6 @@ from database import get_db_session
 from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
 import utils
-COOKIES_FILE = "/var/www/client-projects/rohit/radar_backend/python_project/cookies.txt"
 
 # Initialize BART summarization model
 try:
@@ -32,6 +31,21 @@ except Exception as e:
 # Global variables
 MODEL_CACHE = {}
 background_executor = ThreadPoolExecutor(max_workers=3)
+
+# Path to exported YouTube cookies
+COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookies.txt"
+
+def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
+    """Return yt-dlp options with cookies support"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
 
 def get_whisper_model(model_size: str):
     """Get Whisper model from cache or load it"""
@@ -57,7 +71,6 @@ def extract_video_id(url: str) -> Optional[str]:
         r"youtu\.be/([^?]+)",
         r"youtube\.com/embed/([^/?]+)"
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
@@ -70,76 +83,60 @@ def extract_playlist_id(url: str) -> Optional[str]:
         r"list=([^&]+)",
         r"youtube\.com/playlist\?list=([^&]+)"
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
     return None
 
-def get_ydl_opts(extra_opts=None):
-    """Base yt-dlp options with cookies support"""
-    base_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "cookiefile": COOKIES_FILE,
-    }
-    if extra_opts:
-        base_opts.update(extra_opts)
-    return base_opts
-
-
 def get_playlist_name(playlist_url: str) -> str:
     """Get playlist name using yt-dlp"""
     try:
-        opts = get_ydl_opts({
+        ydl_opts = {
             "extract_flat": True,
             "skip_download": True,
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        }
+        with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(playlist_url, download=False)
             return info.get("title", "Unknown Playlist")
     except Exception as e:
         print(f"Error getting playlist name: {e}")
         return "Unknown Playlist"
 
-
 def get_channel_name(channel_url: str) -> str:
     """Get channel name using yt-dlp"""
     try:
-        opts = get_ydl_opts({
+        ydl_opts = {
             "extract_flat": True,
             "skip_download": True,
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        }
+        with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(channel_url, download=False)
-            return info.get("title") or info.get("uploader", "Unknown Channel")
+            return info.get("title", "Unknown Channel") or info.get("uploader", "Unknown Channel")
     except Exception as e:
         print(f"Error getting channel name: {e}")
         return "Unknown Channel"
 
-
 def get_youtube_title(url: str) -> str:
     """Extract YouTube video title using yt-dlp"""
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+        with yt_dlp.YoutubeDL(get_yt_opts()) as ydl:
             info_dict = ydl.extract_info(url, download=False)
             return info_dict.get("title", "Unknown Title")
     except Exception as e:
         print(f"Error getting YouTube title: {e}")
         return "Unknown Title"
 
-
 def get_playlist_videos_ytdlp(playlist_url: str) -> List[Dict]:
     """Get videos from a playlist using yt-dlp"""
-    opts = get_ydl_opts({
+    ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
         "ignoreerrors": True,
         "force_json": True,
-    })
+    }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(playlist_url, download=False)
             videos = []
             if "entries" in info:
@@ -148,39 +145,35 @@ def get_playlist_videos_ytdlp(playlist_url: str) -> List[Dict]:
                         video_id = entry.get("id")
                         video_title = entry.get("title", "Unknown Title")
                         video_url = f"https://www.youtube.com/watch?v={video_id}"
-                        videos.append({
-                            "id": video_id,
-                            "title": video_title,
-                            "url": video_url,
-                        })
+                        videos.append({"id": video_id, "title": video_title, "url": video_url})
             return videos
     except Exception as e:
         print(f"Error getting playlist videos: {e}")
         return []
 
-
 def get_channel_playlists_ytdlp(channel_url: str) -> List[Dict]:
     """Get all playlists from a YouTube channel using yt-dlp"""
-    opts = get_ydl_opts({
+    ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-    })
+        "extractor_args": {"youtube": {"skip": ["webpage", "auth", "webpage", "webpage", "webpage"]}}
+    }
     try:
         if "/playlists" not in channel_url:
             channel_url = channel_url.rstrip("/") + "/playlists"
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(channel_url, download=False)
             playlists = []
             if "entries" in info:
                 for entry in info["entries"]:
                     if entry and "url" in entry:
-                        playlist_id = entry["url"].split("list=")[-1]
-                        playlists.append({
-                            "id": playlist_id,
-                            "title": entry.get("title", f"Playlist {playlist_id}"),
-                            "url": entry["url"],
-                        })
+                        playlist_id = extract_playlist_id(entry["url"])
+                        if playlist_id:
+                            playlists.append({
+                                "id": playlist_id,
+                                "title": entry.get("title", f"Playlist {playlist_id}"),
+                                "url": entry["url"]
+                            })
             return playlists
     except Exception as e:
         print(f"Error getting channel playlists: {e}")
@@ -190,11 +183,10 @@ def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Opt
     """Download audio from YouTube video"""
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{video_id}.wav")
-
-    # Return cached file if already downloaded
+    
     if os.path.exists(output_file):
         return output_file
-
+    
     ydl_opts = {
         "format": "bestaudio/best",
         "postprocessors": [{
@@ -203,16 +195,11 @@ def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Opt
             "preferredquality": "192",
         }],
         "outtmpl": os.path.join(output_dir, f"{video_id}.%(ext)s"),
-        "cookiefile": COOKIES_FILE,   # 🔑 Add cookies
-        "quiet": False,
-        "no_warnings": False,
     }
-
+    
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-
-        # Ensure we return the actual file path
         if os.path.exists(output_file):
             return output_file
         else:
@@ -224,6 +211,7 @@ def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Opt
     except Exception as e:
         print(f"Error downloading audio for {video_id}: {e}")
         return None
+
 def transcribe_audio(audio_file: str, model_size: str = "base") -> Optional[str]:
     """Transcribe audio using Whisper"""
     try:
@@ -239,6 +227,7 @@ def transcribe_audio(audio_file: str, model_size: str = "base") -> Optional[str]
     except Exception as e:
         print(f"Error transcribing audio {audio_file}: {e}")
         return None
+
 
 def summarize_with_bart(text: str, max_length: int = 150, min_length: int = 30) -> str:
     """Summarize text using Facebook's BART model"""
