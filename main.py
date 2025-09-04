@@ -158,7 +158,25 @@ async def login(user_data: schemas.UserLogin, db: Session = Depends(get_db)):
     
     # Generate token
     access_token = utils.create_access_token(data={"sub": db_user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": db_user.id,
+        "full_name": db_user.full_name,
+        "last_name": db_user.last_name,
+        "role": "admin" if db_user.is_admin else "user"
+    }
+
+@app.get("/users/{user_id}", response_model=schemas.UserResponse)
+async def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    return db_user
 @app.post("/forgot-password")
 async def forgot_password(
     email_data: schemas.OTPRequest, 
