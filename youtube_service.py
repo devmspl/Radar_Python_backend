@@ -42,10 +42,14 @@ def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
         "no_warnings": True,
     }
     if os.path.exists(COOKIES_FILE):
+        print(f"✅ Using cookies from {COOKIES_FILE}")
         opts["cookiefile"] = COOKIES_FILE
+    else:
+        print(f"⚠️ No cookies file found at {COOKIES_FILE}")
     if extra_opts:
         opts.update(extra_opts)
     return opts
+
 
 def get_whisper_model(model_size: str):
     """Get Whisper model from cache or load it"""
@@ -122,9 +126,16 @@ def get_youtube_title(url: str) -> str:
     try:
         with yt_dlp.YoutubeDL(get_yt_opts()) as ydl:
             info_dict = ydl.extract_info(url, download=False)
-            return info_dict.get("title", "Unknown Title")
+            title = info_dict.get("title")
+            if not title:
+                raise RuntimeError("yt-dlp returned no title (cookies may be invalid or expired)")
+            return title
     except Exception as e:
-        print(f"Error getting YouTube title: {e}")
+        print(f"❌ Error getting YouTube title for {url}: {e}")
+        if os.path.exists(COOKIES_FILE):
+            print("   🔎 Cookies file exists, but might be expired or missing auth tokens (SID/HSID/SSID).")
+        else:
+            print("   ⚠️ No cookies file found at runtime.")
         return "Unknown Title"
 
 def get_playlist_videos_ytdlp(playlist_url: str) -> List[Dict]:
