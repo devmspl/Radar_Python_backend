@@ -33,7 +33,7 @@ MODEL_CACHE = {}
 background_executor = ThreadPoolExecutor(max_workers=3)
 
 # Path to exported YouTube cookies
-COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookies.txt"
+COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookie.txt"
 
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
     """Return yt-dlp options with cookies support"""
