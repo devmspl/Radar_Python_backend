@@ -6,7 +6,7 @@ from database import get_db
 from dependencies import get_current_user
 import models
 import schemas
-from youtube_service import create_transcript_job, get_job_status_service,fetch_job_content,fetch_playlist_video,fetch_channel_playlist_video
+from youtube_service import create_transcript_job, get_job_status_service,fetch_job_content,fetch_playlist_video,fetch_channel_playlist_video,get_youtube_title
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
 
@@ -112,26 +112,55 @@ async def get_job_content(
 ):
     """Get channel playlists, playlist videos, or video transcript depending on job type"""
     return fetch_job_content(db, job_id, current_user.id)
-@router.get(
-    "/job/{job_id}/playlist/{video_id}",
-    response_model=schemas.PlaylistVideosResponse
-)
-def get_playlist_video(
-    job_id: str,
+# @router.get(
+#     "/job/{job_id}/playlist/{video_id}",
+#     response_model=schemas.PlaylistVideosResponse
+# )
+# def get_playlist_video(
+#     job_id: str,
+#     video_id: str,
+#     db: Session = Depends(get_db),
+#     current_user: models.User = Depends(get_current_user),
+# ):
+#     return fetch_playlist_video(db, job_id, video_id, current_user.id)
+# @router.get(
+#     "/job/{job_id}/channel/{playlist_id}/video/{video_id}",
+#     response_model=schemas.PlaylistVideosResponse
+# )
+# def get_channel_playlist_video(
+#     job_id: str,
+#     playlist_id: str,
+#     video_id: str,
+#     db: Session = Depends(get_db),
+#     current_user: models.User = Depends(get_current_user),
+# ):
+#     return fetch_channel_playlist_video(db, job_id, playlist_id, video_id, current_user.id)
+@router.get("/video/{video_id}", response_model=schemas.VideoTranscriptResponse)
+def get_video_by_id(
     video_id: str,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user)
 ):
-    return fetch_playlist_video(db, job_id, video_id, current_user.id)
-@router.get(
-    "/job/{job_id}/channel/{playlist_id}/video/{video_id}",
-    response_model=schemas.PlaylistVideosResponse
-)
-def get_channel_playlist_video(
-    job_id: str,
-    playlist_id: str,
-    video_id: str,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    return fetch_channel_playlist_video(db, job_id, playlist_id, video_id, current_user.id)
+    """Fetch a single video and its transcript by video_id"""
+    # Find transcript for this video
+    transcript_obj = db.query(models.Transcript).filter(models.Transcript.video_id == video_id).first()
+
+    if not transcript_obj:
+        raise HTTPException(status_code=404, detail="Transcript not found for this video")
+
+    # Get video metadata (title, description, etc.)
+    video_title = transcript_obj.title or get_youtube_title(f"https://www.youtube.com/watch?v={video_id}")
+
+    video_data = schemas.VideoWithTranscript(
+        id=video_id,
+        title=video_title,
+        description=transcript_obj.description,
+        duration=(
+            int(transcript_obj.duration)
+            if transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            else None
+        ),
+        transcript=transcript_obj.transcript_text
+    )
+
+    return schemas.VideoTranscriptResponse(video_id=video_id, video=video_data)

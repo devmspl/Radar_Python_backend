@@ -16,7 +16,7 @@ from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
 from schemas import (
     ChannelPlaylistsResponse, PlaylistVideosResponse, VideoTranscriptResponse,
-    VideoWithTranscript,JobSimpleStatusResponse,JobContentStatusResponse
+    VideoWithTranscript,JobSimpleStatusResponse,JobContentStatusResponse,PlaylistVideo,ChannelPlaylist
 )
 import utils
 
@@ -570,7 +570,7 @@ def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse
         processed_items=processed_items,
         total_items=total_items,
         type=job.type,
-        content=content
+        # content=content
     )
 
 
@@ -586,40 +586,70 @@ def fetch_job_content(db: Session, job_id: str, user_id: int):
 
         for pl in playlists:
             videos = get_playlist_videos_ytdlp(pl["url"])
-            enriched_playlists.append({
-                "id": pl["id"],
-                "title": pl["title"],
-                "description": pl.get("description"),
-                "videos": videos  # attach videos inside playlist
-            })
+            video_items = [
+                PlaylistVideo(
+                    video_id=v["id"],   # ✅ map correctly
+                    title=v["title"]
+                )
+                for v in videos
+            ]
+            enriched_playlists.append(
+                ChannelPlaylist(
+                    id=pl["id"],
+                    title=pl["title"],
+                    description=pl.get("description"),
+                    videos=video_items
+                )
+            )
 
-        return ChannelPlaylistsResponse(channel_id=job.url, playlists=enriched_playlists)
+        return ChannelPlaylistsResponse(
+            channel_id=job.url,
+            playlists=enriched_playlists
+        )
 
     elif job.type == ContentType.PLAYLIST:
+        playlist_id = extract_playlist_id(job.url)
         videos = get_playlist_videos_ytdlp(job.url)
-        playlist_id = extract_playlist_id(job.url) or job.job_id
-        return PlaylistVideosResponse(playlist_id=playlist_id, videos=videos)
+
+        video_items = [
+            PlaylistVideo(
+                video_id=v["id"],
+                title=v["title"]
+            )
+            for v in videos
+        ]
+
+        return PlaylistVideosResponse(
+            playlist_id=playlist_id,
+            playlist_name=job.content_name,
+            videos=video_items
+        )
 
     elif job.type == ContentType.VIDEO:
         transcript_obj = db.query(Transcript).filter_by(job_id=job.id).first()
         video_id = extract_video_id(job.url)
         video_title = get_youtube_title(job.url)
 
-        video_data = {
-            "id": video_id,
-            "title": video_title,
-            "description": transcript_obj.description if transcript_obj else None,
-            "duration": (
-                int(transcript_obj.duration)
-                if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
-                else None
-            ),
-            "transcript": transcript_obj.transcript_text if transcript_obj else None,
-        }
-        return VideoTranscriptResponse(video_id=video_id, video=video_data)
+        video_data = VideoWithTranscript(   # ✅ use Pydantic model instead of dict
+            id=video_id,
+            title=video_title,
+            # description=transcript_obj.description if transcript_obj else None,
+            # duration=(
+            #     int(transcript_obj.duration)
+            #     if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            #     else None
+            # ),
+            # transcript=transcript_obj.transcript_text if transcript_obj else None,
+        )
+
+        return VideoTranscriptResponse(
+            video_id=video_id,
+            video=video_data
+        )
 
     else:
         raise HTTPException(status_code=400, detail="Unsupported content type")
+
 
 def fetch_playlist_video(db: Session, job_id: str, video_id: str, user_id: int):
     """Fetch a single video from a playlist with transcript, description, and duration."""
