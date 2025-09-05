@@ -131,3 +131,68 @@ class JobStatusResponse(BaseModel):
     
     class Config:
         from_attributes = True
+class JobSimpleStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    processed_items: Optional[int] = None
+    total_items: Optional[int] = None
+
+
+# --- YouTube Channel / Playlist / Video Schemas ---
+class PlaylistBase(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+
+
+class VideoBase(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    duration: Optional[int] = None   # store seconds for simplicity
+
+
+class VideoWithTranscript(VideoBase):
+    transcript: Optional[str] = None
+
+
+class ChannelPlaylistsResponse(BaseModel):
+    channel_id: str
+    playlists: List[PlaylistBase]
+
+
+class PlaylistVideosResponse(BaseModel):
+    video_id: str
+    title: str
+    description: Optional[str] = None
+    duration: Optional[int] = None
+    transcript: Optional[str] = None
+
+
+
+class VideoTranscriptResponse(BaseModel):
+    video_id: str
+    video: VideoWithTranscript
+
+class PlaylistVideo(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    duration: Optional[int] = None
+
+class ChannelPlaylist(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    videos: List[PlaylistVideo] = []
+
+class ChannelPlaylistsResponse(BaseModel):
+    channel_id: str
+    playlists: List[ChannelPlaylist]
+class JobContentStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    processed_items: Optional[int] = None
+    total_items: Optional[int] = None
+    type: ContentType
+    content: Dict

@@ -14,6 +14,10 @@ from transformers import pipeline, BartForConditionalGeneration, BartTokenizer
 from database import get_db_session
 from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
+from schemas import (
+    ChannelPlaylistsResponse, PlaylistVideosResponse, VideoTranscriptResponse,
+    VideoWithTranscript,JobSimpleStatusResponse,JobContentStatusResponse
+)
 import utils
 
 # Initialize BART summarization model
@@ -527,50 +531,147 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-def get_job_status_service(db: Session, job_id: str) -> JobStatusResponse:
-    """Get job status and results"""
-    # Refresh the session to get latest data
-    db.expire_all()
-    
+def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse:
     job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
-    
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    db.refresh(job)
-    # Get playlists if available
-    playlists = []
-    if job.playlists:
-        try:
-            playlists = json.loads(job.playlists)
-        except json.JSONDecodeError:
-            pass
-    
-    # Get transcripts
-    transcripts = []
-    for transcript in job.transcripts:
-        transcripts.append({
-            'id': transcript.transcript_id,
-            'video_id': transcript.video_id,
-            'playlist_id': transcript.playlist_id,
-            'title': transcript.title,
-            'transcript': transcript.transcript_text,
-            'duration': transcript.duration,
-            'word_count': transcript.word_count,
-            'created_at': transcript.created_at,
-            'description': transcript.description
-        })
-    
-    return JobStatusResponse(
+
+    transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
+    processed_items = job.processed_items or len(transcripts)
+    total_items = job.total_items or (len(transcripts) if job.type == ContentType.VIDEO else 0)
+
+    content = {}
+
+    if job.type == ContentType.CHANNEL:
+        playlists = json.loads(job.playlists or "[]")
+        channel_content = []
+        for pl in playlists:
+            pl_videos = get_playlist_videos_ytdlp(pl["url"])
+            channel_content.append({
+                "id": pl["id"],
+                "title": pl["title"],
+                "videos": [v["title"] for v in pl_videos]
+            })
+        content = {"playlists": channel_content}
+
+    elif job.type == ContentType.PLAYLIST:
+        videos = get_playlist_videos_ytdlp(job.url)
+        content = {
+            "playlist_name": job.content_name,
+            "videos": [v["title"] for v in videos]
+        }
+
+    elif job.type == ContentType.VIDEO:
+        content = {"video_title": job.content_name}
+
+    return JobContentStatusResponse(
         job_id=job.job_id,
-        url=job.url,
-        type=job.type,
         status=job.status,
-        created_at=job.created_at,
-        completed_at=job.completed_at,
-        total_items=job.total_items,
-        processed_items=job.processed_items,
-        description=job.description,
-        content_name=job.content_name,
-        playlists=playlists,
-        transcripts=transcripts
+        processed_items=processed_items,
+        total_items=total_items,
+        type=job.type,
+        content=content
     )
+
+
+def fetch_job_content(db: Session, job_id: str, user_id: int):
+    """Fetch channel playlists, playlist videos, or video transcript based on job type."""
+    job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.type == ContentType.CHANNEL:
+        playlists = get_channel_playlists_ytdlp(job.url)
+        enriched_playlists = []
+
+        for pl in playlists:
+            videos = get_playlist_videos_ytdlp(pl["url"])
+            enriched_playlists.append({
+                "id": pl["id"],
+                "title": pl["title"],
+                "description": pl.get("description"),
+                "videos": videos  # attach videos inside playlist
+            })
+
+        return ChannelPlaylistsResponse(channel_id=job.url, playlists=enriched_playlists)
+
+    elif job.type == ContentType.PLAYLIST:
+        videos = get_playlist_videos_ytdlp(job.url)
+        playlist_id = extract_playlist_id(job.url) or job.job_id
+        return PlaylistVideosResponse(playlist_id=playlist_id, videos=videos)
+
+    elif job.type == ContentType.VIDEO:
+        transcript_obj = db.query(Transcript).filter_by(job_id=job.id).first()
+        video_id = extract_video_id(job.url)
+        video_title = get_youtube_title(job.url)
+
+        video_data = {
+            "id": video_id,
+            "title": video_title,
+            "description": transcript_obj.description if transcript_obj else None,
+            "duration": (
+                int(transcript_obj.duration)
+                if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+                else None
+            ),
+            "transcript": transcript_obj.transcript_text if transcript_obj else None,
+        }
+        return VideoTranscriptResponse(video_id=video_id, video=video_data)
+
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported content type")
+
+def fetch_playlist_video(db: Session, job_id: str, video_id: str, user_id: int):
+    """Fetch a single video from a playlist with transcript, description, and duration."""
+    job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
+    if not job or job.type != ContentType.PLAYLIST:
+        raise HTTPException(status_code=404, detail="Playlist job not found")
+
+    # Get transcript for this video
+    transcript_obj = (
+        db.query(Transcript)
+        .filter_by(job_id=job.id, video_id=video_id)
+        .first()
+    )
+
+    # Get video title via yt-dlp if transcript not in DB yet
+    title = get_youtube_title(f"https://www.youtube.com/watch?v={video_id}")
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "description": transcript_obj.description if transcript_obj else None,
+        "duration": (
+            int(transcript_obj.duration)
+            if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            else None
+        ),
+        "transcript": transcript_obj.transcript_text if transcript_obj else None,
+    }
+def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, video_id: str, user_id: int):
+    """Fetch a video from a channel's playlist with transcript, description, and duration."""
+    job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
+    if not job or job.type != ContentType.CHANNEL:
+        raise HTTPException(status_code=404, detail="Channel job not found")
+
+    # Find transcript if already processed
+    transcript_obj = (
+        db.query(Transcript)
+        .filter_by(job_id=job.id, video_id=video_id, playlist_id=playlist_id)
+        .first()
+    )
+
+    # Fallback: fetch metadata with yt-dlp
+    title = get_youtube_title(f"https://www.youtube.com/watch?v={video_id}")
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "description": transcript_obj.description if transcript_obj else None,
+        "duration": (
+            int(transcript_obj.duration)
+            if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            else None
+        ),
+        "transcript": transcript_obj.transcript_text if transcript_obj else None,
+    }
