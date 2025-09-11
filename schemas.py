@@ -127,7 +127,7 @@ class JobStatusResponse(BaseModel):
     description: Optional[str] = None
     content_name: Optional[str] = None
     playlists: List[Dict] = []
-    transcripts: List[TranscriptItem] = []
+    # transcripts: List[TranscriptItem] = []
     
     class Config:
         from_attributes = True
