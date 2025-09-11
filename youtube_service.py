@@ -55,31 +55,28 @@ def refresh_cookies():
         print(f"❌ Failed to refresh cookies: {e}")
 
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options, auto-refresh cookies if missing"""
+    """Return yt-dlp options with cookies support"""
     opts = {
         "quiet": True,
         "no_warnings": True,
     }
 
-    # Refresh cookies if missing or too old
-    if not os.path.exists(COOKIES_FILE):
-        print(f"⚠️ No cookies file found at {COOKIES_FILE}, refreshing...")
-        refresh_cookies()
-    else:
-        # Optional: refresh if older than 6 hours
-        max_age = 6 * 3600  # seconds
-        age = time.time() - os.path.getmtime(COOKIES_FILE)
-        if age > max_age:
-            print(f"⚠️ Cookies file is older than {max_age/3600} hours, refreshing...")
-            refresh_cookies()
+    try:
+        # Prefer using browser cookies
+        opts["cookiesfrombrowser"] = ("chrome",)
+        print("✅ Using cookies directly from Chrome browser")
+    except Exception:
+        # Fallback to cookie.txt if exists
+        if os.path.exists(COOKIES_FILE):
+            print(f"⚠️ Falling back to cookies file {COOKIES_FILE}")
+            opts["cookiefile"] = COOKIES_FILE
         else:
-            print(f"✅ Using cookies from {COOKIES_FILE}")
-
-    opts["cookiefile"] = COOKIES_FILE
+            print(f"❌ No cookies available")
 
     if extra_opts:
         opts.update(extra_opts)
     return opts
+
 
 
 
