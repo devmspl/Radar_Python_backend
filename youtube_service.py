@@ -734,6 +734,12 @@ def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, vid
         "transcript": transcript_obj.transcript_text if transcript_obj else None,
     }
 def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
+    opts = get_yt_opts()
+    info = yt_dlp.YoutubeDL(opts).extract_info(channel_url, download=False)
+
+    channel_title = info.get("title") or "Untitled Channel"
+    channel_description = info.get("description") or ""
+
     playlists = get_channel_playlists_ytdlp(channel_url)
     enriched_playlists = []
 
@@ -743,7 +749,7 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
             ChannelPlaylist(
                 id=pl["id"],
                 title=pl["title"],
-                description=pl.get("description"),
+                description=pl.get("description") or "",
                 videos=[
                     PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos
                 ],
@@ -752,19 +758,19 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
 
     return ChannelWithPlaylists(
         channel_id=channel_url,
-        title=None,  # optional: fetch channel title with yt-dlp if you want
-        description=None,
+        title=channel_title,
+        description=channel_description,
         playlists=enriched_playlists,
     )
 
 
 def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
-    playlist_id = extract_playlist_id(playlist_url)
+    opts = get_yt_opts()
+    info = yt_dlp.YoutubeDL(opts).extract_info(playlist_url, download=False)
 
-    # fetch metadata with yt-dlp
-    info = yt_dlp.YoutubeDL({"quiet": True}).extract_info(playlist_url, download=False)
-    playlist_title = info.get("title")
-    playlist_description = info.get("description")
+    playlist_id = extract_playlist_id(playlist_url)
+    playlist_title = info.get("title") or "Untitled Playlist"
+    playlist_description = info.get("description") or ""
 
     videos = get_playlist_videos_ytdlp(playlist_url)
 
@@ -774,3 +780,4 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
         description=playlist_description,
         videos=[PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos],
     )
+
