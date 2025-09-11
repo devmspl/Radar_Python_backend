@@ -6,7 +6,7 @@ from database import get_db
 from dependencies import get_current_user
 import models
 import schemas
-from youtube_service import create_transcript_job, get_job_status_service,fetch_job_content,fetch_playlist_video,fetch_channel_playlist_video,get_youtube_title
+from youtube_service import *
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
 
@@ -164,3 +164,15 @@ def get_video_by_id(
     )
 
     return schemas.VideoTranscriptResponse(video_id=video_id, video=video_data)
+@router.get("/channel/{channel_id}", response_model=schemas.ChannelWithPlaylists)
+def get_channel_by_id(channel_id: str):
+    """Fetch channel details with playlists and videos"""
+    channel_url = f"https://www.youtube.com/{channel_id}"
+    return fetch_channel_by_id(channel_url)
+
+
+@router.get("/playlist/{playlist_id}", response_model=schemas.PlaylistWithVideos)
+def get_playlist_by_id(playlist_id: str):
+    """Fetch playlist details with its videos"""
+    playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    return fetch_playlist_by_id(playlist_url)

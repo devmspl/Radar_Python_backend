@@ -189,3 +189,15 @@ class JobContentStatusResponse(BaseModel):
     total_items: Optional[int] = None
     type: ContentType
     # content: Dict
+class ChannelWithPlaylists(BaseModel):
+    channel_id: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    playlists: List[ChannelPlaylist] = []
+
+
+class PlaylistWithVideos(BaseModel):
+    playlist_id: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    videos: List[PlaylistVideo] = []

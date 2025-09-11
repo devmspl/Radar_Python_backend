@@ -14,10 +14,7 @@ from transformers import pipeline, BartForConditionalGeneration, BartTokenizer
 from database import get_db_session
 from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
-from schemas import (
-    ChannelPlaylistsResponse, PlaylistVideosResponse, VideoTranscriptResponse,
-    VideoWithTranscript,JobSimpleStatusResponse,JobContentStatusResponse,PlaylistVideo,ChannelPlaylist
-)
+from schemas import *
 import utils
 
 # Initialize BART summarization model
@@ -705,3 +702,44 @@ def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, vid
         ),
         "transcript": transcript_obj.transcript_text if transcript_obj else None,
     }
+def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
+    playlists = get_channel_playlists_ytdlp(channel_url)
+    enriched_playlists = []
+
+    for pl in playlists:
+        videos = get_playlist_videos_ytdlp(pl["url"])
+        enriched_playlists.append(
+            ChannelPlaylist(
+                id=pl["id"],
+                title=pl["title"],
+                description=pl.get("description"),
+                videos=[
+                    PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos
+                ],
+            )
+        )
+
+    return ChannelWithPlaylists(
+        channel_id=channel_url,
+        title=None,  # optional: fetch channel title with yt-dlp if you want
+        description=None,
+        playlists=enriched_playlists,
+    )
+
+
+def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
+    playlist_id = extract_playlist_id(playlist_url)
+
+    # fetch metadata with yt-dlp
+    info = yt_dlp.YoutubeDL({"quiet": True}).extract_info(playlist_url, download=False)
+    playlist_title = info.get("title")
+    playlist_description = info.get("description")
+
+    videos = get_playlist_videos_ytdlp(playlist_url)
+
+    return PlaylistWithVideos(
+        playlist_id=playlist_id,
+        title=playlist_title,
+        description=playlist_description,
+        videos=[PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos],
+    )
