@@ -36,20 +36,51 @@ background_executor = ThreadPoolExecutor(max_workers=3)
 # Path to exported YouTube cookies
 COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookie.txt"
 
+import subprocess
+import time
+
+def refresh_cookies():
+    """Refresh cookies from Chrome and save to COOKIES_FILE"""
+    print("🔄 Refreshing cookies from Chrome...")
+    try:
+        subprocess.run([
+            "yt-dlp",
+            "--cookies-from-browser", "chrome",
+            "--cookies", COOKIES_FILE,
+            "--skip-download",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # dummy video
+        ], check=True)
+        print(f"✅ Cookies refreshed successfully: {COOKIES_FILE}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to refresh cookies: {e}")
+
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options with cookies support"""
+    """Return yt-dlp options, auto-refresh cookies if missing"""
     opts = {
         "quiet": True,
         "no_warnings": True,
     }
-    if os.path.exists(COOKIES_FILE):
-        print(f"✅ Using cookies from {COOKIES_FILE}")
-        opts["cookiefile"] = COOKIES_FILE
+
+    # Refresh cookies if missing or too old
+    if not os.path.exists(COOKIES_FILE):
+        print(f"⚠️ No cookies file found at {COOKIES_FILE}, refreshing...")
+        refresh_cookies()
     else:
-        print(f"⚠️ No cookies file found at {COOKIES_FILE}")
+        # Optional: refresh if older than 6 hours
+        max_age = 6 * 3600  # seconds
+        age = time.time() - os.path.getmtime(COOKIES_FILE)
+        if age > max_age:
+            print(f"⚠️ Cookies file is older than {max_age/3600} hours, refreshing...")
+            refresh_cookies()
+        else:
+            print(f"✅ Using cookies from {COOKIES_FILE}")
+
+    opts["cookiefile"] = COOKIES_FILE
+
     if extra_opts:
         opts.update(extra_opts)
     return opts
+
 
 
 def get_whisper_model(model_size: str):

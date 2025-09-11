@@ -17,3 +17,6 @@ transformers==4.36.2
 torch==2.2.1
 aiofiles==23.2.1
 pydantic-settings
+secretstorage
+keyring
+pycryptodomex
