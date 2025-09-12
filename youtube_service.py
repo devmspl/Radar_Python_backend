@@ -40,12 +40,28 @@ import subprocess
 import time
 
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options with cookies"""
+    """Return yt-dlp options with cookies, with fallback if cookies are invalid"""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "cookies": COOKIES_FILE,   # ✅ always use synced cookie.txt
     }
+    
+    # Only add cookies if the file exists and is valid
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+        try:
+            # Basic validation - check if it looks like a cookie file
+            with open(COOKIES_FILE, 'r') as f:
+                first_line = f.readline().strip()
+                if first_line.startswith('# HTTP Cookie File') or first_line.startswith('# Netscape HTTP Cookie File'):
+                    opts["cookies"] = COOKIES_FILE
+                    print("✅ Using cookies file for authentication")
+                else:
+                    print("⚠️  Cookie file exists but doesn't appear to be in Netscape format")
+        except Exception as e:
+            print(f"⚠️  Error reading cookie file: {e}")
+    else:
+        print("⚠️  Cookie file not found or empty, proceeding without authentication")
+    
     if extra_opts:
         opts.update(extra_opts)
     return opts
@@ -754,3 +770,31 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
         videos=[PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos],
     )
 
+def validate_youtube_cookies():
+    """Validate if YouTube cookies are working"""
+    test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # Famous first YouTube video
+    
+    try:
+        # Test with cookies
+        opts_with_cookies = get_yt_opts()
+        with yt_dlp.YoutubeDL(opts_with_cookies) as ydl:
+            info = ydl.extract_info(test_url, download=False)
+            if info.get('title'):
+                print("✅ Cookies are working correctly")
+                return True
+    except Exception as e:
+        print(f"❌ Cookies validation failed: {e}")
+        
+        # Test without cookies
+        try:
+            opts_no_cookies = {"quiet": True, "no_warnings": True}
+            with yt_dlp.YoutubeDL(opts_no_cookies) as ydl:
+                info = ydl.extract_info(test_url, download=False)
+                if info.get('title'):
+                    print("ℹ️  Can access YouTube without cookies (but may have limitations)")
+                    return False
+        except Exception as no_cookie_error:
+            print(f"❌ Cannot access YouTube even without cookies: {no_cookie_error}")
+            return False
+    
+    return False
