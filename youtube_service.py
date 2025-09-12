@@ -44,7 +44,7 @@ def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "cookiefile": COOKIES_FILE,   # ✅ always use synced cookie.txt
+        "cookies": COOKIES_FILE,   # ✅ always use synced cookie.txt
     }
     if extra_opts:
         opts.update(extra_opts)
