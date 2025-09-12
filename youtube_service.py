@@ -734,7 +734,10 @@ def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, vid
         "transcript": transcript_obj.transcript_text if transcript_obj else None,
     }
 def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
-    opts = get_yt_opts()
+    opts = {
+        "quiet": True,
+        "cookiefile": COOKIES_FILE,  # ✅ fixed here
+    }
     info = yt_dlp.YoutubeDL(opts).extract_info(channel_url, download=False)
 
     channel_title = info.get("title") or "Untitled Channel"
@@ -769,7 +772,7 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
 
     opts = {
         "quiet": True,
-        "cookies": COOKIES_FILE,
+        "cookiefile": COOKIES_FILE,  # ✅ fixed here
     }
 
     # fetch metadata with yt-dlp
