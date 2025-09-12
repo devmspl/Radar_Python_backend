@@ -765,12 +765,17 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
 
 
 def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
-    opts = get_yt_opts()
-    info = yt_dlp.YoutubeDL(opts).extract_info(playlist_url, download=False)
-
     playlist_id = extract_playlist_id(playlist_url)
-    playlist_title = info.get("title") or "Untitled Playlist"
-    playlist_description = info.get("description") or ""
+
+    opts = {
+        "quiet": True,
+        "cookies": COOKIES_FILE,
+    }
+
+    # fetch metadata with yt-dlp
+    info = yt_dlp.YoutubeDL(opts).extract_info(playlist_url, download=False)
+    playlist_title = info.get("title")
+    playlist_description = info.get("description")
 
     videos = get_playlist_videos_ytdlp(playlist_url)
 
