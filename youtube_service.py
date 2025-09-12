@@ -39,48 +39,16 @@ COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookie.txt"
 import subprocess
 import time
 
-def refresh_cookies():
-    """Refresh cookies from Chrome and save to COOKIES_FILE"""
-    print("🔄 Refreshing cookies from Chrome...")
-    try:
-        subprocess.run([
-            "yt-dlp",
-            "--cookies-from-browser", "chrome",
-            "--cookies", COOKIES_FILE,
-            "--skip-download",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # dummy video
-        ], check=True)
-        print(f"✅ Cookies refreshed successfully: {COOKIES_FILE}")
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to refresh cookies: {e}")
-
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options, auto-refresh cookies if missing"""
+    """Return yt-dlp options with cookies"""
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "cookiefile": COOKIES_FILE,   # ✅ always use synced cookie.txt
     }
-
-    # Refresh cookies if missing or too old
-    if not os.path.exists(COOKIES_FILE):
-        print(f"⚠️ No cookies file found at {COOKIES_FILE}, refreshing...")
-        refresh_cookies()
-    else:
-        # Optional: refresh if older than 6 hours
-        max_age = 6 * 3600  # seconds
-        age = time.time() - os.path.getmtime(COOKIES_FILE)
-        if age > max_age:
-            print(f"⚠️ Cookies file is older than {max_age/3600} hours, refreshing...")
-            refresh_cookies()
-        else:
-            print(f"✅ Using cookies from {COOKIES_FILE}")
-
-    opts["cookiefile"] = COOKIES_FILE
-
     if extra_opts:
         opts.update(extra_opts)
     return opts
-
 
 
 def get_whisper_model(model_size: str):
@@ -734,10 +702,8 @@ def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, vid
         "transcript": transcript_obj.transcript_text if transcript_obj else None,
     }
 def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
-    opts = {
-        "quiet": True,
-        "cookiefile": COOKIES_FILE,  # ✅ fixed here
-    }
+    """Fetch channel metadata + playlists + videos"""
+    opts = get_yt_opts()
     info = yt_dlp.YoutubeDL(opts).extract_info(channel_url, download=False)
 
     channel_title = info.get("title") or "Untitled Channel"
@@ -768,17 +734,16 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
 
 
 def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
+    """Fetch playlist metadata + videos"""
     playlist_id = extract_playlist_id(playlist_url)
 
-    opts = {
+    opts = get_yt_opts({
         "quiet": True,
-        "cookiefile": COOKIES_FILE,  # ✅ fixed here
-    }
+    })
 
-    # fetch metadata with yt-dlp
     info = yt_dlp.YoutubeDL(opts).extract_info(playlist_url, download=False)
-    playlist_title = info.get("title")
-    playlist_description = info.get("description")
+    playlist_title = info.get("title") or f"Playlist {playlist_id}"
+    playlist_description = info.get("description") or ""
 
     videos = get_playlist_videos_ytdlp(playlist_url)
 
