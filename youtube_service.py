@@ -34,7 +34,7 @@ MODEL_CACHE = {}
 background_executor = ThreadPoolExecutor(max_workers=3)
 
 # Path to exported YouTube cookies
-COOKIES_FILE = "cookie.txt"
+COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookie.txt"
 
 import subprocess
 import time
