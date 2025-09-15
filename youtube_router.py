@@ -180,7 +180,7 @@ def get_playlist_by_id(playlist_id: str):
 @router.get("/cookies/status")
 async def check_cookie_status():
     """Check if YouTube cookies are working"""
-    is_valid = validate_youtube_cookies()
+    is_valid = validate_cookie_file()
     cookie_exists = os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
     
     return {
