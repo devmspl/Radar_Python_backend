@@ -40,27 +40,23 @@ import subprocess
 import time
 
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options with cookies, with fallback if cookies are invalid"""
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "referer": "https://www.youtube.com/",
+        # Emergency fallback options
+        "extractor_args": {"youtube": {"skip": ["webpage", "auth"]}},
+        "force_ipv4": True,
     }
     
-    # Only add cookies if the file exists and is valid
-    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+    # Try cookies if available, but don't fail if they don't work
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:  # At least 100 bytes
         try:
-            # Basic validation - check if it looks like a cookie file
-            with open(COOKIES_FILE, 'r') as f:
-                first_line = f.readline().strip()
-                if first_line.startswith('# HTTP Cookie File') or first_line.startswith('# Netscape HTTP Cookie File'):
-                    opts["cookies"] = COOKIES_FILE
-                    print("✅ Using cookies file for authentication")
-                else:
-                    print("⚠️  Cookie file exists but doesn't appear to be in Netscape format")
-        except Exception as e:
-            print(f"⚠️  Error reading cookie file: {e}")
-    else:
-        print("⚠️  Cookie file not found or empty, proceeding without authentication")
+            opts["cookies"] = COOKIES_FILE
+            print("🔄 Attempting with cookies...")
+        except:
+            print("⚠️  Cookie file problematic, proceeding without")
     
     if extra_opts:
         opts.update(extra_opts)
