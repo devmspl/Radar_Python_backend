@@ -40,23 +40,31 @@ import subprocess
 import time
 
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
+    """Return yt-dlp options with cookies, with fallback if cookies are invalid"""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        # Add user agent to mimic browser behavior
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        # Add referer to appear more legitimate
         "referer": "https://www.youtube.com/",
-        # Emergency fallback options
-        "extractor_args": {"youtube": {"skip": ["webpage", "auth"]}},
-        "force_ipv4": True,
     }
     
-    # Try cookies if available, but don't fail if they don't work
-    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:  # At least 100 bytes
+    # Only add cookies if the file exists and is valid
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
         try:
-            opts["cookies"] = COOKIES_FILE
-            print("🔄 Attempting with cookies...")
-        except:
-            print("⚠️  Cookie file problematic, proceeding without")
+            with open(COOKIES_FILE, 'r') as f:
+                content = f.read()
+                # Basic validation
+                if any(line.startswith('.youtube.com') for line in content.split('\n') if line.strip() and not line.startswith('#')):
+                    opts["cookies"] = COOKIES_FILE
+                    print("✅ Using cookies file for authentication")
+                else:
+                    print("⚠️  Cookie file exists but doesn't contain valid YouTube cookies")
+        except Exception as e:
+            print(f"⚠️  Error reading cookie file: {e}")
+    else:
+        print("⚠️  Cookie file not found or empty, proceeding without authentication")
     
     if extra_opts:
         opts.update(extra_opts)
