@@ -1,23 +1,35 @@
 import os
-import json
-import whisper
-import yt_dlp
-from typing import List, Dict, Optional
 import re
 import uuid
+import json
+import time
+import torch
+import whisper
+import yt_dlp
+import subprocess
+from typing import List, Dict, Optional
 from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from concurrent.futures import ThreadPoolExecutor
-import torch
 from transformers import pipeline, BartForConditionalGeneration, BartTokenizer
+
 from database import get_db_session
 from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
 from schemas import *
 import utils
 
-# Initialize BART summarization model
+# ===========================
+# GLOBALS
+# ===========================
+MODEL_CACHE = {}
+background_executor = ThreadPoolExecutor(max_workers=3)
+COOKIES_FILE = "cookie.txt"
+
+# ===========================
+# BART SUMMARIZER
+# ===========================
 try:
     bart_model_name = "facebook/bart-large-cnn"
     print("Loading BART model...")
@@ -29,71 +41,96 @@ except Exception as e:
     print(f"Error loading BART model: {e}")
     summarizer = None
 
-# Global variables
-MODEL_CACHE = {}
-background_executor = ThreadPoolExecutor(max_workers=3)
 
-# Path to exported YouTube cookies
-COOKIES_FILE = "/var/www/client-projects/rohit/Radar_Python_backend/cookie.txt"
+# ===========================
+# COOKIE VALIDATION
+# ===========================
+def validate_cookie_file() -> bool:
+    """Ensure cookie file exists and contains critical auth cookies."""
+    required = {"SID", "HSID", "SSID", "SAPISID", "__Secure-3PSID"}
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        found = {
+            line.split("\t")[5]
+            for line in content.splitlines()
+            if not line.startswith("#") and "\t" in line
+        }
+        missing = required - found
+        if missing:
+            print(f"⚠️ Missing critical cookies: {missing}")
+            return False
+        return True
+    except Exception as e:
+        print(f"Error validating cookie file: {e}")
+        return False
 
-import subprocess
-import time
 
+# ===========================
+# YT-DLP OPTIONS WRAPPER
+# ===========================
 def get_yt_opts(extra_opts: Optional[dict] = None) -> dict:
-    """Return yt-dlp options optimized for headless server"""
+    """Return yt-dlp options optimized for headless server use."""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        # Critical: Use a residential-looking user agent
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
         "referer": "https://www.youtube.com/",
-        # Headless-specific options
         "extractor_args": {
             "youtube": {
-                "skip": ["webpage", "auth"],
-                "player_client": ["android", "web"],
+                # Do NOT skip auth if using cookies
+                "skip": ["webpage"],
+                "player_client": ["web"],
             }
         },
         "force_ipv4": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
-        # Retry settings
         "retries": 5,
         "fragment_retries": 5,
         "skip_unavailable_fragments": True,
-        # Throttle requests to avoid detection
         "throttledratelimit": 1000000,
-        # Simulate human behavior
         "sleep_interval": 2,
         "max_sleep_interval": 5,
     }
-    
-    # Only use cookies if they're valid
+
     if validate_cookie_file():
         opts["cookies"] = COOKIES_FILE
         print("✅ Using validated cookie file")
     else:
-        print("⚠️  Proceeding without cookies (may have limited access)")
-        # Add fallback options for no-cookie access
+        print("⚠️ Proceeding without cookies (may have limited access)")
         opts.update({
-            "extractor_args": {"youtube": {"skip": ["webpage", "auth", "consent"]}},
+            "extractor_args": {"youtube": {"skip": ["webpage", "consent"]}},
             "no_check_certificate": True,
         })
-    
+
     if extra_opts:
         opts.update(extra_opts)
     return opts
 
 
+# ===========================
+# MODEL HELPERS
+# ===========================
 def get_whisper_model(model_size: str):
     """Get Whisper model from cache or load it"""
     if model_size not in MODEL_CACHE:
         MODEL_CACHE[model_size] = whisper.load_model(model_size)
     return MODEL_CACHE[model_size]
 
+
+# ===========================
+# YOUTUBE HELPERS
+# ===========================
 def determine_content_type(url: str) -> ContentType:
     """Determine if URL is a channel, playlist, or video"""
-    if "youtube.com/channel/" in url or "youtube.com/c/" in url or "youtube.com/user/" in url or "youtube.com/@" in url:
+    if any(x in url for x in ["youtube.com/channel/", "youtube.com/c/", "youtube.com/user/", "youtube.com/@"]):
         return ContentType.CHANNEL
     elif "youtube.com/playlist" in url or "list=" in url:
         return ContentType.PLAYLIST
@@ -102,38 +139,32 @@ def determine_content_type(url: str) -> ContentType:
     else:
         raise HTTPException(status_code=400, detail="Unsupported YouTube URL format")
 
+
 def extract_video_id(url: str) -> Optional[str]:
-    """Extract video ID from YouTube URL"""
     patterns = [
         r"youtube\.com/watch\?v=([^&]+)",
         r"youtu\.be/([^?]+)",
-        r"youtube\.com/embed/([^/?]+)"
+        r"youtube\.com/embed/([^/?]+)",
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
     return None
+
 
 def extract_playlist_id(url: str) -> Optional[str]:
-    """Extract playlist ID from YouTube URL"""
-    patterns = [
-        r"list=([^&]+)",
-        r"youtube\.com/playlist\?list=([^&]+)"
-    ]
+    patterns = [r"list=([^&]+)", r"youtube\.com/playlist\?list=([^&]+)"]
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
     return None
 
+
 def get_playlist_name(playlist_url: str) -> str:
-    """Get playlist name using yt-dlp"""
     try:
-        ydl_opts = {
-            "extract_flat": True,
-            "skip_download": True,
-        }
+        ydl_opts = {"extract_flat": True, "skip_download": True}
         with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(playlist_url, download=False)
             return info.get("title", "Unknown Playlist")
@@ -141,13 +172,10 @@ def get_playlist_name(playlist_url: str) -> str:
         print(f"Error getting playlist name: {e}")
         return "Unknown Playlist"
 
+
 def get_channel_name(channel_url: str) -> str:
-    """Get channel name using yt-dlp"""
     try:
-        ydl_opts = {
-            "extract_flat": True,
-            "skip_download": True,
-        }
+        ydl_opts = {"extract_flat": True, "skip_download": True}
         with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(channel_url, download=False)
             return info.get("title", "Unknown Channel") or info.get("uploader", "Unknown Channel")
@@ -155,8 +183,8 @@ def get_channel_name(channel_url: str) -> str:
         print(f"Error getting channel name: {e}")
         return "Unknown Channel"
 
+
 def get_youtube_title(url: str) -> str:
-    """Extract YouTube video title using yt-dlp"""
     try:
         with yt_dlp.YoutubeDL(get_yt_opts()) as ydl:
             info_dict = ydl.extract_info(url, download=False)
@@ -172,14 +200,9 @@ def get_youtube_title(url: str) -> str:
             print("   ⚠️ No cookies file found at runtime.")
         return "Unknown Title"
 
+
 def get_playlist_videos_ytdlp(playlist_url: str) -> List[Dict]:
-    """Get videos from a playlist using yt-dlp"""
-    ydl_opts = {
-        "extract_flat": True,
-        "skip_download": True,
-        "ignoreerrors": True,
-        "force_json": True,
-    }
+    ydl_opts = {"extract_flat": True, "skip_download": True, "ignoreerrors": True, "force_json": True}
     try:
         with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(playlist_url, download=False)
@@ -196,16 +219,12 @@ def get_playlist_videos_ytdlp(playlist_url: str) -> List[Dict]:
         print(f"Error getting playlist videos: {e}")
         return []
 
+
 def get_channel_playlists_ytdlp(channel_url: str) -> List[Dict]:
-    """Get all playlists from a YouTube channel using yt-dlp"""
-    ydl_opts = {
-        "extract_flat": True,
-        "skip_download": True,
-        "extractor_args": {"youtube": {"skip": ["webpage", "auth", "webpage", "webpage", "webpage"]}}
-    }
     try:
         if "/playlists" not in channel_url:
             channel_url = channel_url.rstrip("/") + "/playlists"
+        ydl_opts = {"extract_flat": True, "skip_download": True}
         with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             info = ydl.extract_info(channel_url, download=False)
             playlists = []
@@ -217,21 +236,21 @@ def get_channel_playlists_ytdlp(channel_url: str) -> List[Dict]:
                             playlists.append({
                                 "id": playlist_id,
                                 "title": entry.get("title", f"Playlist {playlist_id}"),
-                                "url": entry["url"]
+                                "url": entry["url"],
                             })
             return playlists
     except Exception as e:
         print(f"Error getting channel playlists: {e}")
         return []
 
+
 def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Optional[str]:
-    """Download audio from YouTube video"""
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{video_id}.wav")
-    
+
     if os.path.exists(output_file):
         return output_file
-    
+
     ydl_opts = {
         "format": "bestaudio/best",
         "postprocessors": [{
@@ -241,7 +260,7 @@ def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Opt
         }],
         "outtmpl": os.path.join(output_dir, f"{video_id}.%(ext)s"),
     }
-    
+
     try:
         with yt_dlp.YoutubeDL(get_yt_opts(ydl_opts)) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
@@ -257,8 +276,11 @@ def download_youtube_audio(video_id: str, output_dir: str = "temp_audio") -> Opt
         print(f"Error downloading audio for {video_id}: {e}")
         return None
 
+
+# ===========================
+# WHISPER TRANSCRIPTION
+# ===========================
 def transcribe_audio(audio_file: str, model_size: str = "base") -> Optional[str]:
-    """Transcribe audio using Whisper"""
     try:
         if not os.path.exists(audio_file):
             return None
@@ -272,6 +294,7 @@ def transcribe_audio(audio_file: str, model_size: str = "base") -> Optional[str]
     except Exception as e:
         print(f"Error transcribing audio {audio_file}: {e}")
         return None
+
 
 
 def summarize_with_bart(text: str, max_length: int = 150, min_length: int = 30) -> str:
@@ -788,37 +811,37 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
         videos=[PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos],
     )
 
-def validate_cookie_file():
-    """Validate that cookie file contains necessary YouTube cookies"""
-    if not os.path.exists(COOKIES_FILE):
-        print("❌ Cookie file not found")
-        return False
+# def validate_cookie_file():
+#     """Validate that cookie file contains necessary YouTube cookies"""
+#     if not os.path.exists(COOKIES_FILE):
+#         print("❌ Cookie file not found")
+#         return False
     
-    try:
-        with open(COOKIES_FILE, 'r') as f:
-            content = f.read()
+#     try:
+#         with open(COOKIES_FILE, 'r') as f:
+#             content = f.read()
         
-        required_cookies = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID']
-        found_cookies = []
+#         required_cookies = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID']
+#         found_cookies = []
         
-        for line in content.split('\n'):
-            if line.strip() and not line.startswith('#'):
-                parts = line.split('\t')
-                if len(parts) >= 7 and '.youtube.com' in parts[0]:
-                    cookie_name = parts[5]
-                    if cookie_name in required_cookies:
-                        found_cookies.append(cookie_name)
+#         for line in content.split('\n'):
+#             if line.strip() and not line.startswith('#'):
+#                 parts = line.split('\t')
+#                 if len(parts) >= 7 and '.youtube.com' in parts[0]:
+#                     cookie_name = parts[5]
+#                     if cookie_name in required_cookies:
+#                         found_cookies.append(cookie_name)
         
-        print(f"Found YouTube cookies: {found_cookies}")
+#         print(f"Found YouTube cookies: {found_cookies}")
         
-        # Check if we have at least some critical cookies
-        if len(found_cookies) >= 2:
-            print("✅ Cookie file contains valid YouTube cookies")
-            return True
-        else:
-            print("❌ Cookie file missing critical YouTube authentication cookies")
-            return False
+#         # Check if we have at least some critical cookies
+#         if len(found_cookies) >= 2:
+#             print("✅ Cookie file contains valid YouTube cookies")
+#             return True
+#         else:
+#             print("❌ Cookie file missing critical YouTube authentication cookies")
+#             return False
             
-    except Exception as e:
-        print(f"❌ Error reading cookie file: {e}")
-        return False
+#     except Exception as e:
+#         print(f"❌ Error reading cookie file: {e}")
+#         return False
