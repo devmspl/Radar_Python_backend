@@ -116,3 +116,15 @@ class Transcript(Base):
     # Foreign key to the job
     job_id = Column(Integer, ForeignKey("transcript_jobs.id"))
     job = relationship("TranscriptJob", back_populates="transcripts")
+
+
+class Blog(Base):
+    __tablename__ = "blogs"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    website = Column(String, index=True)   # outreach, gong, etc.
+    category = Column(String, index=True)  # blog, webinars, reports, etc.
+    title = Column(String)
+    description = Column(Text)
+    content = Column(Text)
+    url = Column(String, index=True)

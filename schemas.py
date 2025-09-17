@@ -201,3 +201,30 @@ class PlaylistWithVideos(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     videos: List[PlaylistVideo] = []
+
+
+# app/schemas.py
+from pydantic import BaseModel
+from typing import List, Optional
+
+class BlogBase(BaseModel):
+    id : int
+    website : str   # outreach, gong, etc.
+    category : str  # blog, webinars, reports, etc.
+    title : str
+    description : str
+    content : str
+    url : str
+
+
+class BlogCreate(BlogBase):
+    pass
+
+class Blog(BlogBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class BlogListResponse(BaseModel):
+    blogs: List[Blog]
