@@ -7,7 +7,7 @@ from dependencies import get_current_admin
 import models
 import schemas
 from dependencies import get_current_admin 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["category"])
 
 @router.post("/categories", response_model=schemas.CategoryResponse)
 def create_category(

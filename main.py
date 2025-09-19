@@ -12,6 +12,8 @@ from config import settings
 from admin import router as admin_router
 from youtube_router import router as youtube_router
 from scraping import router as scrapping_router
+from feed_router import router as feed_router
+
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
@@ -70,8 +72,9 @@ async def get_open_api_endpoint():
 
 # Include routers with explicit tags
 app.include_router(admin_router)    
-app.include_router(youtube_router)
-app.include_router(scrapping_router)   
+# app.include_router(youtube_router)
+app.include_router(scrapping_router)  
+app.include_router(feed_router) 
       # tags=["Authentication"]
 
 # CORS middleware
