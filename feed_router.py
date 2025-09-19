@@ -1,31 +1,29 @@
-# feed_router.py
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 from datetime import datetime
 import random
-import openai
-
 from database import get_db
 from models import Blog, Category
+import openai
+from openai import OpenAI
 
-router = APIRouter(prefix="/feed", tags=["feed"])
+router = APIRouter(prefix="/feed", tags=["Generate feeds"])
 
-openai.api_key = "YOUR_OPENAI_KEY"  # Use environment variable preferably
+# Use environment variable for API key
+# openai_api_key = "mykey"
+# client = OpenAI(api_key="mykey")
 
 def categorize_blog_with_openai(blog_content: str, admin_categories: list) -> list:
-    """
-    Categorize blog using OpenAI into admin-defined categories.
-    Returns a list of category names.
-    """
+    """Categorize blog content using OpenAI into admin-defined categories."""
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a blog categorization assistant."},
                 {
                     "role": "user",
                     "content": (
-                        f"Categorize the following blog content into one or more of these categories: {admin_categories}.\n"
+                        f"Categorize this blog content into one or more of these categories: {admin_categories}.\n"
                         "Return only the category names as a comma-separated list.\n\n"
                         f"Blog content:\n{blog_content}"
                     )
@@ -33,9 +31,8 @@ def categorize_blog_with_openai(blog_content: str, admin_categories: list) -> li
             ],
             temperature=0
         )
-        text = response.choices[0].message.content.strip()
 
-        # Normalize and match with admin categories
+        text = response.choices[0].message.content.strip()
         text_items = [x.strip().lower() for x in text.replace("\n", ",").split(",") if x.strip()]
         matched = [c for c in admin_categories if c.lower() in text_items]
 
@@ -44,10 +41,10 @@ def categorize_blog_with_openai(blog_content: str, admin_categories: list) -> li
         print(f"OpenAI categorization error: {e}")
         return ["Uncategorized"]
 
-def generate_slides(blog: Blog) -> list:
+def generate_slides(blog):
     """Generate slides from blog content."""
     slides = []
-    paragraphs = blog.content.split("\n\n")[:4]
+    paragraphs = blog.content.split("\n\n")[:5]
     for idx, p in enumerate(paragraphs):
         slides.append({
             "order": idx + 1,
@@ -55,59 +52,58 @@ def generate_slides(blog: Blog) -> list:
             "body": p,
             "bullets": None,
             "background_image_url": None,
-            "background_color": "#"+''.join([random.choice('0123456789ABCDEF') for _ in range(6)]),
-            "text_color": "#FFFFFF",
-            "render_markdown": True,
-            "hasBookmarked": False,
-            "slide_type": "intro" if idx == 0 else "content",
-            "animation_type": "fade-in",
-            "duration": 4000 + idx*500,
-            "notes": f"Slide generated from blog {blog.id}"
+            "source_refs": [],
+            "render_markdown": True
         })
     return slides
 
 @router.get("/{website}", response_model=dict)
-async def get_feed(website: str, db: Session = Depends(get_db)):
-    """Generate feed for a website with OpenAI-based admin category assignment."""
+async def get_feed(website: str, response: Response, page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
+    """Generate feed for a website with real categories."""
     
-    blogs = db.query(Blog).filter(Blog.website == website).all()
+    blogs_query = db.query(Blog).filter(Blog.website == website)
+    total = blogs_query.count()
+    blogs = blogs_query.offset((page - 1) * limit).limit(limit).all()
+    
     if not blogs:
         raise HTTPException(status_code=404, detail="No blogs found for this website")
 
-    # Fetch all admin-defined categories
+    # Fetch admin-defined categories
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
 
     items = []
     for blog in blogs:
         blog_categories = categorize_blog_with_openai(blog.content, admin_categories)
         slides = generate_slides(blog)
-
         items.append({
             "id": f"cs_{blog.id}",
-            "type": "Topics",
+            "type": "article",
+            "source_url": getattr(blog, "url", None),
             "categories": blog_categories,
-            "background_color": "#"+''.join([random.choice('0123456789ABCDEF') for _ in range(6)]),
-            "hasArticles": None,
-            "created_at": blog.created_at.isoformat() if hasattr(blog, 'created_at') else datetime.utcnow().isoformat(),
-            "updated_at": blog.updated_at.isoformat() if hasattr(blog, 'updated_at') else datetime.utcnow().isoformat(),
-            "status": "published",
-            "views_count": random.randint(100, 2000),
-            "likes_count": random.randint(10, 500),
-            "shares_count": random.randint(0, 100),
-            "reading_time": f"{max(1, len(blog.content.split()) // 200)} min",
-            "difficulty_level": random.choice(["beginner", "intermediate", "advanced"]),
-            "tags": blog.category.split(",") if blog.category else [],
             "meta": {
+                "title": blog.title,
                 "author": "Admin",
-                "thumbnail_url": "",
-                "designation": "",
-                "author_id": f"auth_{blog.id}",
-                "author_bio": "",
-                "author_social": {},
-                "company": "",
-                "location": ""
+                "thumbnail_url": None,
+                "duration_sec": None,
+                "published_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat()
             },
-            "slides": slides
+            "slides": slides,
+            "status": "ready",
+            "created_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat(),
+            "updated_at": blog.updated_at.isoformat() if hasattr(blog, "updated_at") else datetime.utcnow().isoformat()
         })
 
-    return {"items": items}
+    has_more = (page * limit) < total
+
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page"] = str(page)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Has-More"] = str(has_more).lower()
+
+    return {
+        "items": items,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": has_more
+    }

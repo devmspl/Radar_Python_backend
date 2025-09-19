@@ -112,29 +112,7 @@ async def get_job_content(
 ):
     """Get channel playlists, playlist videos, or video transcript depending on job type"""
     return fetch_job_content(db, job_id, current_user.id)
-# @router.get(
-#     "/job/{job_id}/playlist/{video_id}",
-#     response_model=schemas.PlaylistVideosResponse
-# )
-# def get_playlist_video(
-#     job_id: str,
-#     video_id: str,
-#     db: Session = Depends(get_db),
-#     current_user: models.User = Depends(get_current_user),
-# ):
-#     return fetch_playlist_video(db, job_id, video_id, current_user.id)
-# @router.get(
-#     "/job/{job_id}/channel/{playlist_id}/video/{video_id}",
-#     response_model=schemas.PlaylistVideosResponse
-# )
-# def get_channel_playlist_video(
-#     job_id: str,
-#     playlist_id: str,
-#     video_id: str,
-#     db: Session = Depends(get_db),
-#     current_user: models.User = Depends(get_current_user),
-# ):
-#     return fetch_channel_playlist_video(db, job_id, playlist_id, video_id, current_user.id)
+    
 @router.get("/video/{video_id}", response_model=schemas.VideoTranscriptResponse)
 def get_video_by_id(
     video_id: str,
@@ -176,16 +154,3 @@ def get_playlist_by_id(playlist_id: str):
     """Fetch playlist details with its videos"""
     playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
     return fetch_playlist_by_id(playlist_url)
-
-@router.get("/cookies/status")
-async def check_cookie_status():
-    """Check if YouTube cookies are working"""
-    is_valid = validate_cookie_file()
-    cookie_exists = os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
-    
-    return {
-        "cookie_file_exists": cookie_exists,
-        "cookies_valid": is_valid,
-        "cookie_file_path": COOKIES_FILE,
-        "timestamp": datetime.now().isoformat()
-    }

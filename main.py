@@ -72,9 +72,9 @@ async def get_open_api_endpoint():
 
 # Include routers with explicit tags
 app.include_router(admin_router)    
-# app.include_router(youtube_router)
+app.include_router(youtube_router)
 app.include_router(scrapping_router)  
-app.include_router(feed_router) 
+app.include_router(feed_router)     
       # tags=["Authentication"]
 
 # CORS middleware

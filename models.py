@@ -127,4 +127,15 @@ class Blog(Base):
     title = Column(String)
     description = Column(Text)
     content = Column(Text)
-    url = Column(String, index=True)
+    url = Column(String, index=True)    
+    job_uid = Column(String, index=True)
+class ScrapeJob(Base):
+    __tablename__ = "scrape_jobs"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    uid = Column(String, unique=True, index=True)  # unique job ID
+    website = Column(String, index=True)           # domain like outreach.io
+    url = Column(String)                            # link provided for scraping
+    status = Column(String, default="inprocess")   # inprocess / done / failed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

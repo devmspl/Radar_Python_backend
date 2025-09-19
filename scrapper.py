@@ -1,13 +1,14 @@
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import time
 from typing import List, Dict
 from sqlalchemy.orm import Session
-from database import SessionLocal  # ✅ import SessionLocal directly
-from models import Blog            # ✅ import Blog model
+from database import SessionLocal
+from models import Blog, ScrapeJob
+import uuid
 
-# Define headers
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -15,39 +16,6 @@ HEADERS = {
         "Chrome/91.0.4472.124 Safari/537.36"
     )
 }
-
-# Define all websites with their main listing pages
-WEBSITE_URLS = {
-    "outreach": {
-        "blogs": "https://www.outreach.io/resources/blog",
-        "webinars": "https://www.outreach.io/resources/webinars-videos/role/revenue-operations",
-        "reports": "https://www.outreach.io/resources/reports-guides",
-        "stories": "https://www.outreach.io/resources/stories",
-        "tools": "https://www.outreach.io/resources/tools",
-        "product_updates": "https://www.outreach.io/product-updates"
-    },
-    "xactly": {
-        "blogs": "https://www.xactlycorp.com/blog",
-        "webinars": "https://www.xactlycorp.com/resources/webinars",
-        "infographics": "https://www.xactlycorp.com/resources/infographics"
-    },
-    "gong": {
-        "blogs": "https://www.gong.io/blog/",
-        "resources": "https://www.gong.io/resources/",
-        "guides": "https://www.gong.io/resources/guides/what-is-revenue-intelligence/",
-        "webinars": "https://www.gong.io/resources/webinars/",
-        "labs": "https://www.gong.io/resources/labs/",
-        "podcast": "https://www.gong.io/podcast/"
-    },
-    "ziphq": {
-        "blogs": "https://ziphq.com/blog?blog-topic=Industry+trends",
-        "webinars": "https://ziphq.com/webinars",
-        "events": "https://ziphq.com/events",
-        "reports": "https://ziphq.com/research-reports-guides",
-        "resources": "https://ziphq.com/resources"
-    }
-}
-
 
 def scrape_listing_page(listing_url: str) -> List[str]:
     """Extract all sub-page links from a listing page."""
@@ -62,21 +30,18 @@ def scrape_listing_page(listing_url: str) -> List[str]:
         soup = BeautifulSoup(response.content, "html.parser")
         links = []
 
-        # Collect all links that belong to the same website
+        base_domain = urlparse(listing_url).netloc
+
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             full_url = urljoin(listing_url, href)
-            if full_url.startswith(listing_url) or any(
-                domain in full_url for domain in ["outreach.io", "xactlycorp.com", "gong.io", "ziphq.com"]
-            ):
-                if full_url not in links:
-                    links.append(full_url)
+            if urlparse(full_url).netloc == base_domain and full_url not in links:
+                links.append(full_url)
 
         return links
     except Exception as e:
         print(f"Error fetching {listing_url}: {e}")
         return []
-
 
 def scrape_page(url: str) -> Dict:
     """Scrape content from a single page."""
@@ -117,39 +82,32 @@ def scrape_page(url: str) -> Dict:
         print(f"Error scraping {url}: {e}")
         return {}
 
-
-def scrape_website(website: str) -> List[Dict]:
-    """Scrape all resources from the selected website, classified by category."""
-    website = website.lower()
-    if website not in WEBSITE_URLS:
-        raise ValueError(f"Unsupported website: {website}")
-
+def scrape_any_website(listing_url: str, category: str = "general") -> List[Dict]:
+    """Scrape a given URL dynamically and classify pages under a category."""
     results = []
     idx = 1
 
-    for category, listing_page in WEBSITE_URLS[website].items():
-        print(f"Scraping {category} page: {listing_page}")
-        links = scrape_listing_page(listing_page)
-        print(f"Found {len(links)} links in {category}")
+    print(f"Scraping listing page: {listing_url}")
+    links = scrape_listing_page(listing_url)
+    print(f"Found {len(links)} links")
 
-        for link in links:
-            data = scrape_page(link)
-            if data:
-                data["id"] = idx
-                data["website"] = website
-                data["category"] = category   # ✅ classify here
-                results.append(data)
-                idx += 1
-                time.sleep(1)  # polite delay
+    for link in links:
+        data = scrape_page(link)
+        if data:
+            data["id"] = idx
+            data["website"] = urlparse(listing_url).netloc
+            data["category"] = category
+            results.append(data)
+            idx += 1
+            time.sleep(1)  # polite delay
 
     return results
 
-
-def save_blogs_to_db(website: str):
-    """Scrape and persist data into DB with classification."""
+def save_any_website_to_db(listing_url: str, category: str = "general"):
+    """Scrape any given URL and save to DB."""
     db: Session = SessionLocal()
     try:
-        scraped_data = scrape_website(website)
+        scraped_data = scrape_any_website(listing_url, category)
 
         for item in scraped_data:
             existing = db.query(Blog).filter(Blog.url == item["url"]).first()
@@ -158,14 +116,45 @@ def save_blogs_to_db(website: str):
 
             blog = Blog(
                 website=item["website"],
-                category=item["category"],  # ✅ store category
+                category=item["category"],
                 title=item["title"],
                 description=item["description"],
                 content=item["content"],
-                url=item["url"]
+                url=item["url"],
+                job_uid=job.uid
             )
             db.add(blog)
 
         db.commit()
     finally:
         db.close()
+def start_scraping_job(db: Session, url: str, category: str = "general"):
+    job_uid = str(uuid.uuid4())
+    job = ScrapeJob(uid=job_uid, website=urlparse(url).netloc, url=url, status="inprocess")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    try:
+        data = scrape_any_website(url, category)
+        for item in data:
+            existing = db.query(Blog).filter(Blog.url == item["url"]).first()
+            if existing:
+                continue
+            blog = Blog(
+                website=item["website"],
+                category=item["category"],
+                title=item["title"],
+                description=item["description"],
+                content=item["content"],
+                url=item["url"]
+            )
+            db.add(blog)
+        db.commit()
+        job.status = "done"
+    except Exception as e:
+        job.status = "failed"
+    finally:
+        db.commit()
+
+    return job.uid
