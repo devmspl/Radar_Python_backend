@@ -110,14 +110,14 @@ async def get_feed(website: str, response: Response, page: int = 1, limit: int =
 
 @router.get("/all", response_model=dict)
 async def get_all_feed(response: Response, db: Session = Depends(get_db)):
-    """Return all blogs for the website without pagination."""
+    """Return all blogs for all websites without pagination."""
     
     # Fetch all blogs
     blogs = db.query(Blog).all()
     total = len(blogs)
     
     if not blogs:
-        raise HTTPException(status_code=404, detail="No blogs found for this website")
+        raise HTTPException(status_code=404, detail="No blogs found")
     
     # Fetch active categories
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
@@ -129,13 +129,12 @@ async def get_all_feed(response: Response, db: Session = Depends(get_db)):
         items.append({
             "id": f"cs_{blog.id}",
             "type": "article",
-            "source_url": getattr(blog, "url", None),
+            "source_url": blog.url,
             "categories": blog_categories,
             "meta": {
                 "title": blog.title,
                 "author": "Admin",
-                "thumbnail_url": getattr(blog, "thumbnail_url", None),
-                "duration_sec": getattr(blog, "duration_sec", None),
+                "description": getattr(blog, "description", ""),
                 "published_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat()
             },
             "slides": slides,
@@ -144,9 +143,9 @@ async def get_all_feed(response: Response, db: Session = Depends(get_db)):
             "updated_at": blog.updated_at.isoformat() if hasattr(blog, "updated_at") else datetime.utcnow().isoformat()
         })
     
-    # Headers (optional, still useful)
+    # Set response headers
     response.headers["X-Total-Count"] = str(total)
-    response.headers["X-Has-More"] = "false"  # since we return all
+    response.headers["X-Has-More"] = "false"
     
     return {
         "items": items,
