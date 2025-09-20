@@ -123,7 +123,13 @@ async def get_all_feed(response: Response, page: int = 1, limit: int = 20, db: S
         response.headers["X-Page"] = str(page)
         response.headers["X-Limit"] = str(limit)
         response.headers["X-Has-More"] = "false"
-        raise HTTPException(status_code=404, detail="No blogs found")
+        return {
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False
+        }
     
     # Fetch active categories
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
