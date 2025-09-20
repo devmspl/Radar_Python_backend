@@ -109,20 +109,21 @@ async def get_feed(website: str, response: Response, page: int = 1, limit: int =
     }
 
 @router.get("/all", response_model=dict)
-async def get_all_feed(response: Response, db: Session = Depends(get_db)):
-    """Return all blogs from all websites without pagination."""
+async def get_all_feed(response: Response, page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
+    """Return all blogs from all websites with pagination."""
     
-    # Fetch all blogs without any filtering
-    blogs = db.query(Blog).all()
-    total = len(blogs)
+    # Calculate offset and fetch paginated blogs
+    offset = (page - 1) * limit
+    blogs_query = db.query(Blog)
+    total = blogs_query.count()
+    blogs = blogs_query.offset(offset).limit(limit).all()
     
     if not blogs:
-        # Return empty items list instead of error if no blogs found
-        return {
-            "items": [],
-            "total": 0,
-            "has_more": False
-        }
+        response.headers["X-Total-Count"] = "0"
+        response.headers["X-Page"] = str(page)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Has-More"] = "false"
+        raise HTTPException(status_code=404, detail="No blogs found")
     
     # Fetch active categories
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
@@ -134,12 +135,13 @@ async def get_all_feed(response: Response, db: Session = Depends(get_db)):
         items.append({
             "id": f"cs_{blog.id}",
             "type": "article",
-            "source_url": blog.url,
+            "source_url": getattr(blog, "url", None),
             "categories": blog_categories,
             "meta": {
                 "title": blog.title,
                 "author": "Admin",
-                "description": getattr(blog, "description", ""),
+                "thumbnail_url": None,
+                "duration_sec": None,
                 "published_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat()
             },
             "slides": slides,
@@ -148,12 +150,18 @@ async def get_all_feed(response: Response, db: Session = Depends(get_db)):
             "updated_at": blog.updated_at.isoformat() if hasattr(blog, "updated_at") else datetime.utcnow().isoformat()
         })
     
+    has_more = (page * limit) < total
+    
     # Set response headers
     response.headers["X-Total-Count"] = str(total)
-    response.headers["X-Has-More"] = "false"
+    response.headers["X-Page"] = str(page)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Has-More"] = str(has_more).lower()
     
     return {
         "items": items,
+        "page": page,
+        "limit": limit,
         "total": total,
-        "has_more": False
+        "has_more": has_more
     }
