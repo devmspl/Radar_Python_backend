@@ -110,14 +110,19 @@ async def get_feed(website: str, response: Response, page: int = 1, limit: int =
 
 @router.get("/all", response_model=dict)
 async def get_all_feed(response: Response, db: Session = Depends(get_db)):
-    """Return all blogs for all websites without pagination."""
+    """Return all blogs from all websites without pagination."""
     
-    # Fetch all blogs
+    # Fetch all blogs without any filtering
     blogs = db.query(Blog).all()
     total = len(blogs)
     
     if not blogs:
-        raise HTTPException(status_code=404, detail="No blogs found")
+        # Return empty items list instead of error if no blogs found
+        return {
+            "items": [],
+            "total": 0,
+            "has_more": False
+        }
     
     # Fetch active categories
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
