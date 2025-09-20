@@ -57,57 +57,6 @@ def generate_slides(blog):
         })
     return slides
 
-@router.get("/{website}", response_model=dict)
-async def get_feed(website: str, response: Response, page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
-    """Generate feed for a website with real categories."""
-    
-    blogs_query = db.query(Blog).filter(Blog.website == website)
-    total = blogs_query.count()
-    blogs = blogs_query.offset((page - 1) * limit).limit(limit).all()
-    
-    if not blogs:
-        raise HTTPException(status_code=404, detail="No blogs found for this website")
-
-    # Fetch admin-defined categories
-    admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
-
-    items = []
-    for blog in blogs:
-        blog_categories = categorize_blog_with_openai(blog.content, admin_categories)
-        slides = generate_slides(blog)
-        items.append({
-            "id": f"cs_{blog.id}",
-            "type": "article",
-            "source_url": getattr(blog, "url", None),
-            "categories": blog_categories,
-            "meta": {
-                "title": blog.title,
-                "author": "Admin",
-                "thumbnail_url": None,
-                "duration_sec": None,
-                "published_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat()
-            },
-            "slides": slides,
-            "status": "ready",
-            "created_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat(),
-            "updated_at": blog.updated_at.isoformat() if hasattr(blog, "updated_at") else datetime.utcnow().isoformat()
-        })
-
-    has_more = (page * limit) < total
-
-    response.headers["X-Total-Count"] = str(total)
-    response.headers["X-Page"] = str(page)
-    response.headers["X-Limit"] = str(limit)
-    response.headers["X-Has-More"] = str(has_more).lower()
-
-    return {
-        "items": items,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": has_more
-    }
-
 @router.get("/all", response_model=dict)
 async def get_all_feed(response: Response, page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
     """Return all blogs from all websites with pagination."""
@@ -164,6 +113,57 @@ async def get_all_feed(response: Response, page: int = 1, limit: int = 20, db: S
     response.headers["X-Limit"] = str(limit)
     response.headers["X-Has-More"] = str(has_more).lower()
     
+    return {
+        "items": items,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": has_more
+    }
+
+@router.get("/{website}", response_model=dict)
+async def get_feed(website: str, response: Response, page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
+    """Generate feed for a specific website with real categories."""
+    
+    blogs_query = db.query(Blog).filter(Blog.website == website)
+    total = blogs_query.count()
+    blogs = blogs_query.offset((page - 1) * limit).limit(limit).all()
+    
+    if not blogs:
+        raise HTTPException(status_code=404, detail="No blogs found for this website")
+
+    # Fetch admin-defined categories
+    admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
+
+    items = []
+    for blog in blogs:
+        blog_categories = categorize_blog_with_openai(blog.content, admin_categories)
+        slides = generate_slides(blog)
+        items.append({
+            "id": f"cs_{blog.id}",
+            "type": "article",
+            "source_url": getattr(blog, "url", None),
+            "categories": blog_categories,
+            "meta": {
+                "title": blog.title,
+                "author": "Admin",
+                "thumbnail_url": None,
+                "duration_sec": None,
+                "published_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat()
+            },
+            "slides": slides,
+            "status": "ready",
+            "created_at": blog.created_at.isoformat() if hasattr(blog, "created_at") else datetime.utcnow().isoformat(),
+            "updated_at": blog.updated_at.isoformat() if hasattr(blog, "updated_at") else datetime.utcnow().isoformat()
+        })
+
+    has_more = (page * limit) < total
+
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page"] = str(page)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Has-More"] = str(has_more).lower()
+
     return {
         "items": items,
         "page": page,
