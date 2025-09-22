@@ -1,10 +1,10 @@
-from sqlalchemy import Boolean, Column, Integer, String, DateTime, Text, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey, ARRAY, JSON, Enum
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 import uuid
 from database import Base
 import enum
-
+from datetime import datetime
 def generate_uuid():
     return str(uuid.uuid4())
 
@@ -22,7 +22,7 @@ class ContentType(str, enum.Enum):
 
 class User(Base):
     __tablename__ = "users"
-
+    __table_args__ = {"extend_existing": True}
     id = Column(Integer, primary_key=True, index=True)
     full_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
@@ -122,13 +122,15 @@ class Blog(Base):
     __tablename__ = "blogs"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    website = Column(String, index=True)   # outreach, gong, etc.
-    category = Column(String, index=True)  # blog, webinars, reports, etc.
+    website = Column(String, index=True)  
+    category = Column(String, index=True)  
     title = Column(String)
     description = Column(Text)
     content = Column(Text)
     url = Column(String, index=True)    
     job_uid = Column(String, index=True)
+
+    feeds = relationship("Feed", back_populates="blog")
 class ScrapeJob(Base):
     __tablename__ = "scrape_jobs"
 
@@ -139,3 +141,48 @@ class ScrapeJob(Base):
     status = Column(String, default="inprocess")   # inprocess / done / failed
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class Feed(Base):
+    __tablename__ = "feeds"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=False)
+    title = Column(String(500), nullable=True)  # AI-generated title
+    categories = Column(JSON, default=list)  # stores list of categories as JSON
+    status = Column(String(50), default="processing")  # processing, ready, failed
+    ai_generated_content = Column(JSON, nullable=True)  # Stores all AI-generated content
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    blog = relationship("Blog", back_populates="feeds")
+    slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
+    
+    def __repr__(self):
+        return f"<Feed(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+class Slide(Base):
+    __tablename__ = "slides"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    feed_id = Column(Integer, ForeignKey("feeds.id"), nullable=False)
+    order = Column(Integer, nullable=False)  # Slide order in presentation
+    title = Column(String(500), nullable=False)
+    body = Column(Text, nullable=False)
+    bullets = Column(JSON, nullable=True)     # Array of bullet points
+    background_image_url = Column(String(500), nullable=True)
+    source_refs = Column(JSON, default=list)
+    render_markdown = Column(Boolean, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    feed = relationship("Feed", back_populates="slides")
+    
+    def __repr__(self):
+        return f"<Slide(id={self.id}, order={self.order}, title='{self.title}')>"
