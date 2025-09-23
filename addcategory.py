@@ -5,7 +5,6 @@ import uuid
 def generate_uuid():
     return str(uuid.uuid4())
 categories_data = [
-    [
   {"name": "Electronics", "description": "Devices and gadgets like smartphones, laptops, and cameras.", "note": "High demand globally.", "admin_note": "Monitor for rapid technological advancements."},
   {"name": "Fashion & Apparel", "description": "Clothing, shoes, and accessories for all genders and ages.", "note": "Seasonal trends influence sales.", "admin_note": "Track fashion cycles closely."},
   {"name": "Home & Kitchen Appliances", "description": "Electronics and tools for household use, including refrigerators and blenders.", "note": "Essential for daily living.", "admin_note": "Focus on energy efficiency features."},
@@ -112,8 +111,6 @@ categories_data = [
   {"name": "Wearable AR Devices", "description": "Augmented reality wearables like glasses and helmets.", "note": "Emerging immersive technology.", "admin_note": "Provide tutorials and demos."},
   {"name": "AI Personal Assistants", "description": "Intelligent assistants for scheduling, reminders, and tasks.", "note": "High adoption in productivity tools.", "admin_note": "Include privacy considerations."},
   {"name": "Eco-Friendly Packaging", "description": "Sustainable packaging for products.", "note": "Increasing consumer demand.", "admin_note": "Highlight biodegradability."}
-]
-
 ]
 
 
