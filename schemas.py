@@ -201,7 +201,9 @@ class PlaylistWithVideos(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     videos: List[PlaylistVideo] = []
-
+class ScrapeRequest(BaseModel):
+    url: str
+    category: str = "general"
 
 # app/schemas.py
 from pydantic import BaseModel

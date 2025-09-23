@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import time
 
 router = APIRouter(prefix="/website", tags=["web"])
-
+from schemas import ScrapeRequest
 
 # Helper: start scraping in background
 def run_scraping_job(db: Session, url: str, category: str, job_uid: str):
@@ -41,29 +41,33 @@ def run_scraping_job(db: Session, url: str, category: str, job_uid: str):
 # 1️⃣ Start scraping job
 from fastapi import BackgroundTasks
 
+
 @router.post("/scrape/start")
 async def start_scraping(
-    url: str,
+    request: ScrapeRequest,  # receive the body
     background_tasks: BackgroundTasks,
-    category: str = "general",
     db: Session = Depends(get_db)
 ):
     job_uid = str(uuid.uuid4())
-    job = ScrapeJob(uid=job_uid, website=urlparse(url).netloc, url=url, status="inprocess")
+    job = ScrapeJob(
+        uid=job_uid, 
+        website=urlparse(request.url).netloc, 
+        url=request.url, 
+        status="inprocess"
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
 
     # Run scraping in the background
-    background_tasks.add_task(run_scraping_job, db, url, category, job_uid)
+    background_tasks.add_task(run_scraping_job, db, request.url, request.category, job_uid)
 
     return {
         "uid": job_uid,
-        "website": urlparse(url).netloc,
+        "website": urlparse(request.url).netloc,
         "status": "inprocess",
-        "link": url
+        "link": request.url
     }
-
 
 
 # 2️⃣ Get scraping job status
