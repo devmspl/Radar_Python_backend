@@ -10,7 +10,7 @@ from database import get_db
 from models import Blog, Category, Feed, Slide
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-
+from schemas import FeedRequest
 router = APIRouter(prefix="/get", tags=["Feeds"])
 
 # Configure logging
@@ -489,28 +489,32 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "ai_generated": hasattr(feed, 'ai_generated_content') and feed.ai_generated_content is not None,
         "images_generated": feed.image_generation_enabled
     }
-
-@router.post("/feeds/{website}", response_model=dict)
+@router.post("/feeds", response_model=dict)
 def create_feeds_from_website(
-    website: str, 
+    request: FeedRequest,
     background_tasks: BackgroundTasks,
-    overwrite: bool = False,
-    use_ai: bool = True,
-    generate_images: bool = True,
     db: Session = Depends(get_db)
 ):
     """Create feeds for all blogs from a website with optional AI image generation."""
-    blogs = db.query(Blog).filter(Blog.website == website).all()
+    blogs = db.query(Blog).filter(Blog.website == request.website).all()
     if not blogs:
         raise HTTPException(status_code=404, detail="No blogs found for this website")
 
-    background_tasks.add_task(process_feeds_creation, db, blogs, website, overwrite, use_ai, generate_images)
-    
+    background_tasks.add_task(
+        process_feeds_creation,
+        db,
+        blogs,
+        request.website,
+        request.overwrite,
+        request.use_ai,
+        request.generate_images,
+    )
+
     return {
-        "website": website,
+        "website": request.website,
         "total_blogs": len(blogs),
-        "use_ai": use_ai,
-        "generate_images": generate_images,
+        "use_ai": request.use_ai,
+        "generate_images": request.generate_images,
         "message": "Feed creation process started in background",
         "status": "processing"
     }

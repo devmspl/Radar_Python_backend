@@ -204,7 +204,11 @@ class PlaylistWithVideos(BaseModel):
 class ScrapeRequest(BaseModel):
     url: str
     category: str = "general"
-
+class FeedRequest(BaseModel):
+    website: str
+    overwrite: bool = False
+    use_ai: bool = True
+    generate_images: bool = True
 # app/schemas.py
 from pydantic import BaseModel
 from typing import List, Optional
