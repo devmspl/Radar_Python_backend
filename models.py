@@ -141,48 +141,49 @@ class ScrapeJob(Base):
     status = Column(String, default="inprocess")   # inprocess / done / failed
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+from sqlalchemy.types import TypeDecorator, TEXT
+import json
 
+class JSONEncodedList(TypeDecorator):
+    impl = TEXT
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return json.dumps(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return json.loads(value)
 class Feed(Base):
     __tablename__ = "feeds"
     
     id = Column(Integer, primary_key=True, index=True)
     blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=False)
-    title = Column(String(500), nullable=True)  # AI-generated title
-    categories = Column(JSON, default=list)  # stores list of categories as JSON
-    status = Column(String(50), default="processing")  # processing, ready, failed
-    ai_generated_content = Column(JSON, nullable=True)  # Stores all AI-generated content
-    
-    # Timestamps
+    title = Column(String(500), nullable=True)
+    categories = Column(JSONEncodedList, default=list)
+    status = Column(String(50), default="processing")
+    ai_generated_content = Column(JSON, nullable=True)
+    image_generation_enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
     blog = relationship("Blog", back_populates="feeds")
     slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
     
-    def __repr__(self):
-        return f"<Feed(id={self.id}, title='{self.title}', status='{self.status}')>"
-
-
 class Slide(Base):
     __tablename__ = "slides"
     
     id = Column(Integer, primary_key=True, index=True)
     feed_id = Column(Integer, ForeignKey("feeds.id"), nullable=False)
-    order = Column(Integer, nullable=False)  # Slide order in presentation
+    order = Column(Integer, nullable=False)
     title = Column(String(500), nullable=False)
     body = Column(Text, nullable=False)
-    bullets = Column(JSON, nullable=True)     # Array of bullet points
+    bullets = Column(JSONEncodedList, default=list)
     background_image_url = Column(String(500), nullable=True)
-    source_refs = Column(JSON, default=list)
+    background_image_prompt = Column(String(1000), nullable=True)
+    source_refs = Column(JSONEncodedList, default=list)
     render_markdown = Column(Boolean, default=True)
-    
-    # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
     feed = relationship("Feed", back_populates="slides")
-    
-    def __repr__(self):
-        return f"<Slide(id={self.id}, order={self.order}, title='{self.title}')>"
