@@ -10,7 +10,7 @@ from database import get_db
 from models import Blog, Category, Feed, Slide
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-from schemas import FeedRequest
+from schemas import FeedRequest,DeleteSlideRequest
 router = APIRouter(prefix="/get", tags=["Feeds"])
 
 # Configure logging
@@ -579,3 +579,44 @@ def regenerate_feed_images(feed_id: int, db: Session = Depends(get_db)):
         "updated_slides": updated_slides,
         "message": f"Regenerated images for {updated_slides} slides"
     }
+@router.delete("/feeds/slides", response_model=dict)
+def delete_slide_from_feed(
+    request: DeleteSlideRequest, 
+    db: Session = Depends(get_db)
+):
+    """Delete a specific slide from a feed using request body."""
+    feed_id = request.feed_id
+    slide_id = request.slide_id
+
+    # First verify the feed exists
+    feed = db.query(Feed).filter(Feed.id == feed_id).first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+    
+    # Find the specific slide
+    slide = db.query(Slide).filter(
+        Slide.id == slide_id, 
+        Slide.feed_id == feed_id
+    ).first()
+    
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found in this feed")
+    
+    try:
+        # Delete the slide
+        db.delete(slide)
+        db.commit()
+        
+        logger.info(f"Successfully deleted slide {slide_id} from feed {feed_id}")
+        
+        return {
+            "message": "Slide deleted successfully",
+            "feed_id": feed_id,
+            "slide_id": slide_id,
+            "deleted_slide_title": slide.title
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting slide {slide_id} from feed {feed_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete slide")

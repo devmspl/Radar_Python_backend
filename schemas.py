@@ -234,3 +234,7 @@ class Blog(BlogBase):
 
 class BlogListResponse(BaseModel):
     blogs: List[Blog]
+
+class DeleteSlideRequest(BaseModel):
+    feed_id: int
+    slide_id: int
