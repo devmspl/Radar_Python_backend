@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, validator
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict,Any
 from datetime import datetime
 from enum import Enum
 
@@ -210,8 +210,6 @@ class FeedRequest(BaseModel):
     use_ai: bool = True
     generate_images: bool = True
 # app/schemas.py
-from pydantic import BaseModel
-from typing import List, Optional
 
 class BlogBase(BaseModel):
     id : int
@@ -237,4 +235,96 @@ class BlogListResponse(BaseModel):
 
 class DeleteSlideRequest(BaseModel):
     feed_id: int
-    slide_id: int
+    slide_id: int   
+
+class PublishFeedRequest(BaseModel):
+    feed_id: int
+    admin_id: int   # <-- NEW
+
+class SlideResponse(BaseModel):
+    id: int
+    order: int
+    title: str
+    body: str
+    bullets: List[str]
+    background_image_url: Optional[str]
+    background_image_prompt: Optional[str]
+    source_refs: List[str]
+    render_markdown: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class FeedDetailResponse(BaseModel):
+    id: int
+    title: str
+    categories: List[str]
+    status: str
+    ai_generated_content: Optional[Dict[str, Any]]
+    image_generation_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+    slides: List[SlideResponse]
+
+    class Config:
+        from_attributes = True
+
+class PublishedFeedResponse(BaseModel):
+    id: int
+    feed_id: int
+    admin_id: int
+    admin_name: str
+    published_at: datetime
+    is_active: bool
+    
+    # Feed details
+    feed_title: str
+    feed_categories: List[str]
+    slides_count: int
+    
+    class Config:
+        from_attributes = True
+
+class PublishedFeedDetailResponse(BaseModel):
+    id: int
+    feed_id: int
+    admin_id: int
+    admin_name: str
+    published_at: datetime
+    is_active: bool
+    
+    # Complete feed details with slides
+    feed: FeedDetailResponse
+    blog_title: str
+    
+    class Config:
+        from_attributes = True
+
+class PublishStatusResponse(BaseModel):
+    message: str
+    published_feed_id: int
+    feed_id: int
+    admin_id: int
+    admin_name: str
+    published_at: datetime
+
+class DeletePublishResponse(BaseModel):
+    message: str
+    deleted_feed_id: int
+    admin_id: int
+    admin_name: str
+
+class BulkPublishRequest(BaseModel):
+    admin_id: int
+    feed_ids: List[int]
+
+class PublishStatsResponse(BaseModel):
+    total_published: int
+    active_published: int
+    inactive_published: int
+    admin_stats: List[Dict[str, Any]]
+class UnpublishFeedRequest(BaseModel):
+    feed_id: int
+    admin_id: int

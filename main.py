@@ -13,7 +13,7 @@ from admin import router as admin_router
 from youtube_router import router as youtube_router
 from scraping import router as scrapping_router
 from feed_router import router as feed_router
-
+from publish_router import router as publish_router
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
@@ -74,7 +74,8 @@ async def get_open_api_endpoint():
 app.include_router(admin_router)    
 app.include_router(youtube_router)
 app.include_router(scrapping_router)  
-app.include_router(feed_router)     
+app.include_router(feed_router)
+app.include_router(publish_router)     
       # tags=["Authentication"]
 
 # CORS middleware

@@ -187,3 +187,17 @@ class Slide(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     feed = relationship("Feed", back_populates="slides")
+# Add this to your models.py file
+class PublishedFeed(Base):
+    __tablename__ = "published_feeds"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    feed_id = Column(Integer, ForeignKey('feeds.id'), nullable=False)
+    admin_id = Column(Integer, ForeignKey('users.id'), nullable=False)  # Reference to users table
+    admin_name = Column(String, nullable=False)
+    published_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    
+    # Relationships
+    feed = relationship("Feed", backref="published_feeds")
+    admin_user = relationship("User")  # Relationship to User model

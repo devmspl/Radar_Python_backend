@@ -10,7 +10,8 @@ from database import get_db
 from models import Blog, Category, Feed, Slide
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-from schemas import FeedRequest,DeleteSlideRequest
+from schemas import FeedRequest, DeleteSlideRequest
+
 router = APIRouter(prefix="/get", tags=["Feeds"])
 
 # Configure logging
@@ -67,52 +68,6 @@ def categorize_blog_with_openai(blog_content: str, admin_categories: list) -> li
         logger.error(f"OpenAI categorization error: {e}")
         return ["Uncategorized"]
 
-# ------------------ AI Image Generation Functions ------------------
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def generate_image_with_ai(prompt: str, size: str = "1024x1024") -> Optional[str]:
-    """Generate an image using DALL-E based on the prompt."""
-    try:
-        response = client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            size=size,
-            quality="standard",
-            style="natural",
-            n=1,
-        )
-        image_url = response.data[0].url
-        logger.info(f"Successfully generated image for prompt: {prompt[:100]}...")
-        return image_url
-    except Exception as e:
-        logger.error(f"DALL-E image generation error: {e}")
-        return None
-
-def generate_image_prompt(slide_title: str, slide_content: str, categories: List[str]) -> str:
-    """Generate a compelling prompt for image generation based on slide content."""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a creative prompt engineer for image generation. Create a vivid, descriptive prompt for DALL-E based on the content. Focus on creating a background image that would complement a presentation slide. Make it abstract, professional, and visually appealing."
-                },
-                {
-                    "role": "user",
-                    "content": f"Slide Title: {slide_title}\nSlide Content: {slide_content[:500]}\nCategories: {', '.join(categories)}\n\nCreate a compelling image generation prompt for a presentation background:"
-                }
-            ],
-            temperature=0.8,
-            max_tokens=150
-        )
-        prompt = response.choices[0].message.content.strip()
-        prompt = re.sub(r'["\']', '', prompt)
-        return prompt
-    except Exception as e:
-        logger.error(f"Image prompt generation error: {e}")
-        return f"Abstract professional background for {slide_title}, minimalistic design"
-
 # ------------------ AI Content Generation Functions ------------------
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -149,7 +104,7 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         messages = [
             {
                 "role": "system", 
-                "content": "You are a presentation design expert. Create engaging, concise slides. Return JSON with: title, body, bullets (array), image_theme."
+                "content": "You are a presentation design expert. Create engaging, concise slides. Return JSON with: title, body, bullets (array)."
             },
             {
                 "role": "user",
@@ -173,8 +128,6 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
             "title": slide_data.get("title", f"Slide {slide_type}"),
             "body": slide_data.get("body", ""),
             "bullets": slide_data.get("bullets"),
-            "image_theme": slide_data.get("image_theme", "professional abstract background"),
-            "background_image_url": None,
             "source_refs": [],
             "render_markdown": True
         }
@@ -182,18 +135,14 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         logger.error(f"OpenAI slide generation error: {e}")
         return generate_fallback_slide(slide_type, context, categories)
 
-def generate_slides_with_ai(blog_title: str, blog_content: str, ai_generated_content: Dict[str, Any], categories: List[str], generate_images: bool = True) -> List[Dict]:
-    """Generate presentation slides using AI with optional image generation."""
+def generate_slides_with_ai(blog_title: str, blog_content: str, ai_generated_content: Dict[str, Any], categories: List[str]) -> List[Dict]:
+    """Generate presentation slides using AI without image generation."""
     slides = []
     
     # Title slide
     title_context = f"Blog: {blog_title}\nSummary: {ai_generated_content.get('summary', '')}"
     title_slide = generate_slide_with_ai("title", title_context, categories)
     title_slide["order"] = 1
-    if generate_images:
-        image_prompt = generate_image_prompt(title_slide["title"], title_slide["body"], categories)
-        title_slide["background_image_prompt"] = image_prompt
-        title_slide["background_image_url"] = generate_image_with_ai(image_prompt)
     slides.append(title_slide)
     
     # Key point slides
@@ -202,43 +151,31 @@ def generate_slides_with_ai(blog_title: str, blog_content: str, ai_generated_con
         key_point_context = f"Key Point: {point}\nBlog: {blog_title}"
         key_slide = generate_slide_with_ai("key_point", key_point_context, categories, slides)
         key_slide["order"] = len(slides) + 1
-        if generate_images:
-            image_prompt = generate_image_prompt(key_slide["title"], key_slide["body"], categories)
-            key_slide["background_image_prompt"] = image_prompt
-            key_slide["background_image_url"] = generate_image_with_ai(image_prompt)
         slides.append(key_slide)
     
     # Summary slide
     summary_context = f"Summary: {ai_generated_content.get('summary', '')}\nKey Points: {', '.join(key_points)}"
     summary_slide = generate_slide_with_ai("summary", summary_context, categories, slides)
     summary_slide["order"] = len(slides) + 1
-    if generate_images:
-        image_prompt = generate_image_prompt(summary_slide["title"], summary_slide["body"], categories)
-        summary_slide["background_image_prompt"] = image_prompt
-        summary_slide["background_image_url"] = generate_image_with_ai(image_prompt)
     slides.append(summary_slide)
     
     # Conclusion slide
     conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nBlog: {blog_title}"
     conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, slides)
     conclusion_slide["order"] = len(slides) + 1
-    if generate_images:
-        image_prompt = generate_image_prompt(conclusion_slide["title"], conclusion_slide["body"], categories)
-        conclusion_slide["background_image_prompt"] = image_prompt
-        conclusion_slide["background_image_url"] = generate_image_with_ai(image_prompt)
     slides.append(conclusion_slide)
     
     return slides
 
 # ------------------ Core Feed Creation Function ------------------
 
-def create_feed_from_blog(db: Session, blog: Blog, generate_images: bool = True):
+def create_feed_from_blog(db: Session, blog: Blog):
     """Generate feed and slides from a blog using AI and store in DB."""
     try:
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         categories = categorize_blog_with_openai(blog.content, admin_categories)
         ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories)
-        slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, generate_images)
+        slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories)
         
         feed_title = ai_generated_content.get("title", blog.title)
         feed = Feed(
@@ -247,7 +184,7 @@ def create_feed_from_blog(db: Session, blog: Blog, generate_images: bool = True)
             categories=categories, 
             status="ready",
             ai_generated_content=ai_generated_content,
-            image_generation_enabled=generate_images,
+            image_generation_enabled=False,  # Always false now
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -261,8 +198,8 @@ def create_feed_from_blog(db: Session, blog: Blog, generate_images: bool = True)
                 title=slide_data["title"],
                 body=slide_data["body"],
                 bullets=slide_data.get("bullets"),
-                background_image_url=slide_data.get("background_image_url"),
-                background_image_prompt=slide_data.get("background_image_prompt"),
+                background_image_url=None,  # No image generation
+                background_image_prompt=None,  # No image generation
                 source_refs=slide_data.get("source_refs", []),
                 render_markdown=int(slide_data.get("render_markdown", True)),
                 created_at=datetime.utcnow(),
@@ -307,8 +244,6 @@ def generate_fallback_slide(slide_type: str, context: str, categories: List[str]
         "title": f"{slide_type.replace('_', ' ').title()}",
         "body": context[:500] + "..." if len(context) > 500 else context,
         "bullets": None,
-        "image_theme": f"abstract background for {slide_type}",
-        "background_image_url": None,
         "source_refs": [],
         "render_markdown": True
     }
@@ -331,7 +266,13 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
             "render_markdown": True
         })
     
-    feed = Feed(blog_id=blog.id, categories=categories, status="ready", title=blog.title)
+    feed = Feed(
+        blog_id=blog.id, 
+        categories=categories, 
+        status="ready", 
+        title=blog.title,
+        image_generation_enabled=False
+    )
     db.add(feed)
     db.flush()
     
@@ -342,7 +283,7 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
             title=s["title"],
             body=s["body"],
             bullets=s.get("bullets"),
-            background_image_url=s.get("background_image_url"),
+            background_image_url=None,
             source_refs=s.get("source_refs", []),
             render_markdown=int(s.get("render_markdown", True))
         )
@@ -352,7 +293,7 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
     db.refresh(feed)
     return feed
 
-def process_feeds_creation(db: Session, blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True, generate_images: bool = True):
+def process_feeds_creation(db: Session, blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True):
     """Background task to process feed creation."""
     from database import SessionLocal
     db = SessionLocal()
@@ -373,7 +314,7 @@ def process_feeds_creation(db: Session, blogs: List[Blog], website: str, overwri
                     db.flush()
                 
                 if use_ai:
-                    feed = create_feed_from_blog(db, blog, generate_images)
+                    feed = create_feed_from_blog(db, blog)
                 else:
                     feed = create_basic_feed_from_blog(db, blog)
                 
@@ -429,7 +370,7 @@ def get_all_feeds(
             "created_at": f.created_at.isoformat() if f.created_at else None,
             "updated_at": f.updated_at.isoformat() if f.updated_at else None,
             "ai_generated": hasattr(f, 'ai_generated_content') and f.ai_generated_content is not None,
-            "images_generated": f.image_generation_enabled
+            "images_generated": False  # Always false now
         })
 
     has_more = (page * limit) < total
@@ -467,7 +408,6 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
             "original_title": feed.blog.title if feed.blog else "Unknown",
             "author": getattr(feed.blog, 'author', 'Admin'),
             "source_url": getattr(feed.blog, 'url', '#'),
-            # "published_at": feed.blog.created_at.isoformat() if feed.blog and feed.blog.created_at else None,
         },
         "slides": sorted([
             {
@@ -476,8 +416,8 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
                 "title": s.title,
                 "body": s.body,
                 "bullets": s.bullets,
-                "background_image_url": s.background_image_url,
-                "background_image_prompt": s.background_image_prompt,
+                "background_image_url": None,  # No images
+                "background_image_prompt": None,  # No images
                 "source_refs": s.source_refs,
                 "render_markdown": bool(s.render_markdown),
                 "created_at": s.created_at.isoformat() if s.created_at else None,
@@ -487,15 +427,16 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "created_at": feed.created_at.isoformat() if feed.created_at else None,
         "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
         "ai_generated": hasattr(feed, 'ai_generated_content') and feed.ai_generated_content is not None,
-        "images_generated": feed.image_generation_enabled
+        "images_generated": False  # Always false now
     }
+
 @router.post("/feeds", response_model=dict)
 def create_feeds_from_website(
     request: FeedRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Create feeds for all blogs from a website with optional AI image generation."""
+    """Create feeds for all blogs from a website (AI data only, no images)."""
     blogs = db.query(Blog).filter(Blog.website == request.website).all()
     if not blogs:
         raise HTTPException(status_code=404, detail="No blogs found for this website")
@@ -507,78 +448,17 @@ def create_feeds_from_website(
         request.website,
         request.overwrite,
         request.use_ai,
-        request.generate_images,
     )
 
     return {
         "website": request.website,
         "total_blogs": len(blogs),
         "use_ai": request.use_ai,
-        "generate_images": request.generate_images,
+        "generate_images": False,  # Always false now
         "message": "Feed creation process started in background",
         "status": "processing"
     }
 
-# @router.post("/feeds/blog/{blog_id}", response_model=dict)
-# def create_feed_for_blog(
-#     blog_id: int, 
-#     overwrite: bool = False, 
-#     use_ai: bool = True,
-#     generate_images: bool = True,
-#     db: Session = Depends(get_db)
-# ):
-#     """Create feed for a specific blog with optional AI image generation."""
-#     blog = db.query(Blog).filter(Blog.id == blog_id).first()
-#     if not blog:
-#         raise HTTPException(status_code=404, detail="Blog not found")
-    
-#     existing_feed = db.query(Feed).filter(Feed.blog_id == blog_id).first()
-#     if existing_feed and not overwrite:
-#         raise HTTPException(status_code=409, detail="Feed already exists for this blog. Use overwrite=true to replace it.")
-    
-#     if existing_feed and overwrite:
-#         db.delete(existing_feed)
-#         db.flush()
-    
-#     if use_ai:
-#         feed = create_feed_from_blog(db, blog, generate_images)
-#         message = "AI-generated feed created successfully"
-#     else:
-#         feed = create_basic_feed_from_blog(db, blog)
-#         message = "Basic feed created successfully"
-    
-#     return {
-#         "feed_id": feed.id,
-#         "blog_id": blog_id,
-#         "status": "created",
-#         "ai_generated": use_ai,
-#         "images_generated": generate_images,
-#         "message": message
-#     }
-
-@router.post("/feeds/{feed_id}/regenerate-images", response_model=dict)
-def regenerate_feed_images(feed_id: int, db: Session = Depends(get_db)):
-    """Regenerate images for an existing feed."""
-    feed = db.query(Feed).options(joinedload(Feed.slides)).filter(Feed.id == feed_id).first()
-    if not feed:
-        raise HTTPException(status_code=404, detail="Feed not found")
-    
-    updated_slides = 0
-    for slide in feed.slides:
-        if slide.background_image_prompt:
-            new_image_url = generate_image_with_ai(slide.background_image_prompt)
-            if new_image_url:
-                slide.background_image_url = new_image_url
-                slide.updated_at = datetime.utcnow()
-                updated_slides += 1
-    
-    db.commit()
-    
-    return {
-        "feed_id": feed_id,
-        "updated_slides": updated_slides,
-        "message": f"Regenerated images for {updated_slides} slides"
-    }
 @router.delete("/feeds/slides", response_model=dict)
 def delete_slide_from_feed(
     request: DeleteSlideRequest, 
@@ -620,3 +500,80 @@ def delete_slide_from_feed(
         db.rollback()
         logger.error(f"Error deleting slide {slide_id} from feed {feed_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete slide")
+
+@router.get("/feeds/source/{website}/categorized", response_model=dict)
+def get_categorized_feeds_by_source(
+    website: str,
+    response: Response, 
+    page: int = 1, 
+    limit: int = 20,
+    exclude_uncategorized: bool = True,
+    db: Session = Depends(get_db)
+):
+    """Get categorized feeds from a specific source URL/website."""
+    # First, verify the website exists and get its blogs
+    blogs = db.query(Blog).filter(Blog.website == website).all()
+    if not blogs:
+        raise HTTPException(status_code=404, detail=f"No blogs found for website: {website}")
+    
+    # Get blog IDs for this website
+    blog_ids = [blog.id for blog in blogs]
+    
+    # Query feeds for these blog IDs with category filters
+    query = db.query(Feed).options(joinedload(Feed.blog)).filter(Feed.blog_id.in_(blog_ids))
+    
+    # Filter feeds that have categories
+    query = query.filter(Feed.categories.isnot(None))
+    
+    if exclude_uncategorized:
+        # Exclude feeds that contain "Uncategorized" in their categories
+        query = query.filter(~Feed.categories.contains(["Uncategorized"]))
+    
+    # Order by creation date (newest first)
+    query = query.order_by(Feed.created_at.desc())
+    
+    # Get total count and paginated results
+    total = query.count()
+    feeds = query.offset((page - 1) * limit).limit(limit).all()
+
+    # Format the response
+    items = []
+    for f in feeds:
+        # Additional validation to ensure meaningful categories
+        if f.categories and (not exclude_uncategorized or "Uncategorized" not in f.categories):
+            items.append({
+                "id": f.id,
+                "blog_id": f.blog_id,
+                "title": f.title,
+                "categories": f.categories,
+                "status": f.status,
+                "slides_count": len(f.slides),
+                "meta": {
+                    "title": f.title,
+                    "original_title": f.blog.title if f.blog else "Unknown",
+                    "author": getattr(f.blog, 'author', 'Admin'),
+                    "source_url": getattr(f.blog, 'url', '#'),
+                    "website": website
+                },
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+                "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+                "ai_generated": hasattr(f, 'ai_generated_content') and f.ai_generated_content is not None,
+                "images_generated": False  # Always false now
+            })
+
+    has_more = (page * limit) < total
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page"] = str(page)
+    response.headers["X-Limit"] = str(limit)
+
+    return {
+        "website": website,
+        "items": items, 
+        "page": page, 
+        "limit": limit, 
+        "total": total, 
+        "has_more": has_more,
+        "filters": {
+            "exclude_uncategorized": exclude_uncategorized
+        }
+    }
