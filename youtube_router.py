@@ -142,76 +142,15 @@ def get_video_by_id(
     )
 
     return schemas.VideoTranscriptResponse(video_id=video_id, video=video_data)
-    
-def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
-    """Fetch channel metadata + playlists + videos using YouTube API only"""
-    if not youtube_api:
-        raise HTTPException(status_code=500, detail="YouTube API not configured")
-    
-    channel_id = extract_channel_id(channel_url)
-    if not channel_id:
-        raise HTTPException(status_code=400, detail="Invalid channel URL")
-    
-    # Get channel info
-    channel_info = youtube_api.get_channel_info(channel_id)
-    if not channel_info:
-        raise HTTPException(status_code=404, detail="Channel not found")
-    
-    channel_title = channel_info.get("title") or "Untitled Channel"
-    channel_description = channel_info.get("description") or ""
-    
-    # Get channel playlists
-    playlists = youtube_api.get_channel_playlists(channel_id)
-    enriched_playlists = []
-    
-    for pl in playlists:
-        # Get videos for each playlist
-        videos = youtube_api.get_playlist_videos(pl["id"])
-        video_list = [
-            PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos
-        ]
-        
-        enriched_playlists.append(
-            ChannelPlaylist(
-                id=pl["id"],
-                title=pl["title"],
-                description=pl.get("description") or "",
-                videos=video_list,
-            )
-        )
-    
-    return ChannelWithPlaylists(
-        channel_id=channel_id,
-        title=channel_title,
-        description=channel_description,
-        playlists=enriched_playlists,
-    )
+@router.get("/channel/{channel_id}", response_model=schemas.ChannelWithPlaylists)
+def get_channel_by_id(channel_id: str):
+    """Fetch channel details with playlists and videos"""
+    channel_url = f"https://www.youtube.com/{channel_id}"
+    return fetch_channel_by_id(channel_url)
 
 
-def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
-    """Fetch playlist metadata + videos using YouTube API only"""
-    if not youtube_api:
-        raise HTTPException(status_code=500, detail="YouTube API not configured")
-    
-    playlist_id = extract_playlist_id(playlist_url)
-    if not playlist_id:
-        raise HTTPException(status_code=400, detail="Invalid playlist URL")
-    
-    # Get playlist info
-    playlist_info = youtube_api.get_playlist_info(playlist_id)
-    if not playlist_info:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    
-    playlist_title = playlist_info.get("title") or f"Playlist {playlist_id}"
-    playlist_description = playlist_info.get("description") or ""
-    
-    # Get playlist videos
-    videos = youtube_api.get_playlist_videos(playlist_id)
-    video_list = [PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos]
-    
-    return PlaylistWithVideos(
-        playlist_id=playlist_id,
-        title=playlist_title,
-        description=playlist_description,
-        videos=video_list,
-    )
+@router.get("/playlist/{playlist_id}", response_model=schemas.PlaylistWithVideos)
+def get_playlist_by_id(playlist_id: str):
+    """Fetch playlist details with its videos"""
+    playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    return fetch_playlist_by_id(playlist_url)

@@ -1292,7 +1292,7 @@ def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, vid
         "transcript": transcript_obj.transcript_text if transcript_obj else None,
     }
 def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
-    """Fetch channel metadata + playlists + videos using YouTube Data API"""
+    """Fetch channel metadata + playlists + videos using YouTube API only"""
     if not youtube_api:
         raise HTTPException(status_code=500, detail="YouTube API not configured")
     
@@ -1300,7 +1300,7 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
     if not channel_id:
         raise HTTPException(status_code=400, detail="Invalid channel URL")
     
-    # Get channel info from YouTube API
+    # Get channel info
     channel_info = youtube_api.get_channel_info(channel_id)
     if not channel_info:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -1308,7 +1308,7 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
     channel_title = channel_info.get("title") or "Untitled Channel"
     channel_description = channel_info.get("description") or ""
     
-    # Get channel playlists from YouTube API
+    # Get channel playlists
     playlists = youtube_api.get_channel_playlists(channel_id)
     enriched_playlists = []
     
@@ -1337,7 +1337,7 @@ def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
 
 
 def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
-    """Fetch playlist metadata + videos using YouTube Data API"""
+    """Fetch playlist metadata + videos using YouTube API only"""
     if not youtube_api:
         raise HTTPException(status_code=500, detail="YouTube API not configured")
     
@@ -1345,7 +1345,7 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
     if not playlist_id:
         raise HTTPException(status_code=400, detail="Invalid playlist URL")
     
-    # Get playlist info from YouTube API
+    # Get playlist info
     playlist_info = youtube_api.get_playlist_info(playlist_id)
     if not playlist_info:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -1353,7 +1353,7 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
     playlist_title = playlist_info.get("title") or f"Playlist {playlist_id}"
     playlist_description = playlist_info.get("description") or ""
     
-    # Get playlist videos from YouTube API
+    # Get playlist videos
     videos = youtube_api.get_playlist_videos(playlist_id)
     video_list = [PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos]
     
