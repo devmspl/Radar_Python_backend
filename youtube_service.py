@@ -3,74 +3,574 @@ import re
 import uuid
 import json
 import time
-import httpx
-import logging
-import isodate
-from typing import List, Dict, Optional, Any
+import requests
+from typing import List, Dict, Optional
 from datetime import datetime
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from concurrent.futures import ThreadPoolExecutor
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+
+# Selenium imports for transcript fetching
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import pyperclip
 
 from database import get_db_session
 from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
 from schemas import *
-
-# ===========================
-# CONFIGURATION
-# ===========================
-API_SERVICE_NAME = 'youtube'
-API_VERSION = 'v3'
-YOUTUBE_API_KEY = "AIzaSyBNcFGPlGcRS1ehchAxJdXDOo3s0k660tY" # Set your API key in environment
-
-# ===========================
-# LOGGING
-# ===========================   
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import utils
 
 # ===========================
 # GLOBALS
 # ===========================
-background_executor = ThreadPoolExecutor(max_workers=3)
+background_executor = ThreadPoolExecutor(max_workers=2)
+COOKIES_FILE = "cookies.txt"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # ===========================
-# API KEY VALIDATION
+# YOUTUBE DATA API v3 CLIENT
 # ===========================
-def validate_api_key():
-    """Validate the YouTube API key"""
-    if not YOUTUBE_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="YouTube API key not configured. Set YOUTUBE_API_KEY environment variable."
-        )
+class YouTubeAPI:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://www.googleapis.com/youtube/v3"
     
-    # Test the API key with a simple request
-    try:
-        youtube = build(API_SERVICE_NAME, API_VERSION, developerKey=YOUTUBE_API_KEY)
-        request = youtube.videos().list(part="snippet", id="dQw4w9WgXcQ")  # Test with a known video
-        request.execute()
-        return True
-    except HttpError as e:
-        logger.error(f"API key validation failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"YouTube API key is invalid: {e}"
-        )
+    def _make_request(self, endpoint: str, params: dict) -> Optional[dict]:
+        """Make request to YouTube Data API"""
+        params['key'] = self.api_key
+        try:
+            response = requests.get(f"{self.base_url}/{endpoint}", params=params, timeout=30)
+            if response.status_code == 404:
+                print(f"YouTube API 404: {endpoint} - {params}")
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"YouTube API request failed: {e}")
+            return None
+    
+    def get_video_title(self, video_id: str) -> Optional[str]:
+        """Get video title using YouTube Data API"""
+        data = self._make_request("videos", {
+            'part': 'snippet',
+            'id': video_id
+        })
+        
+        if data and 'items' in data and len(data['items']) > 0:
+            return data['items'][0]['snippet']['title']
+        return None
+    
+    def get_playlist_info(self, playlist_id: str) -> Optional[dict]:
+        """Get playlist information"""
+        data = self._make_request("playlists", {
+            'part': 'snippet',
+            'id': playlist_id
+        })
+        
+        if data and 'items' in data and len(data['items']) > 0:
+            item = data['items'][0]['snippet']
+            return {
+                'title': item['title'],
+                'description': item.get('description', '')
+            }
+        return None
+    
+    def get_playlist_videos(self, playlist_id: str, max_results: int = 50) -> List[Dict]:
+        """Get all videos from a playlist"""
+        videos = []
+        page_token = None
+        
+        while len(videos) < max_results:
+            params = {
+                'part': 'snippet',
+                'playlistId': playlist_id,
+                'maxResults': min(50, max_results - len(videos))
+            }
+            if page_token:
+                params['pageToken'] = page_token
+            
+            data = self._make_request("playlistItems", params)
+            if not data or 'items' not in data:
+                break
+                
+            for item in data['items']:
+                if 'snippet' in item and 'resourceId' in item['snippet']:
+                    video_id = item['snippet']['resourceId']['videoId']
+                    videos.append({
+                        'id': video_id,
+                        'title': item['snippet']['title'],
+                        'url': f"https://www.youtube.com/watch?v={video_id}"
+                    })
+            
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                break
+        
+        return videos
+    
+    def get_channel_info(self, channel_id: str) -> Optional[dict]:
+        """Get channel information with proper handle (@username) support"""
+        print(f"🎯 Fetching channel info for: {channel_id}")
+    
+        # If it's a handle (starts with @), we need to search for it first
+        if channel_id.startswith('@'):
+            print(f"🔍 Handling @username format: {channel_id}")
+        
+            # Remove the @ symbol for search
+            handle = channel_id[1:]
+            print(f"🔍 Searching for handle: {handle}")
+        
+            # Search for the channel by handle
+            search_data = self._make_request("search", {
+                'part': 'snippet',
+                'type': 'channel',
+                'q': handle,
+                'maxResults': 5
+            })
+        
+            print(f"📦 Search API response: {search_data}")
+        
+            if not search_data or 'items' not in search_data or len(search_data['items']) == 0:
+                print(f"❌ No channels found for handle: {handle}")
+                return None
+        
+            # Find the exact match for the handle
+            exact_match = None
+            for item in search_data['items']:
+                snippet = item['snippet']
+                channel_title = snippet.get('title', '')
+                channel_handle = snippet.get('customUrl', '')
+            
+                print(f"🔍 Checking result: {channel_title} (handle: {channel_handle})")
+            
+                # Check if this is an exact match
+                if (channel_handle and channel_handle.lower() == f"@{handle.lower()}") or \
+                (channel_title and handle.lower() in channel_title.lower()):
+                    exact_match = item
+                    break
+        
+            # If no exact match found, use the first result
+            if not exact_match:
+                exact_match = search_data['items'][0]
+                print(f"⚠️ No exact handle match found, using first result")
+        
+            channel_id = exact_match['id']['channelId']
+            print(f"✅ Found channel ID for @{handle}: {channel_id}")
+    
+        # Now get channel info with the proper channel ID
+        print(f"📡 Making channels API request for ID: {channel_id}")
+        channels_data = self._make_request("channels", {
+            'part': 'snippet',
+            'id': channel_id
+        })
+    
+        print(f"📦 Channels API response: {channels_data}")
+    
+        if channels_data and 'items' in channels_data and len(channels_data['items']) > 0:
+            item = channels_data['items'][0]['snippet']
+            result = {
+                'title': item['title'],
+                'description': item.get('description', '')
+            }
+            print(f"✅ Successfully fetched channel info: {result['title']}")
+            return result
+    
+        print(f"❌ No channel found with ID: {channel_id}")
+        return None
+    
+    def get_channel_playlists(self, channel_id: str, max_results: int = 50) -> List[Dict]:
+        """Get all playlists from a channel with handle support"""
+        playlists = []
+        page_token = None
+    
+        print(f"🎯 Fetching playlists for channel: {channel_id}")
+    
+        # If it's a handle, first get the channel ID
+        if channel_id.startswith('@'):
+            print(f"🔍 Converting handle to channel ID: {channel_id}")
+            channel_info = self.get_channel_info(channel_id)
+            if not channel_info:
+                print(f"❌ Could not get channel info for handle: {channel_id}")
+                return []
+        
+            # We need to search again to get the actual channel ID
+            handle = channel_id[1:]
+            search_data = self._make_request("search", {
+                'part': 'snippet',
+                'type': 'channel',
+                'q': handle,
+                'maxResults': 1
+            })
+        
+            if search_data and 'items' in search_data and len(search_data['items']) > 0:
+                channel_id = search_data['items'][0]['id']['channelId']
+                print(f"✅ Got channel ID for playlists: {channel_id}")
+            else:
+                print(f"❌ Could not find channel ID for handle: {channel_id}")
+                return []
+    
+        print(f"📡 Fetching playlists for channel ID: {channel_id}")
+    
+        while len(playlists) < max_results:
+            params = {
+                'part': 'snippet',
+                'channelId': channel_id,
+                'maxResults': min(50, max_results - len(playlists))
+            }
+            if page_token:
+                params['pageToken'] = page_token
+        
+            data = self._make_request("playlists", params)
+            if not data or 'items' not in data:
+                print(f"❌ No playlists data returned for channel: {channel_id}")
+                break
+            
+            for item in data['items']:
+                playlists.append({
+                    'id': item['id'],
+                    'title': item['snippet']['title'],
+                    'description': item['snippet'].get('description', ''),
+                    'url': f"https://www.youtube.com/playlist?list={item['id']}"
+                })
+        
+            print(f"📚 Found {len(data['items'])} playlists in this page")
+        
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                break
+    
+        print(f"✅ Total playlists found: {len(playlists)}")
+        return playlists
+    
+    def search_channel_videos(self, channel_id: str, max_results: int = 20) -> List[Dict]:
+        """Search for videos in a channel (fallback if no playlists)"""
+        videos = []
+        page_token = None
+        
+        while len(videos) < max_results:
+            params = {
+                'part': 'snippet',
+                'channelId': channel_id,
+                'type': 'video',
+                'order': 'date',
+                'maxResults': min(50, max_results - len(videos))
+            }
+            if page_token:
+                params['pageToken'] = page_token
+            
+            data = self._make_request("search", params)
+            if not data or 'items' not in data:
+                break
+                
+            for item in data['items']:
+                if 'id' in item and 'videoId' in item['id']:
+                    videos.append({
+                        'id': item['id']['videoId'],
+                        'title': item['snippet']['title'],
+                        'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}"
+                    })
+            
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                break
+        
+        return videos
+
+# Initialize YouTube API client
+youtube_api = YouTubeAPI(YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
 
 # ===========================
-# YOUTUBE API HELPERS
+# SELENIUM TRANSCRIPT FETCHER (Using your exact logic)
 # ===========================
-def get_youtube_service():
-    """Get YouTube API service with API key"""
-    validate_api_key()
-    return build(API_SERVICE_NAME, API_VERSION, developerKey=YOUTUBE_API_KEY)
+def copy_transcript(youtube_url, headless=True, max_retries=2):
+    """Fetch transcript using Selenium and Tactiq with retry logic"""
+    
+    for retry_count in range(max_retries + 1):
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        
+        # Performance optimizations
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins")
+        options.add_argument("--disable-images")
+        options.add_argument("--blink-settings=imagesEnabled=false")
+        
+        # Timeout settings
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+
+        try:
+            if retry_count > 0:
+                print(f"🔄 Retry attempt {retry_count}/{max_retries} for: {youtube_url}")
+            
+            # Set timeouts
+            driver.set_page_load_timeout(60)  # 60 seconds for page load
+            driver.implicitly_wait(10)  # 10 seconds for element finding
+
+            # 1. Open the Tactiq YouTube transcript tool
+            print("Opening Tactiq transcript tool...")
+            driver.get("https://tactiq.io/tools/youtube-transcript")
+
+            wait = WebDriverWait(driver, 20)  # Increased wait time
+
+            # 2. Find the input field
+            print("Looking for input field...")
+            input_selectors = [
+                "#yt-2",
+                "input[type='url']",
+                "input[placeholder*='youtube']",
+                "input[placeholder*='YouTube']",
+                "input.youtube-url",
+                "input#youtube-url"
+            ]
+            
+            input_box = None
+            for selector in input_selectors:
+                try:
+                    input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                    print(f"Found input with selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not input_box:
+                if retry_count < max_retries:
+                    print("Input field not found, retrying...")
+                    continue
+                driver.save_screenshot("debug_input_not_found.png")
+                raise Exception("Could not find input field")
+            
+            input_box.clear()
+            input_box.send_keys(youtube_url)
+            print("YouTube URL entered")
+
+            # 3. Find and click the submit button
+            print("Looking for submit button...")
+            button_selectors = [
+                "input.button-primary.w-button",
+                "button[type='submit']",
+                "input[type='submit']",
+                "button.primary",
+                ".w-button"
+            ]
+            
+            submit_btn = None
+            for selector in button_selectors:
+                try:
+                    submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                    print(f"Found button with selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not submit_btn:
+                if retry_count < max_retries:
+                    print("Submit button not found, retrying...")
+                    continue
+                driver.save_screenshot("debug_button_not_found.png")
+                raise Exception("Could not find submit button")
+            
+            # Click using JavaScript for reliability
+            driver.execute_script("arguments[0].click();", submit_btn)
+            print("Submit button clicked")
+
+            # 4. Wait for transcript to load with better waiting strategy
+            print("Waiting for transcript to load...")
+            
+            # Wait for processing to complete
+            transcript = wait_for_transcript_processing(driver, wait)
+            
+            if transcript:
+                print(f"✅ Successfully extracted clean transcript ({len(transcript)} characters)")
+                return transcript
+            else:
+                if retry_count < max_retries:
+                    print("Transcript not found, retrying...")
+                    continue
+                print("❌ Could not extract transcript after all retries")
+                return None
+
+        except TimeoutException as e:
+            print(f"⏰ Timeout error (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+            if retry_count < max_retries:
+                print("Retrying after timeout...")
+                continue
+            else:
+                print("Max retries exceeded for timeout")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+            if retry_count < max_retries:
+                print("Retrying after error...")
+                continue
+            else:
+                print("Max retries exceeded")
+                return None
+
+        finally:
+            driver.quit()
+    
+    return None
+
+
+def wait_for_transcript_processing(driver, wait, max_wait=60):
+    """Wait for transcript to process with better detection"""
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait:
+        try:
+            # Check for loading indicators
+            loading_selectors = [
+                "//*[contains(text(), 'Loading')]",
+                "//*[contains(text(), 'Processing')]",
+                "//*[contains(@class, 'loading')]",
+                "//*[contains(@class, 'spinner')]",
+            ]
+            
+            # If loading indicators found, wait
+            loading_found = False
+            for selector in loading_selectors:
+                try:
+                    driver.find_element(By.XPATH, selector)
+                    loading_found = True
+                    break
+                except:
+                    continue
+            
+            if loading_found:
+                print("⏳ Still processing...")
+                time.sleep(3)
+                continue
+            
+            # Try to extract transcript
+            transcript = extract_clean_transcript_from_page(driver)
+            if transcript:
+                return transcript
+            
+            # Wait before next attempt
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"⚠️ Error during transcript wait: {e}")
+            time.sleep(2)
+    
+    print("⏰ Timeout waiting for transcript processing")
+    return None
+
+
+def extract_clean_transcript_from_page(driver):
+    """Extract and clean transcript from the page"""
+    try:
+        # Get all text from the page
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        
+        # Clean the transcript
+        clean_transcript = clean_transcript_text(body_text)
+        
+        if clean_transcript and len(clean_transcript.strip()) > 100:
+            return clean_transcript.strip()
+        
+    except Exception as e:
+        print(f"Error extracting transcript: {e}")
+    
+    return None
+
+
+def clean_transcript_text(raw_text):
+    """Clean the raw transcript text to remove timestamps and Tactiq headers"""
+    if not raw_text:
+        return None
+    
+    lines = raw_text.split('\n')
+    clean_lines = []
+    
+    # Patterns to exclude
+    exclude_patterns = [
+        'Get started for FREE',
+        'Get the transcript:',
+        'YouTube Transcript Generator',
+        'Focus on the Meeting',
+        'Get live, in-meeting transcriptions',
+        'Upload the transcript to Tactiq',
+        '©.*Tactiq',
+        'All rights reserved',
+        'Made with',
+        'Tactiq'
+    ]
+    
+    found_transcript_start = False
+    
+    for line in lines:
+        line = line.strip()
+        
+        if not line:
+            continue
+            
+        # Skip excluded patterns
+        if any(pattern in line for pattern in exclude_patterns):
+            continue
+            
+        # Skip timestamp lines
+        if re.match(r'^\d{2}:\d{2}:\d{2}\.\d{3}$', line) or re.match(r'^\d{2}:\d{2}:\d{2}$', line):
+            continue
+            
+        # Skip very short lines
+        if len(line) < 5:
+            continue
+            
+        # Find start of actual content
+        if not found_transcript_start:
+            if (len(line) > 10 and 
+                not any(keyword in line.lower() for keyword in ['transcript', 'get', 'free', 'started']) and
+                not line.isupper()):
+                found_transcript_start = True
+                clean_lines.append(line)
+        else:
+            clean_lines.append(line)
+    
+    clean_text = '\n'.join(clean_lines)
+    
+    # Remove remaining timestamps
+    clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3}', '', clean_text)
+    clean_text = re.sub(r'\d{2}:\d{2}:\d{2}', '', clean_text)
+    
+    # Clean up whitespace
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    clean_text = clean_text.strip()
+    
+    return clean_text
+# ===========================
+# YOUTUBE HELPERS (Using YouTube Data API)
+# ===========================
+def determine_content_type(url: str) -> ContentType:
+    """Determine if URL is a channel, playlist, or video"""
+    if any(x in url for x in ["youtube.com/channel/", "youtube.com/c/", "youtube.com/user/", "youtube.com/@"]):
+        return ContentType.CHANNEL
+    elif "youtube.com/playlist" in url or "list=" in url:
+        return ContentType.PLAYLIST
+    elif "youtube.com/watch" in url or "youtu.be/" in url:
+        return ContentType.VIDEO
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported YouTube URL format")
 
 def extract_video_id(url: str) -> Optional[str]:
-    """Extract video ID from YouTube URL"""
     patterns = [
         r"youtube\.com/watch\?v=([^&]+)",
         r"youtu\.be/([^?]+)",
@@ -83,7 +583,6 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 def extract_playlist_id(url: str) -> Optional[str]:
-    """Extract playlist ID from YouTube URL"""
     patterns = [r"list=([^&]+)", r"youtube\.com/playlist\?list=([^&]+)"]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -92,215 +591,129 @@ def extract_playlist_id(url: str) -> Optional[str]:
     return None
 
 def extract_channel_id(url: str) -> Optional[str]:
-    """Extract channel ID from YouTube URL"""
+    """Extract channel ID from various YouTube URL formats with better parsing"""
+    print(f"🔗 Parsing channel URL: {url}")
+    
     patterns = [
-        r"youtube\.com/channel/([^/]+)",
-        r"youtube\.com/c/([^/]+)",
-        r"youtube\.com/user/([^/]+)",
-        r"youtube\.com/@([^/]+)",
+        r"youtube\.com/channel/([a-zA-Z0-9_-]+)",
+        r"youtube\.com/c/([a-zA-Z0-9_-]+)",
+        r"youtube\.com/user/([a-zA-Z0-9_-]+)",
+        r"youtube\.com/@([a-zA-Z0-9_.-]+)",
     ]
+    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            return match.group(1)
+            channel_id = match.group(1)
+            print(f"✅ Extracted channel ID with pattern '{pattern}': {channel_id}")
+            return channel_id
+    
+    print("❌ No channel ID pattern matched the URL")
     return None
 
-def determine_content_type(url: str) -> ContentType:
-    """Determine if URL is a channel, playlist, or video"""
-    if extract_channel_id(url):
-        return ContentType.CHANNEL
-    elif extract_playlist_id(url):
-        return ContentType.PLAYLIST
-    elif extract_video_id(url):
-        return ContentType.VIDEO
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported YouTube URL format")
+def get_youtube_title(url: str) -> str:
+    """Get video title using YouTube Data API"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    video_id = extract_video_id(url)
+    if video_id:
+        title = youtube_api.get_video_title(video_id)
+        if title:
+            return title
+    
+    raise HTTPException(status_code=404, detail="Could not fetch video title")
 
-# ===========================
-# YOUTUBE DATA API FUNCTIONS
-# ===========================
-def get_video_details(youtube, video_id: str) -> Optional[Dict]:
-    """Get video details using YouTube Data API"""
-    try:
-        request = youtube.videos().list(
-            part="snippet,contentDetails",
-            id=video_id
-        )
-        response = request.execute()
-        
-        if response['items']:
-            item = response['items'][0]
-            # Convert ISO 8601 duration to seconds
-            duration = isodate.parse_duration(item['contentDetails']['duration']).total_seconds()
-            
-            return {
-                'id': video_id,
-                'title': item['snippet']['title'],
-                'description': item['snippet'].get('description', ''),
-                'duration': int(duration),
-                'publishedAt': item['snippet']['publishedAt']
-            }
-        return None
-    except HttpError as e:
-        logger.error(f"Error getting video details: {e}")
-        return None
+def get_playlist_name(playlist_url: str) -> str:
+    """Get playlist name using YouTube Data API"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    playlist_id = extract_playlist_id(playlist_url)
+    if playlist_id:
+        info = youtube_api.get_playlist_info(playlist_id)
+        if info:
+            return info['title']
+    
+    raise HTTPException(status_code=404, detail="Could not fetch playlist info")
 
-def get_playlist_details(youtube, playlist_id: str) -> Optional[Dict]:
-    """Get playlist details using YouTube Data API"""
-    try:
-        request = youtube.playlists().list(
-            part="snippet",
-            id=playlist_id
-        )
-        response = request.execute()
-        
-        if response['items']:
-            item = response['items'][0]
-            return {
-                'id': playlist_id,
-                'title': item['snippet']['title'],
-                'description': item['snippet'].get('description', ''),
-                'publishedAt': item['snippet']['publishedAt']
-            }
-        return None
-    except HttpError as e:
-        logger.error(f"Error getting playlist details: {e}")
-        return None
-
-def get_channel_details(youtube, channel_id: str) -> Optional[Dict]:
-    """Get channel details using YouTube Data API"""
-    try:
-        request = youtube.channels().list(
-            part="snippet",
-            id=channel_id
-        )
-        response = request.execute()
-        
-        if response['items']:
-            item = response['items'][0]
-            return {
-                'id': channel_id,
-                'title': item['snippet']['title'],
-                'description': item['snippet'].get('description', ''),
-                'publishedAt': item['snippet']['publishedAt']
-            }
-        return None
-    except HttpError as e:
-        logger.error(f"Error getting channel details: {e}")
-        return None
-
-def get_playlist_videos(youtube, playlist_id: str) -> List[Dict]:
-    """Get all videos from a playlist using YouTube Data API"""
-    videos = []
-    next_page_token = None
+def get_channel_name(channel_url: str) -> str:
+    """Get channel name using YouTube Data API with handle support"""
+    if not youtube_api:
+        print("❌ YouTube API not configured")
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    print(f"🔍 Processing channel URL: {channel_url}")
+    channel_id = extract_channel_id(channel_url)
+    print(f"📋 Extracted channel identifier: {channel_id}")
+    
+    if not channel_id:
+        print("❌ Could not extract channel identifier from URL")
+        raise HTTPException(status_code=400, detail="Invalid channel URL format")
     
     try:
-        while True:
-            request = youtube.playlistItems().list(
-                part="snippet",
-                playlistId=playlist_id,
-                maxResults=50,
-                pageToken=next_page_token
-            )
-            response = request.execute()
-            
-            for item in response['items']:
-                if 'resourceId' in item['snippet'] and 'videoId' in item['snippet']['resourceId']:
-                    video_id = item['snippet']['resourceId']['videoId']
-                    videos.append({
-                        'id': video_id,
-                        'title': item['snippet']['title'],
-                        'description': item['snippet'].get('description', ''),
-                        'publishedAt': item['snippet']['publishedAt']
-                    })
-            
-            next_page_token = response.get('nextPageToken')
-            if not next_page_token:
-                break
-                
-    except HttpError as e:
-        logger.error(f"Error getting playlist videos: {e}")
-    
-    return videos
-
-def get_channel_playlists(youtube, channel_id: str) -> List[Dict]:
-    """Get all playlists from a channel using YouTube Data API"""
-    playlists = []
-    next_page_token = None
-    
-    try:
-        while True:
-            request = youtube.playlists().list(
-                part="snippet",
-                channelId=channel_id,
-                maxResults=50,
-                pageToken=next_page_token
-            )
-            response = request.execute()
-            
-            for item in response['items']:
-                playlists.append({
-                    'id': item['id'],
-                    'title': item['snippet']['title'],
-                    'description': item['snippet'].get('description', ''),
-                    'publishedAt': item['snippet']['publishedAt']
-                })
-            
-            next_page_token = response.get('nextPageToken')
-            if not next_page_token:
-                break
-                
-    except HttpError as e:
-        logger.error(f"Error getting channel playlists: {e}")
-    
-    return playlists
-
-# ===========================
-# CAPTIONS API FUNCTIONS
-# ===========================
-def get_video_captions(video_id: str) -> Optional[str]:
-    """Get captions/transcript for a video using YouTube Captions API"""
-    try:
-        # For API key access, we need to use a different approach since captions
-        # typically require OAuth. We'll use a workaround with the transcripts API
-        # or fall back to a different method if available
+        # For handle URLs, we need to keep the @ symbol
+        if channel_url.startswith('https://www.youtube.com/@'):
+            channel_id = f"@{channel_id}"
+            print(f"🔧 Using handle format: {channel_id}")
         
-        # This is a placeholder - you might need to implement a different approach
-        # for captions with API key only access
+        info = youtube_api.get_channel_info(channel_id)
+        print(f"📊 Channel API response: {info}")
         
-        logger.warning(f"Caption access with API key only is limited. Video ID: {video_id}")
-        return None
-        
+        if info and info.get('title'):
+            print(f"✅ Got channel name: {info['title']}")
+            return info['title']
+        else:
+            print(f"❌ No channel info found for: {channel_id}")
+            raise HTTPException(status_code=404, detail=f"Channel not found: {channel_url}")
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting captions for video {video_id}: {e}")
-        return None
+        print(f"❌ Error fetching channel info: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching channel information: {str(e)}")
 
-# Alternative approach: Use a third-party service or different API for transcripts
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+def get_playlist_videos_api(playlist_url: str) -> List[Dict]:
+    """Get playlist videos using YouTube Data API"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    playlist_id = extract_playlist_id(playlist_url)
+    if playlist_id:
+        videos = youtube_api.get_playlist_videos(playlist_id)
+        if videos:
+            return videos
+    
+    raise HTTPException(status_code=404, detail="No videos found in playlist")
 
-def get_transcript_fallback(video_id: str) -> Optional[str]:
-    """Fallback method to get transcripts if YouTube API doesn't work"""
-    try:
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join([t["text"] for t in transcript_data])
-
-    except TranscriptsDisabled:
-        logger.warning(f"Transcripts are disabled for video {video_id}")
-    except NoTranscriptFound:
-        logger.warning(f"No transcript found for video {video_id}")
-    # except TooManyRequests:
-    #     logger.error(f"Rate limited by YouTube while fetching transcript for {video_id}")
-    except Exception as e:
-        logger.error(f"Unexpected error in fallback transcript method for {video_id}: {e}")
-
-    return None
-
-
+def get_channel_playlists_api(channel_url: str) -> List[Dict]:
+    """Get channel playlists using YouTube Data API with handle support"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    channel_id = extract_channel_id(channel_url)
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="Invalid channel URL")
+    
+    print(f"🔍 Getting playlists for channel: {channel_url}")
+    
+    # For handle URLs, we need to keep the @ symbol
+    if channel_url.startswith('https://www.youtube.com/@'):
+        channel_id = f"@{channel_id}"
+        print(f"🔧 Using handle format for playlists: {channel_id}")
+    
+    playlists = youtube_api.get_channel_playlists(channel_id)
+    if playlists:
+        print(f"✅ Found {len(playlists)} playlists")
+        return playlists
+    
+    print(f"❌ No playlists found for channel: {channel_url}")
+    raise HTTPException(status_code=404, detail="No playlists found in channel")
 # ===========================
 # PROCESSING FUNCTIONS
 # ===========================
 def update_job_status(job_id: str, status: JobStatus, total_items: int = None, processed_items: int = None):
-    """Update job status in database"""
+    """Update job status in database with proper session handling"""
     db = next(get_db_session())
     try:
         job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
@@ -319,129 +732,136 @@ def update_job_status(job_id: str, status: JobStatus, total_items: int = None, p
     finally:
         db.close()
 
-def process_video_background(video_url: str, job_id: str, store_in_db: bool, playlist_id: Optional[str] = None):
-    """Process a single video in background using YouTube APIs"""
+def process_video_background(video_url: str, job_id: str, model_size: str, store_in_db: bool, playlist_id: Optional[str] = None):
+    """Process a single video in background with improved error handling"""
     try:
-        youtube = get_youtube_service()
         video_id = extract_video_id(video_url)
-        
         if not video_id:
-            update_job_status(job_id, JobStatus.FAILED)
+            print(f"❌ Could not extract video ID from: {video_url}")
             return False
         
-        # Get video details
-        video_details = get_video_details(youtube, video_id)
-        if not video_details:
-            update_job_status(job_id, JobStatus.FAILED)
-            return False
+        title = get_youtube_title(video_url)
+        print(f"🎬 Processing video: {title}")
         
-        # Get captions/transcript
-        transcript = get_video_captions(video_id)
+        # Use Selenium to get transcript with retry logic
+        transcript = copy_transcript(video_url, headless=True, max_retries=2)
         
-        # If YouTube API doesn't work, try fallback
         if not transcript:
-            transcript = get_transcript_fallback(video_id)
+            print(f"❌ Failed to fetch transcript for: {title}")
+            return False
         
-        if transcript:
-            # Generate description
-            description = f"Transcript available for: {video_details['title']}"
-            
-            if store_in_db:
-                db = next(get_db_session())
-                try:
-                    job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
-                    if job:
-                        transcript_obj = Transcript(
-                            transcript_id=str(uuid.uuid4()),
-                            video_id=video_id,
-                            playlist_id=playlist_id,
-                            title=video_details['title'],
-                            transcript_text=transcript,
-                            word_count=len(transcript.split()),
-                            description=description,
-                            duration=video_details['duration'],
-                            job_id=job.id
-                        )
-                        db.add(transcript_obj)
-                        db.commit()
-                finally:
-                    db.close()
-            
-            update_job_status(job_id, JobStatus.COMPLETED, total_items=1, processed_items=1)
-            return True
+        # Additional validation
+        if len(transcript.strip()) < 50:
+            print(f"❌ Transcript too short for: {title}")
+            return False
         
-        update_job_status(job_id, JobStatus.FAILED)
-        return False
+        print(f"✅ Successfully extracted transcript ({len(transcript)} characters)")
+        
+        if store_in_db:
+            db = next(get_db_session())
+            try:
+                job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
+                if job:
+                    transcript_obj = Transcript(
+                        transcript_id=str(uuid.uuid4()),
+                        video_id=video_id,
+                        playlist_id=playlist_id,
+                        title=title,
+                        transcript_text=transcript,
+                        word_count=len(transcript.split()),
+                        description=None,
+                        job_id=job.id
+                    )
+                    db.add(transcript_obj)
+                    db.commit()
+                    print(f"💾 Saved transcript to database for: {title}")
+            except Exception as e:
+                print(f"❌ Database error for {title}: {e}")
+                db.rollback()
+                return False
+            finally:
+                db.close()
+        
+        return True
         
     except Exception as e:
-        logger.error(f"Error processing video {video_url}: {e}")
-        update_job_status(job_id, JobStatus.FAILED)
+        print(f"❌ Error processing video {video_url}: {e}")
         return False
-
-def process_playlist_background(playlist_url: str, job_id: str, store_in_db: bool):
-    """Process playlist in background using YouTube APIs"""
+def process_playlist_background(playlist_url: str, job_id: str, model_size: str, store_in_db: bool):
+    """Process playlist in background - process all videos in the playlist"""
+    db = next(get_db_session())
     try:
-        youtube = get_youtube_service()
+        playlist_name = get_playlist_name(playlist_url)
+        job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
+        if job:
+            job.content_name = playlist_name
+            db.commit()
+        
+        # Get all videos from the playlist
+        videos = get_playlist_videos_api(playlist_url)
         playlist_id = extract_playlist_id(playlist_url)
         
-        if not playlist_id:
-            update_job_status(job_id, JobStatus.FAILED, 0, 0)
-            return
-        
-        # Get playlist details
-        playlist_details = get_playlist_details(youtube, playlist_id)
-        playlist_name = playlist_details['title'] if playlist_details else "Unknown Playlist"
-        
-        # Update job with playlist name
-        db = next(get_db_session())
-        try:
-            job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
-            if job:
-                job.content_name = playlist_name
-                db.commit()
-        finally:
-            db.close()
-        
-        # Get playlist videos
-        videos = get_playlist_videos(youtube, playlist_id)
-        
         if not videos:
+            print(f"❌ No videos found in playlist: {playlist_name}")
             update_job_status(job_id, JobStatus.FAILED, 0, 0)
             return
         
+        print(f"🎯 Processing playlist '{playlist_name}' with {len(videos)} videos")
+        
+        # Update job with total items
         update_job_status(job_id, JobStatus.PROCESSING, len(videos), 0)
         
         processed_count = 0
-        for i, video in enumerate(videos):
-            success = process_video_background(
-                f"https://www.youtube.com/watch?v={video['id']}",
-                job_id,
-                store_in_db,
-                playlist_id
-            )
-            if success:
-                processed_count += 1
-            update_job_status(job_id, JobStatus.PROCESSING, len(videos), i + 1)
+        successful_count = 0
         
-        update_job_status(job_id, JobStatus.COMPLETED, len(videos), processed_count)
+        # Process each video in the playlist
+        for i, video in enumerate(videos):
+            print(f"📹 Processing video {i+1}/{len(videos)}: {video['title']}")
+            
+            try:
+                success = process_video_background(video['url'], job_id, model_size, store_in_db, playlist_id)
+                if success:
+                    successful_count += 1
+                    print(f"✅ Successfully processed: {video['title']}")
+                else:
+                    print(f"❌ Failed to process: {video['title']}")
+                
+                processed_count += 1
+                
+                # Update progress
+                update_job_status(job_id, JobStatus.PROCESSING, len(videos), processed_count)
+                
+                # Add a small delay between videos to avoid overwhelming the system
+                time.sleep(2)
+                
+            except Exception as e:
+                print(f"❌ Error processing video {video['title']}: {e}")
+                processed_count += 1
+                update_job_status(job_id, JobStatus.PROCESSING, len(videos), processed_count)
+                continue
+        
+        # Final status update
+        if successful_count > 0:
+            print(f"🎉 Playlist processing completed: {successful_count}/{len(videos)} videos successful")
+            update_job_status(job_id, JobStatus.COMPLETED, len(videos), successful_count)
+        else:
+            print(f"💥 Playlist processing failed: 0/{len(videos)} videos successful")
+            update_job_status(job_id, JobStatus.FAILED, len(videos), 0)
         
     except Exception as e:
-        logger.error(f"Error processing playlist: {e}")
+        print(f"❌ Error processing playlist: {e}")
         update_job_status(job_id, JobStatus.FAILED)
+    finally:
+        db.close()
 
-def process_channel_background(channel_url: str, job_id: str, store_in_db: bool):
-    """Process channel in background using YouTube APIs"""
+def process_channel_background(channel_url: str, job_id: str, model_size: str, store_in_db: bool):
+    """Process channel in background using only YouTube API and Selenium"""
     try:
-        youtube = get_youtube_service()
-        channel_id = extract_channel_id(channel_url)
+        print(f"🏢 Starting channel processing: {channel_url}")
         
-        if not channel_id:
-            update_job_status(job_id, JobStatus.FAILED, 0, 0)
-            return
-        
-        # Get channel details
-        channel_details = get_channel_details(youtube, channel_id)
-        channel_name = channel_details['title'] if channel_details else "Unknown Channel"
+        # Get channel info
+        channel_name = get_channel_name(channel_url)
+        print(f"📝 Channel: {channel_name}")
         
         # Update job with channel name
         db = next(get_db_session())
@@ -454,11 +874,15 @@ def process_channel_background(channel_url: str, job_id: str, store_in_db: bool)
             db.close()
         
         # Get channel playlists
-        playlists = get_channel_playlists(youtube, channel_id)
+        print("🔍 Fetching channel playlists...")
+        playlists = get_channel_playlists_api(channel_url)
         
         if not playlists:
+            print("❌ No playlists found in channel")
             update_job_status(job_id, JobStatus.FAILED, 0, 0)
             return
+        
+        print(f"📚 Found {len(playlists)} playlists")
         
         # Store playlist information
         playlist_info = []
@@ -466,7 +890,7 @@ def process_channel_background(channel_url: str, job_id: str, store_in_db: bool)
             playlist_info.append({
                 'id': playlist['id'],
                 'title': playlist['title'],
-                'description': playlist.get('description', '')
+                'url': playlist['url']
             })
         
         # Update job with playlists
@@ -479,78 +903,149 @@ def process_channel_background(channel_url: str, job_id: str, store_in_db: bool)
         finally:
             db.close()
         
-        # Calculate total videos across all playlists
+        # Calculate total videos
+        print("📊 Calculating total videos...")
         total_videos = 0
-        for playlist in playlists:
-            videos = get_playlist_videos(youtube, playlist['id'])
-            total_videos += len(videos) if videos else 0
+        playlist_videos_map = {}
         
+        for playlist in playlists:
+            playlist_id = playlist['id']
+            playlist_title = playlist['title']
+            
+            print(f"   📋 Processing playlist: {playlist_title}")
+            try:
+                videos = get_playlist_videos_api(playlist['url'])
+                if videos:
+                    playlist_videos_map[playlist_id] = videos
+                    total_videos += len(videos)
+                    print(f"   ✅ Found {len(videos)} videos")
+                else:
+                    print(f"   ⚠️ No videos found in playlist")
+            except Exception as e:
+                print(f"   ❌ Failed to get videos for playlist: {e}")
+        
+        print(f"🎯 Total videos to process: {total_videos}")
+        
+        if total_videos == 0:
+            print("❌ No videos found in any playlist")
+            update_job_status(job_id, JobStatus.FAILED, 0, 0)
+            return
+        
+        # Update job with total items
         update_job_status(job_id, JobStatus.PROCESSING, total_videos, 0)
         
         # Process videos from all playlists
         processed_count = 0
-        for playlist in playlists:
-            playlist_videos = get_playlist_videos(youtube, playlist['id'])
-            
-            if not playlist_videos:
-                continue
-                
-            for video in playlist_videos:
-                success = process_video_background(
-                    f"https://www.youtube.com/watch?v={video['id']}",
-                    job_id,
-                    store_in_db,
-                    playlist['id']
-                )
-                if success:
-                    processed_count += 1
-                update_job_status(job_id, JobStatus.PROCESSING, total_videos, processed_count)
+        successful_count = 0
         
-        update_job_status(job_id, JobStatus.COMPLETED, total_videos, processed_count)
+        for playlist_index, playlist in enumerate(playlists, 1):
+            playlist_id = playlist['id']
+            playlist_title = playlist['title']
+            videos = playlist_videos_map.get(playlist_id, [])
+            
+            if not videos:
+                print(f"⏭️ Skipping empty playlist: {playlist_title}")
+                continue
+            
+            print(f"\n🎬 Processing playlist {playlist_index}/{len(playlists)}: {playlist_title}")
+            
+            for video_index, video in enumerate(videos, 1):
+                video_title = video['title']
+                
+                print(f"   🎥 Processing video {video_index}/{len(videos)}: {video_title}")
+                
+                try:
+                    success = process_video_background(
+                        video['url'], 
+                        job_id, 
+                        model_size, 
+                        store_in_db, 
+                        playlist_id
+                    )
+                    
+                    if success:
+                        successful_count += 1
+                        print(f"   ✅ Successfully processed: {video_title}")
+                    else:
+                        print(f"   ❌ Failed to process: {video_title}")
+                    
+                    processed_count += 1
+                    
+                    # Update progress
+                    update_job_status(job_id, JobStatus.PROCESSING, total_videos, processed_count)
+                    
+                    # Add delay between videos
+                    time.sleep(5)
+                    
+                except Exception as e:
+                    print(f"   💥 Error processing video {video_title}: {e}")
+                    processed_count += 1
+                    update_job_status(job_id, JobStatus.PROCESSING, total_videos, processed_count)
+                    time.sleep(10)  # Longer delay after errors
+                    continue
+        
+        # Final status
+        print(f"\n📊 Processing complete: {successful_count}/{total_videos} successful")
+        
+        if successful_count > 0:
+            update_job_status(job_id, JobStatus.COMPLETED, total_videos, successful_count)
+            print(f"🎉 Channel processing completed successfully!")
+        else:
+            update_job_status(job_id, JobStatus.FAILED, total_videos, 0)
+            print(f"💥 Channel processing failed")
         
     except Exception as e:
-        logger.error(f"Error processing channel: {e}")
+        print(f"❌ Critical error processing channel: {e}")
         update_job_status(job_id, JobStatus.FAILED)
 
 # ===========================
-# MAIN SERVICE FUNCTIONS
-# ===========================   
+# KEEP ALL OTHER EXISTING FUNCTIONS 
+# ===========================
 def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int) -> TranscriptResponse:
-    """Create a new transcript job using YouTube APIs"""
+    """Create a new transcript job with proper error handling"""
     try:
+        print(f"🎬 Creating transcript job for URL: {request.youtube_url}")
+        
         url = request.youtube_url
         content_type = determine_content_type(url)
+        print(f"📝 Content type: {content_type}")
         
-        youtube = get_youtube_service()
+        # Get content name based on type
         content_name = None
         playlists = []
+        message = ""
         
-        if content_type == ContentType.VIDEO:
-            video_id = extract_video_id(url)
-            video_details = get_video_details(youtube, video_id)
-            content_name = video_details['title'] if video_details else "Unknown Video"
-            message = "Started processing video"
-            
-        elif content_type == ContentType.PLAYLIST:
-            playlist_id = extract_playlist_id(url)
-            playlist_details = get_playlist_details(youtube, playlist_id)
-            content_name = playlist_details['title'] if playlist_details else "Unknown Playlist"
-            message = "Started processing playlist"
-            
-        elif content_type == ContentType.CHANNEL:
-            channel_id = extract_channel_id(url)
-            channel_details = get_channel_details(youtube, channel_id)
-            content_name = channel_details['title'] if channel_details else "Unknown Channel"
-            playlists_data = get_channel_playlists(youtube, channel_id)
-            playlists = [{'id': p['id'], 'title': p['title']} for p in playlists_data]
-            message = "Started processing channel"
+        try:
+            if content_type == ContentType.VIDEO:
+                content_name = get_youtube_title(url)
+                message = "Started processing video"
+                print(f"🎥 Video title: {content_name}")
+                
+            elif content_type == ContentType.PLAYLIST:
+                content_name = get_playlist_name(url)
+                message = "Started processing playlist"
+                print(f"📚 Playlist name: {content_name}")
+                
+            elif content_type == ContentType.CHANNEL:
+                content_name = get_channel_name(url)
+                playlists_data = get_channel_playlists_api(url)
+                playlists = [{'id': p['id'], 'title': p['title'], 'url': p['url']} for p in playlists_data]
+                message = "Started processing channel"
+                print(f"🏢 Channel name: {content_name}, Playlists: {len(playlists)}")
+                
+        except HTTPException as e:
+            print(f"❌ Error getting content info: {e.detail}")
+            raise e
+        except Exception as e:
+            print(f"❌ Unexpected error getting content info: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to get content information: {str(e)}")
         
         # Create job in database
         job = TranscriptJob(
             url=url,
             type=content_type,
             status=JobStatus.PROCESSING,
-            model_size="youtube-api",
+            model_size=request.model_size,
             store_in_db=request.store_in_db,
             content_name=content_name,
             playlists=json.dumps(playlists) if playlists else None,
@@ -560,24 +1055,37 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
         db.commit()
         db.refresh(job)
         
+        print(f"✅ Job created with ID: {job.job_id}")
+        
         # Start background processing
-        if content_type == ContentType.VIDEO:
-            background_executor.submit(
-                process_video_background, 
-                url, job.job_id, request.store_in_db
-            )
-            
-        elif content_type == ContentType.PLAYLIST:
-            background_executor.submit(
-                process_playlist_background,
-                url, job.job_id, request.store_in_db
-            )
-            
-        elif content_type == ContentType.CHANNEL:
-            background_executor.submit(
-                process_channel_background,
-                url, job.job_id, request.store_in_db
-            )
+        try:
+            if content_type == ContentType.VIDEO:
+                background_executor.submit(
+                    process_video_background, 
+                    url, job.job_id, request.model_size, request.store_in_db
+                )
+                print("🚀 Started video background processing")
+                
+            elif content_type == ContentType.PLAYLIST:
+                background_executor.submit(
+                    process_playlist_background,
+                    url, job.job_id, request.model_size, request.store_in_db
+                )
+                print("🚀 Started playlist background processing")
+                
+            elif content_type == ContentType.CHANNEL:
+                background_executor.submit(
+                    process_channel_background,
+                    url, job.job_id, request.model_size, request.store_in_db
+                )
+                print("🚀 Started channel background processing")
+                
+        except Exception as e:
+            print(f"❌ Error starting background processing: {e}")
+            # Update job status to failed
+            job.status = JobStatus.FAILED
+            db.commit()
+            raise HTTPException(status_code=500, detail=f"Failed to start background processing: {str(e)}")
         
         return TranscriptResponse(
             job_id=job.job_id,
@@ -588,15 +1096,20 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
             playlists=playlists
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error creating transcript job: {e}")
-        raise HTTPException(status_code=400, detail=str(e)) 
+        print(f"❌ Critical error in create_transcript_job: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# ===========================
-# ADDITIONAL SERVICE FUNCTIONS
-# ===========================
+# Keep all other existing functions exactly as they were...
+# [get_job_status_service, fetch_job_content, fetch_playlist_video, 
+# fetch_channel_playlist_video, fetch_channel_by_id, fetch_playlist_by_id, 
+# validate_cookie_file, etc.]
+
 def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse:
-    """Get job status with content information"""
     job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -604,6 +1117,45 @@ def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse
     transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
     processed_items = job.processed_items or len(transcripts)
     total_items = job.total_items or (len(transcripts) if job.type == ContentType.VIDEO else 0)
+
+    # Remove yt-dlp dependencies from content
+    content = {}
+
+    if job.type == ContentType.CHANNEL:
+        playlists = json.loads(job.playlists or "[]")
+        channel_content = []
+        for pl in playlists:
+            # Use YouTube API instead of yt-dlp
+            try:
+                pl_videos = get_playlist_videos_api(pl["url"])
+                channel_content.append({
+                    "id": pl["id"],
+                    "title": pl["title"],
+                    "videos": [v["title"] for v in pl_videos]
+                })
+            except:
+                channel_content.append({
+                    "id": pl["id"],
+                    "title": pl["title"],
+                    "videos": []
+                })
+        content = {"playlists": channel_content}
+
+    elif job.type == ContentType.PLAYLIST:
+        try:
+            videos = get_playlist_videos_api(job.url)
+            content = {
+                "playlist_name": job.content_name,
+                "videos": [v["title"] for v in videos]
+            }
+        except:
+            content = {
+                "playlist_name": job.content_name,
+                "videos": []
+            }
+
+    elif job.type == ContentType.VIDEO:
+        content = {"video_title": job.content_name}
 
     return JobContentStatusResponse(
         job_id=job.job_id,
@@ -613,162 +1165,49 @@ def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse
         type=job.type,
     )
 
-def search_youtube_videos(query: str, max_results: int = 10) -> List[Dict]:
-    """Search for YouTube videos using Data API"""
-    try:
-        youtube = get_youtube_service()
-        request = youtube.search().list(
-            part="snippet",
-            q=query,
-            type="video",
-            maxResults=max_results
-        )
-        response = request.execute()
-        
-        videos = []
-        for item in response['items']:
-            videos.append({
-                'id': item['id']['videoId'],
-                'title': item['snippet']['title'],
-                'description': item['snippet'].get('description', ''),
-                'publishedAt': item['snippet']['publishedAt'],
-                'channelTitle': item['snippet']['channelTitle']
-            })
-        
-        return videos
-    except HttpError as e:
-        logger.error(f"Error searching videos: {e}")
-        return []
 
-def get_video_statistics(video_id: str) -> Optional[Dict]:
-    """Get video statistics using Data API"""
-    try:
-        youtube = get_youtube_service()
-        request = youtube.videos().list(
-            part="statistics",
-            id=video_id
-        )
-        response = request.execute()
-        
-        if response['items']:
-            stats = response['items'][0]['statistics']
-            return {
-                'viewCount': int(stats.get('viewCount', 0)),
-                'likeCount': int(stats.get('likeCount', 0)),
-                'commentCount': int(stats.get('commentCount', 0))
-            }
-        return None
-    except HttpError as e:
-        logger.error(f"Error getting video statistics: {e}")
-        return None
 
-def get_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
-    """Fetch channel metadata + playlists + videos"""
-    youtube = get_youtube_service()
-    channel_id = extract_channel_id(channel_url)
-    
-    if not channel_id:
-        raise HTTPException(status_code=400, detail="Invalid channel URL")
-    
-    # Get channel details
-    channel_details = get_channel_details(youtube, channel_id)
-    if not channel_details:
-        raise HTTPException(status_code=404, detail="Channel not found")
-    
-    # Get channel playlists
-    playlists = get_channel_playlists(youtube, channel_id)
-    enriched_playlists = []
-
-    for pl in playlists:
-        videos = get_playlist_videos(youtube, pl['id'])
-        enriched_playlists.append(
-            ChannelPlaylist(
-                id=pl['id'],
-                title=pl['title'],
-                description=pl.get('description', ''),
-                videos=[
-                    PlaylistVideo(video_id=v['id'], title=v['title']) for v in videos
-                ],
-            )
-        )
-
-    return ChannelWithPlaylists(
-        channel_id=channel_id,
-        title=channel_details['title'],
-        description=channel_details.get('description', ''),
-        playlists=enriched_playlists,
-    )
-
-def get_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
-    """Fetch playlist metadata + videos"""
-    youtube = get_youtube_service()
-    playlist_id = extract_playlist_id(playlist_url)
-    
-    if not playlist_id:
-        raise HTTPException(status_code=400, detail="Invalid playlist URL")
-    
-    # Get playlist details
-    playlist_details = get_playlist_details(youtube, playlist_id)
-    if not playlist_details:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    
-    # Get playlist videos
-    videos = get_playlist_videos(youtube, playlist_id)
-
-    return PlaylistWithVideos(
-        playlist_id=playlist_id,
-        title=playlist_details['title'],
-        description=playlist_details.get('description', ''),
-        videos=[PlaylistVideo(video_id=v['id'], title=v['title']) for v in videos],
-    )
-
-# ===========================
-# CONTENT FETCHING FUNCTIONS
-# ===========================
 def fetch_job_content(db: Session, job_id: str, user_id: int):
     """Fetch channel playlists, playlist videos, or video transcript based on job type."""
     job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    youtube = get_youtube_service()
-
     if job.type == ContentType.CHANNEL:
-        channel_id = extract_channel_id(job.url)
-        playlists = get_channel_playlists(youtube, channel_id)
+        playlists = get_channel_playlists_api(job.url)  # Use YouTube API
         enriched_playlists = []
 
         for pl in playlists:
-            videos = get_playlist_videos(youtube, pl['id'])
+            videos = get_playlist_videos_api(pl["url"])  # Use YouTube API
             video_items = [
                 PlaylistVideo(
-                    video_id=v['id'],
-                    title=v['title']
+                    video_id=v["id"],
+                    title=v["title"]
                 )
                 for v in videos
-            ]   
+            ]
             enriched_playlists.append(
                 ChannelPlaylist(
-                    id=pl['id'],
-                    title=pl['title'],
-                    description=pl.get('description', ''),
+                    id=pl["id"],
+                    title=pl["title"],
+                    description=pl.get("description", ""),
                     videos=video_items
                 )
             )
 
         return ChannelPlaylistsResponse(
-            channel_id=channel_id,
+            channel_id=extract_channel_id(job.url) or job.url,
             playlists=enriched_playlists
         )
 
     elif job.type == ContentType.PLAYLIST:
         playlist_id = extract_playlist_id(job.url)
-        videos = get_playlist_videos(youtube, playlist_id)
+        videos = get_playlist_videos_api(job.url)  # Use YouTube API
 
         video_items = [
             PlaylistVideo(
-                video_id=v['id'],
-                title=v['title']
+                video_id=v["id"],
+                title=v["title"]
             )
             for v in videos
         ]
@@ -782,14 +1221,11 @@ def fetch_job_content(db: Session, job_id: str, user_id: int):
     elif job.type == ContentType.VIDEO:
         transcript_obj = db.query(Transcript).filter_by(job_id=job.id).first()
         video_id = extract_video_id(job.url)
-        video_details = get_video_details(youtube, video_id)
+        video_title = get_youtube_title(job.url)  # Already uses YouTube API
 
         video_data = VideoWithTranscript(
             id=video_id,
-            title=video_details['title'] if video_details else "Unknown Title",
-            description=transcript_obj.description if transcript_obj else None,
-            duration=transcript_obj.duration if transcript_obj else None,
-            transcript=transcript_obj.transcript_text if transcript_obj else None,
+            title=video_title,
         )
 
         return VideoTranscriptResponse(
@@ -799,3 +1235,131 @@ def fetch_job_content(db: Session, job_id: str, user_id: int):
 
     else:
         raise HTTPException(status_code=400, detail="Unsupported content type")
+
+
+def fetch_playlist_video(db: Session, job_id: str, video_id: str, user_id: int):
+    """Fetch a single video from a playlist with transcript, description, and duration."""
+    job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
+    if not job or job.type != ContentType.PLAYLIST:
+        raise HTTPException(status_code=404, detail="Playlist job not found")
+
+    # Get transcript for this video
+    transcript_obj = (
+        db.query(Transcript)
+        .filter_by(job_id=job.id, video_id=video_id)
+        .first()
+    )
+
+    # Use YouTube API for title
+    title = get_youtube_title(f"https://www.youtube.com/watch?v={video_id}")
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "description": transcript_obj.description if transcript_obj else None,
+        "duration": (
+            int(transcript_obj.duration)
+            if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            else None
+        ),
+        "transcript": transcript_obj.transcript_text if transcript_obj else None,
+    }
+def fetch_channel_playlist_video(db: Session, job_id: str, playlist_id: str, video_id: str, user_id: int):
+    """Fetch a video from a channel's playlist with transcript, description, and duration."""
+    job = db.query(TranscriptJob).filter_by(job_id=job_id, user_id=user_id).first()
+    if not job or job.type != ContentType.CHANNEL:
+        raise HTTPException(status_code=404, detail="Channel job not found")
+
+    # Find transcript if already processed
+    transcript_obj = (
+        db.query(Transcript)
+        .filter_by(job_id=job.id, video_id=video_id, playlist_id=playlist_id)
+        .first()
+    )
+
+    # Use YouTube API for title
+    title = get_youtube_title(f"https://www.youtube.com/watch?v={video_id}")
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "description": transcript_obj.description if transcript_obj else None,
+        "duration": (
+            int(transcript_obj.duration)
+            if transcript_obj and transcript_obj.duration and str(transcript_obj.duration).isdigit()
+            else None
+        ),
+        "transcript": transcript_obj.transcript_text if transcript_obj else None,
+    }
+def fetch_channel_by_id(channel_url: str) -> ChannelWithPlaylists:
+    """Fetch channel metadata + playlists + videos using YouTube Data API"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    channel_id = extract_channel_id(channel_url)
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="Invalid channel URL")
+    
+    # Get channel info from YouTube API
+    channel_info = youtube_api.get_channel_info(channel_id)
+    if not channel_info:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    
+    channel_title = channel_info.get("title") or "Untitled Channel"
+    channel_description = channel_info.get("description") or ""
+    
+    # Get channel playlists from YouTube API
+    playlists = youtube_api.get_channel_playlists(channel_id)
+    enriched_playlists = []
+    
+    for pl in playlists:
+        # Get videos for each playlist
+        videos = youtube_api.get_playlist_videos(pl["id"])
+        video_list = [
+            PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos
+        ]
+        
+        enriched_playlists.append(
+            ChannelPlaylist(
+                id=pl["id"],
+                title=pl["title"],
+                description=pl.get("description") or "",
+                videos=video_list,
+            )
+        )
+    
+    return ChannelWithPlaylists(
+        channel_id=channel_id,
+        title=channel_title,
+        description=channel_description,
+        playlists=enriched_playlists,
+    )
+
+
+def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
+    """Fetch playlist metadata + videos using YouTube Data API"""
+    if not youtube_api:
+        raise HTTPException(status_code=500, detail="YouTube API not configured")
+    
+    playlist_id = extract_playlist_id(playlist_url)
+    if not playlist_id:
+        raise HTTPException(status_code=400, detail="Invalid playlist URL")
+    
+    # Get playlist info from YouTube API
+    playlist_info = youtube_api.get_playlist_info(playlist_id)
+    if not playlist_info:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    playlist_title = playlist_info.get("title") or f"Playlist {playlist_id}"
+    playlist_description = playlist_info.get("description") or ""
+    
+    # Get playlist videos from YouTube API
+    videos = youtube_api.get_playlist_videos(playlist_id)
+    video_list = [PlaylistVideo(video_id=v["id"], title=v["title"]) for v in videos]
+    
+    return PlaylistWithVideos(
+        playlist_id=playlist_id,
+        title=playlist_title,
+        description=playlist_description,
+        videos=video_list,
+    )
