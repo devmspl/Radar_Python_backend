@@ -328,3 +328,8 @@ class PublishStatsResponse(BaseModel):
 class UnpublishFeedRequest(BaseModel):
     feed_id: int
     admin_id: int
+class YouTubeFeedRequest(BaseModel):
+    job_id: Optional[str] = None  # Create feeds from a specific transcript job
+    video_id: Optional[str] = None  # Create feed from a specific video
+    overwrite: bool = False  # Overwrite existing feeds
+    use_ai: bool = True  # Use AI for enhanced content generation

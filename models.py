@@ -160,7 +160,7 @@ class Feed(Base):
     __tablename__ = "feeds"
     
     id = Column(Integer, primary_key=True, index=True)
-    blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=False)
+    blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=True)
     title = Column(String(500), nullable=True)
     categories = Column(JSONEncodedList, default=list)
     status = Column(String(50), default="processing")
@@ -170,7 +170,10 @@ class Feed(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     blog = relationship("Blog", back_populates="feeds")
     slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
-    
+    transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)  # Link to YouTube transcripts
+    source_type = Column(String, default='blog')  # 'blog' or 'youtube'
+
+
 class Slide(Base):
     __tablename__ = "slides"
     
