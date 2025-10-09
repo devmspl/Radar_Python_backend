@@ -81,7 +81,7 @@ app.include_router(publish_router)
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*","https://admin-radar.careergraph.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
