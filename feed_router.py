@@ -143,135 +143,196 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         return generate_fallback_slide(slide_type, context, categories, content_type)
 
 def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict[str, Any], categories: List[str], content_type: str = "blog") -> List[Dict]:
-    """Generate presentation slides using AI without image generation."""
+    """Generate exactly 5 presentation slides using AI without image generation."""
     slides = []
     
-    # Title slide
+    # 1. Title slide
     title_context = f"Content: {title}\nSummary: {ai_generated_content.get('summary', '')}\nType: {content_type}"
     title_slide = generate_slide_with_ai("title", title_context, categories, content_type)
     title_slide["order"] = 1
     slides.append(title_slide)
     
-    # Key point slides
-    key_points = ai_generated_content.get("key_points", [])
-    for i, point in enumerate(key_points[:4]):
+    # 2. Summary/Overview slide
+    summary_context = f"Summary: {ai_generated_content.get('summary', '')}\nContent: {title}\nType: {content_type}"
+    summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
+    summary_slide["order"] = 2
+    slides.append(summary_slide)
+    
+    # 3-5. Key point slides (only 3 key points max)
+    key_points = ai_generated_content.get("key_points", [])[:3]  # Limit to 3 key points
+    
+    for i, point in enumerate(key_points):
         key_point_context = f"Key Point: {point}\nContent: {title}\nType: {content_type}"
         key_slide = generate_slide_with_ai("key_point", key_point_context, categories, content_type, slides)
         key_slide["order"] = len(slides) + 1
         slides.append(key_slide)
     
-    # Summary slide
-    summary_context = f"Summary: {ai_generated_content.get('summary', '')}\nKey Points: {', '.join(key_points)}\nType: {content_type}"
-    summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
-    summary_slide["order"] = len(slides) + 1
-    slides.append(summary_slide)
+    # If we have less than 5 slides, add conclusion slide
+    if len(slides) < 5:
+        conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nKey Points: {', '.join(key_points)}\nType: {content_type}"
+        conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, content_type, slides)
+        conclusion_slide["order"] = len(slides) + 1
+        slides.append(conclusion_slide)
     
-    # Conclusion slide
-    conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nContent: {title}\nType: {content_type}"
-    conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, content_type, slides)
-    conclusion_slide["order"] = len(slides) + 1
-    slides.append(conclusion_slide)
+    # Ensure exactly 5 slides
+    while len(slides) < 5:
+        filler_context = f"Additional insights from: {title}\nType: {content_type}"
+        filler_slide = generate_slide_with_ai("additional_insights", filler_context, categories, content_type, slides)
+        filler_slide["order"] = len(slides) + 1
+        slides.append(filler_slide)
     
-    return slides
+    # Limit to exactly 5 slides
+    return slides[:5]
 
 # ------------------ Core Feed Creation Functions ------------------
 
 def create_feed_from_blog(db: Session, blog: Blog):
     """Generate feed and slides from a blog using AI and store in DB."""
     try:
-        admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
-        categories = categorize_content_with_openai(blog.content, admin_categories)
-        ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
-        slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
-        
-        feed_title = ai_generated_content.get("title", blog.title)
-        feed = Feed(
-            blog_id=blog.id, 
-            title=feed_title,
-            categories=categories, 
-            status="ready",
-            ai_generated_content=ai_generated_content,
-            image_generation_enabled=False,
-            source_type="blog",  # New field to track source type
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(feed)
-        db.flush()
-        
-        for slide_data in slides_data:
-            slide = Slide(
-                feed_id=feed.id,
-                order=slide_data["order"],
-                title=slide_data["title"],
-                body=slide_data["body"],
-                bullets=slide_data.get("bullets"),
-                background_image_url=None,
-                background_image_prompt=None,
-                source_refs=slide_data.get("source_refs", []),
-                render_markdown=int(slide_data.get("render_markdown", True)),
+        # Check if feed already exists for this blog
+        existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
+        if existing_feed:
+            # Delete existing slides to regenerate
+            db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
+            db.flush()
+        else:
+            # Create new feed
+            admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
+            categories = categorize_content_with_openai(blog.content, admin_categories)
+            ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
+            slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
+            
+            feed_title = ai_generated_content.get("title", blog.title)
+            feed = Feed(
+                blog_id=blog.id, 
+                title=feed_title,
+                categories=categories, 
+                status="ready",
+                ai_generated_content=ai_generated_content,
+                image_generation_enabled=False,
+                source_type="blog",
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
-            db.add(slide)
-        
-        db.commit()
-        db.refresh(feed)
-        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
-        return feed
+            db.add(feed)
+            db.flush()
+            
+            for slide_data in slides_data:
+                slide = Slide(
+                    feed_id=feed.id,
+                    order=slide_data["order"],
+                    title=slide_data["title"],
+                    body=slide_data["body"],
+                    bullets=slide_data.get("bullets"),
+                    background_image_url=None,
+                    background_image_prompt=None,
+                    source_refs=slide_data.get("source_refs", []),
+                    render_markdown=int(slide_data.get("render_markdown", True)),
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(slide)
+            
+            db.commit()
+            db.refresh(feed)
+            logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
+            return feed
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
         raise
 
-def create_feed_from_transcript(db: Session, transcript: Transcript):
+def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: bool = False):
     """Generate feed and slides from a YouTube transcript using AI and store in DB."""
     try:
+        # Check if feed already exists for this transcript
+        existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
+        
+        if existing_feed and not overwrite:
+            logger.info(f"Feed already exists for transcript {transcript.transcript_id}, skipping")
+            return existing_feed
+            
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         categories = categorize_content_with_openai(transcript.transcript_text, admin_categories)
         ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
         slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
         
         feed_title = ai_generated_content.get("title", transcript.title)
-        feed = Feed(
-            transcript_id=transcript.transcript_id,  # Link to transcript
-            title=feed_title,
-            categories=categories, 
-            status="ready",
-            ai_generated_content=ai_generated_content,
-            image_generation_enabled=False,
-            source_type="youtube",  # New field to track source type
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(feed)
-        db.flush()
         
-        for slide_data in slides_data:
-            slide = Slide(
-                feed_id=feed.id,
-                order=slide_data["order"],
-                title=slide_data["title"],
-                body=slide_data["body"],
-                bullets=slide_data.get("bullets"),
-                background_image_url=None,
-                background_image_prompt=None,
-                source_refs=slide_data.get("source_refs", []),
-                render_markdown=int(slide_data.get("render_markdown", True)),
+        if existing_feed and overwrite:
+            # UPDATE existing feed instead of deleting
+            existing_feed.title = feed_title
+            existing_feed.categories = categories
+            existing_feed.status = "ready"
+            existing_feed.ai_generated_content = ai_generated_content
+            existing_feed.updated_at = datetime.utcnow()
+            
+            # Delete old slides
+            db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
+            db.flush()
+            
+            # Create new slides
+            for slide_data in slides_data:
+                slide = Slide(
+                    feed_id=existing_feed.id,
+                    order=slide_data["order"],
+                    title=slide_data["title"],
+                    body=slide_data["body"],
+                    bullets=slide_data.get("bullets"),
+                    background_image_url=None,
+                    background_image_prompt=None,
+                    source_refs=slide_data.get("source_refs", []),
+                    render_markdown=int(slide_data.get("render_markdown", True)),
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(slide)
+            
+            db.commit()
+            db.refresh(existing_feed)
+            logger.info(f"Successfully UPDATED AI-generated feed {existing_feed.id} for transcript {transcript.transcript_id} with {len(slides_data)} slides")
+            return existing_feed
+        else:
+            # CREATE new feed
+            feed = Feed(
+                transcript_id=transcript.transcript_id,
+                title=feed_title,
+                categories=categories, 
+                status="ready",
+                ai_generated_content=ai_generated_content,
+                image_generation_enabled=False,
+                source_type="youtube",
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
-            db.add(slide)
+            db.add(feed)
+            db.flush()
+            
+            for slide_data in slides_data:
+                slide = Slide(
+                    feed_id=feed.id,
+                    order=slide_data["order"],
+                    title=slide_data["title"],
+                    body=slide_data["body"],
+                    bullets=slide_data.get("bullets"),
+                    background_image_url=None,
+                    background_image_prompt=None,
+                    source_refs=slide_data.get("source_refs", []),
+                    render_markdown=int(slide_data.get("render_markdown", True)),
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(slide)
+            
+            db.commit()
+            db.refresh(feed)
+            logger.info(f"Successfully CREATED AI-generated feed {feed.id} for transcript {transcript.transcript_id} with {len(slides_data)} slides")
+            return feed
         
-        db.commit()
-        db.refresh(feed)
-        logger.info(f"Successfully created AI-generated feed {feed.id} for transcript {transcript.transcript_id}")
-        return feed
     except Exception as e:
         db.rollback()
-        logger.error(f"Error creating AI-generated feed for transcript {transcript.transcript_id}: {e}")
+        logger.error(f"Error creating/updating AI-generated feed for transcript {transcript.transcript_id}: {e}")
         raise
-
 # ------------------ Helper Functions ------------------
 
 def generate_fallback_feed_content(title: str, content: str, content_type: str = "blog") -> Dict[str, Any]:
@@ -320,17 +381,19 @@ def generate_fallback_slide(slide_type: str, context: str, categories: List[str]
     }
 
 def create_basic_feed_from_blog(db: Session, blog: Blog):
-    """Fallback method to create basic feed without AI."""
+    """Fallback method to create basic feed without AI - limit to 5 slides."""
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
     categories = categorize_content_with_openai(blog.content, admin_categories)
     
-    slides = []
+    # Limit to 5 paragraphs/slides
     paragraphs = blog.content.split("\n\n")[:5]
+    slides = []
+    
     for idx, p in enumerate(paragraphs):
         slides.append({
             "order": idx + 1,
-            "title": blog.title if idx == 0 else f"Slide {idx + 1}",
-            "body": p,
+            "title": blog.title if idx == 0 else f"Key Point {idx}",
+            "body": p[:500],  # Limit body length
             "bullets": None,
             "background_image_url": None,
             "source_refs": [],
@@ -366,20 +429,20 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
     return feed
 
 def create_basic_feed_from_transcript(db: Session, transcript: Transcript):
-    """Fallback method to create basic feed from transcript without AI."""
+    """Fallback method to create basic feed from transcript without AI - limit to 5 slides."""
     admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
     categories = categorize_content_with_openai(transcript.transcript_text, admin_categories)
     
-    slides = []
-    # Split transcript into meaningful chunks (sentences or paragraphs)
+    # Split transcript into meaningful chunks and limit to 5
     chunks = re.split(r'(?<=[.!?])\s+', transcript.transcript_text)
-    chunks = [chunk.strip() for chunk in chunks if len(chunk.strip()) > 30][:5]  # Take first 5 substantial chunks
+    chunks = [chunk.strip() for chunk in chunks if len(chunk.strip()) > 30][:5]
     
+    slides = []
     for idx, chunk in enumerate(chunks):
         slides.append({
             "order": idx + 1,
-            "title": transcript.title if idx == 0 else f"Key Point {idx}",
-            "body": chunk,
+            "title": transcript.title if idx == 0 else f"Key Insight {idx}",
+            "body": chunk[:500],  # Limit body length
             "bullets": None,
             "background_image_url": None,
             "source_refs": [],
@@ -659,28 +722,49 @@ def create_feeds_from_youtube(
     db: Session = Depends(get_db)
 ):
     """Create feeds from YouTube transcripts (AI data only, no images)."""
-    # Get transcripts based on the request type
+    transcripts = []
+    job_identifier = "all_transcripts"
+    
     if request.job_id:
-        # Get transcripts from a specific job
-        transcripts = db.query(Transcript).filter(Transcript.job_id == request.job_id).all()
-        if not transcripts:
-            raise HTTPException(status_code=404, detail="No transcripts found for this job")
+        # First try to find the TranscriptJob by its job_id string
+        transcript_job = db.query(TranscriptJob).filter(TranscriptJob.job_id == request.job_id).first()
+        
+        if transcript_job:
+            # If found, get all transcripts using the INTEGER id (foreign key)
+            transcripts = db.query(Transcript).filter(Transcript.job_id == transcript_job.id).all()
+            job_identifier = f"job_{request.job_id}"
+        else:
+            # If no job found, check if it's a video_id
+            video_transcript = db.query(Transcript).filter(Transcript.video_id == request.job_id).first()
+            if video_transcript:
+                transcripts = [video_transcript]
+                job_identifier = f"video_{request.job_id}"
+            else:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"No transcripts found for job ID: {request.job_id}. Available jobs: {[job.job_id for job in db.query(TranscriptJob).all()]}"
+                )
+    
     elif request.video_id:
-        # Get specific video transcript
+        # Get specific video transcript by video_id
         transcripts = db.query(Transcript).filter(Transcript.video_id == request.video_id).all()
+        job_identifier = f"video_{request.video_id}"
         if not transcripts:
-            raise HTTPException(status_code=404, detail="No transcript found for this video")
+            raise HTTPException(status_code=404, detail=f"No transcript found for video ID: {request.video_id}")
     else:
         # Get all available transcripts
         transcripts = db.query(Transcript).all()
         if not transcripts:
             raise HTTPException(status_code=404, detail="No transcripts found in database")
 
+    if not transcripts:
+        raise HTTPException(status_code=404, detail="No transcripts found for the given criteria")
+
     background_tasks.add_task(
         process_transcript_feeds_creation,
         db,
         transcripts,
-        request.job_id or "all_transcripts",
+        job_identifier,
         request.overwrite,
         request.use_ai,
     )
@@ -692,10 +776,9 @@ def create_feeds_from_youtube(
         "use_ai": request.use_ai,
         "generate_images": False,
         "source_type": "youtube",
-        "message": "YouTube transcript feed creation process started in background",
+        "message": f"YouTube transcript feed creation process started for {len(transcripts)} transcripts",
         "status": "processing"
     }
-
 # Add the YouTubeFeedRequest schema to your schemas.py
 """
 class YouTubeFeedRequest(BaseModel):

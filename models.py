@@ -195,7 +195,7 @@ class PublishedFeed(Base):
     __tablename__ = "published_feeds"
     
     id = Column(Integer, primary_key=True, index=True)
-    feed_id = Column(Integer, ForeignKey('feeds.id'), nullable=False)
+    feed_id = Column(Integer, ForeignKey('feeds.id',ondelete='CASCADE'), nullable=False)
     admin_id = Column(Integer, ForeignKey('users.id'), nullable=False)  # Reference to users table
     admin_name = Column(String, nullable=False)
     published_at = Column(DateTime, default=datetime.utcnow)
