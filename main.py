@@ -14,6 +14,7 @@ from youtube_router import router as youtube_router
 from scraping import router as scrapping_router
 from feed_router import router as feed_router
 from publish_router import router as publish_router
+from quiz_router import router as quiz_router
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
@@ -71,11 +72,12 @@ async def get_open_api_endpoint():
     return openapi_schema
 
 # Include routers with explicit tags
-app.include_router(admin_router)    
-app.include_router(youtube_router)
-app.include_router(scrapping_router)  
-app.include_router(feed_router)
-app.include_router(publish_router)     
+# app.include_router(admin_router)    
+# app.include_router(youtube_router)
+# app.include_router(scrapping_router)  
+# app.include_router(feed_router)
+# app.include_router(publish_router)
+# app.include_router(quiz_router)     
       # tags=["Authentication"]
 
 # CORS middleware
@@ -276,7 +278,12 @@ def promote_to_admin(
     return {"message": "User promoted to admin successfully"}
 
 app.include_router(auth_router)
-
+app.include_router(admin_router)    
+app.include_router(youtube_router)
+app.include_router(scrapping_router)  
+app.include_router(feed_router)
+app.include_router(publish_router)
+app.include_router(quiz_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7878)

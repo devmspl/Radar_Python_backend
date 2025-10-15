@@ -39,6 +39,7 @@ class User(Base):
     # Relationship to transcript jobs created by this user
     transcript_jobs = relationship("TranscriptJob", back_populates="user")
 
+    quiz_scores = relationship("UserQuizScore", back_populates="user")
 class OTP(Base):
     __tablename__ = "otps"
 
@@ -172,7 +173,8 @@ class Feed(Base):
     slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
     transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)  # Link to YouTube transcripts
     source_type = Column(String, default='blog')  # 'blog' or 'youtube'
-
+    published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False)
+    quizzes = relationship("Quiz", back_populates="feed")
 
 class Slide(Base):
     __tablename__ = "slides"
@@ -204,3 +206,61 @@ class PublishedFeed(Base):
     # Relationships
     feed = relationship("Feed", backref="published_feeds")
     admin_user = relationship("User")  # Relationship to User model
+
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, JSON, ForeignKey, Float
+
+class QuizCategory(Base):
+    __tablename__ = "quiz_categories"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)  # UI/UX Design, Product Management, etc.
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    quizzes = relationship("Quiz", back_populates="category")
+class Quiz(Base):
+    __tablename__ = "quizzes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    category_id = Column(Integer, ForeignKey('quiz_categories.id'), nullable=False)
+    difficulty = Column(String, default="medium")  # easy, medium, hard
+    questions = Column(JSON)  # Store questions as JSON array
+    source_type = Column(String)  # 'blog' or 'youtube'
+    source_id = Column(String)  # blog_id or transcript_id
+    feed_id = Column(Integer, ForeignKey('feeds.id'), nullable=True)
+    is_active = Column(Boolean, default=True)
+    version = Column(Integer, default=1)  # Track quiz versions for updates
+    last_updated = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    category = relationship("QuizCategory", back_populates="quizzes")
+    feed = relationship("Feed", back_populates="quizzes")
+    user_scores = relationship("UserQuizScore", back_populates="quiz")
+
+class UserQuizScore(Base):
+    __tablename__ = "user_quiz_scores"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)  # Assuming you have a User model
+    quiz_id = Column(Integer, ForeignKey('quizzes.id'), nullable=False)
+    score = Column(Float, nullable=False)  # Percentage score
+    correct_answers = Column(Integer, nullable=False)
+    total_questions = Column(Integer, nullable=False)
+    time_taken = Column(Integer, nullable=True)  # Time in seconds
+    answers = Column(JSON)  # Store user's answers
+    completed_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User", back_populates="quiz_scores")
+    quiz = relationship("Quiz", back_populates="user_scores")
+
+# Add to existing models:
+# QuizCategory.quizzes = relationship("Quiz", back_populates="category")
+# Feed.quizzes = relationship("Quiz", back_populates="feed")
+# User.quiz_scores = relationship("UserQuizScore", back_populates="user")

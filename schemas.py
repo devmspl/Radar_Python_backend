@@ -333,3 +333,53 @@ class YouTubeFeedRequest(BaseModel):
     video_id: Optional[str] = None  # Create feed from a specific video
     overwrite: bool = False  # Overwrite existing feeds
     use_ai: bool = True  # Use AI for enhanced content generation
+class QuizCategoryResponse(BaseModel):
+    id: int
+    name: str
+    description: str
+    is_active: bool
+    quiz_count: int
+    created_at: Optional[str]
+
+class QuestionResponse(BaseModel):
+    question: str
+    options: List[str]
+    correct_answer: int
+    explanation: str
+
+class QuizResponse(BaseModel):
+    id: int
+    title: str
+    description: str
+    category: QuizCategoryResponse
+    # difficulty: str
+    questions: List[Dict[str, Any]]  # Will be empty array
+    # source_type: str
+    # version: int
+    last_updated: str
+    user_score: Optional[float]
+    total_quizzes_in_category: Optional[int] = 0
+    question_count: int
+class QuizResultResponse(BaseModel):
+    quiz_id: int
+    quiz_title: str
+    score: float
+    correct_answers: int
+    total_questions: int
+    time_taken: int
+    passed: bool
+    results: List[Dict[str, Any]]
+    user_rank: str
+
+class QuizSubmission(BaseModel):
+    quiz_id: int
+    answers: Dict[int, int]  # question_index -> answer_index
+    time_taken: int  # in seconds
+
+class UserQuizHistory(BaseModel):
+    quiz_id: int
+    quiz_title: str
+    category: str
+    score: float
+    completed_at: str
+    time_taken: int
