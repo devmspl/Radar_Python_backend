@@ -222,15 +222,152 @@ def create_quiz_for_category(db: Session, category_id: int, difficulty: str = "m
         db.rollback()
         logger.error(f"❌ Error creating quiz for category {category_id}: {e}")
         raise
+def generate_quiz_variations(db: Session, category_id: int, num_quizzes: int = 3):
+    """Generate multiple quiz variations for a category"""
+    category = db.query(QuizCategory).filter(QuizCategory.id == category_id).first()
+    if not category:
+        raise ValueError(f"Category {category_id} not found")
+    
+    # Get content for quiz generation
+    content = get_content_for_category(db, category_id)
+    
+    if not content or len(content.strip()) < 500:
+        logger.warning(f"Insufficient content for {category.name} quizzes, using fallback")
+        content = f"Comprehensive overview of {category.name} including key concepts, best practices, and industry standards."
+    
+    quizzes_created = []
+    
+    for i in range(num_quizzes):
+        try:
+            # Use different difficulties or focuses for variety
+            difficulties = ["easy", "medium", "hard"]
+            difficulty = difficulties[i % len(difficulties)]
+            
+            # Add variation to the prompt
+            variations = [
+                "focus on fundamental concepts and basics",
+                "focus on practical applications and real-world scenarios", 
+                "focus on advanced techniques and industry best practices",
+                "focus on common challenges and problem-solving",
+                "focus on emerging trends and future developments"
+            ]
+            
+            variation_prompt = variations[i % len(variations)]
+            
+            # Generate unique quiz
+            quiz_data = generate_quiz_with_variation(category.name, content, difficulty, variation_prompt)
+            
+            # Deactivate only if we're replacing existing ones
+            if i == 0:  # Only deactivate for the first quiz if replacing
+                db.query(Quiz).filter(
+                    Quiz.category_id == category_id,
+                    Quiz.is_active == True
+                ).update({"is_active": False})
+            
+            # Create new quiz
+            quiz = Quiz(
+                title=f"{quiz_data['title']} - {variation_prompt.split(' ')[1].title()}",
+                description=quiz_data.get("description", f"Test your {variation_prompt} knowledge of {category.name}"),
+                category_id=category_id,
+                difficulty=difficulty,
+                questions=quiz_data["questions"],
+                source_type="mixed",
+                is_active=True,
+                version=i + 1,
+                last_updated=datetime.utcnow()
+            )
+            
+            db.add(quiz)
+            quizzes_created.append(quiz)
+            
+            logger.info(f"✅ Created quiz variation {i+1} for category {category.name}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error creating quiz variation {i+1} for category {category_id}: {e}")
+            continue
+    
+    db.commit()
+    
+    # Refresh all created quizzes
+    for quiz in quizzes_created:
+        db.refresh(quiz)
+    
+    return quizzes_created
 
+def generate_quiz_with_variation(category: str, content: str, difficulty: str, variation: str) -> Dict[str, Any]:
+    """Generate quiz with specific variation"""
+    try:
+        truncated_content = content[:12000] + "..." if len(content) > 12000 else content
+        
+        prompt = f"""
+        Create a {difficulty} difficulty quiz about {category} with EXACTLY 10 multiple-choice questions.
+        
+        Specific Focus: {variation}
+        
+        Requirements:
+        - Generate exactly 10 questions (no more, no less)
+        - Each question must have 4 options (A, B, C, D)
+        - Mark the correct answer clearly (0-3 index)
+        - Include brief explanations for each answer
+        - Questions should test understanding of key concepts from the content
+        - Make questions relevant to the specific focus and content provided
+        - Vary question types: conceptual, practical, scenario-based
+        
+        Content:
+        {truncated_content}
+        
+        Return JSON format:
+        {{
+            "title": "Engaging Quiz Title about {category} - {variation}",
+            "description": "Brief description focusing on {variation}",
+            "questions": [
+                {{
+                    "question": "Clear and concise question text",
+                    "options": ["Option A", "Option B", "Option C", "Option D"],
+                    "correct_answer": 0,
+                    "explanation": "Brief explanation why this is correct"
+                }}
+            ]
+        }}
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are a quiz creation expert. Create engaging, educational multiple-choice quizzes. Always return valid JSON with exactly 10 questions."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.8,  # Higher temperature for more variation
+            max_tokens=4000
+        )
+        
+        content = response.choices[0].message.content
+        quiz_data = json.loads(content)
+        
+        # Validate we have exactly 10 questions
+        questions = quiz_data.get("questions", [])
+        if len(questions) != 10:
+            raise ValueError(f"Expected 10 questions, got {len(questions)}")
+        
+        return quiz_data
+        
+    except Exception as e:
+        logger.error(f"OpenAI quiz generation error: {e}")
+        return generate_fallback_quiz(category, difficulty)
 # ------------------ Quiz Update Scheduler ------------------
 
 def update_quizzes_job():
-    """Background job to update quizzes daily"""
+    """Background job to update quizzes with multiple variations"""
     from database import SessionLocal
     db = SessionLocal()
     try:
-        logger.info("🔄 Starting daily quiz update...")
+        logger.info("🔄 Starting daily quiz update with multiple variations...")
         
         # Get all active categories
         categories = db.query(QuizCategory).filter(QuizCategory.is_active == True).all()
@@ -238,21 +375,34 @@ def update_quizzes_job():
         updated_count = 0
         for category in categories:
             try:
-                # Check if category needs update (quizzes older than 24 hours)
-                latest_quiz = db.query(Quiz).filter(
+                # Check if category needs update (quizzes older than 24 hours or less than 3 quizzes)
+                active_quizzes = db.query(Quiz).filter(
                     Quiz.category_id == category.id,
                     Quiz.is_active == True
-                ).order_by(Quiz.last_updated.desc()).first()
+                ).all()
                 
-                if not latest_quiz or (datetime.utcnow() - latest_quiz.last_updated).total_seconds() > 86400:  # 24 hours
-                    create_quiz_for_category(db, category.id)
-                    updated_count += 1
-                    logger.info(f"🔄 Updated quiz for {category.name}")
+                needs_update = False
+                
+                if not active_quizzes:
+                    needs_update = True
+                elif len(active_quizzes) < 3:
+                    needs_update = True
                 else:
-                    logger.info(f"⏭️  Quiz for {category.name} is up to date")
+                    # Check if any quiz is older than 24 hours
+                    latest_quiz = max(active_quizzes, key=lambda q: q.last_updated)
+                    if (datetime.utcnow() - latest_quiz.last_updated).total_seconds() > 86400:
+                        needs_update = True
+                
+                if needs_update:
+                    # Generate 3 quiz variations
+                    generate_quiz_variations(db, category.id, 3)
+                    updated_count += 1
+                    logger.info(f"🔄 Updated quizzes for {category.name}")
+                else:
+                    logger.info(f"⏭️  Quizzes for {category.name} are up to date")
                     
             except Exception as e:
-                logger.error(f"❌ Failed to update quiz for {category.name}: {e}")
+                logger.error(f"❌ Failed to update quizzes for {category.name}: {e}")
                 continue
         
         logger.info(f"✅ Daily quiz update completed: {updated_count} categories updated")
@@ -309,73 +459,76 @@ def get_categories(db: Session = Depends(get_db)):
         })
     
     return result
-@router.get("/category/{category_id}/quiz", response_model=QuizResponse)
-def get_quiz_by_category(
+@router.post("/category/{category_id}/generate-multiple")
+def generate_multiple_quizzes(
     category_id: int,
-    user_id: int = 1,  # In real app, get from auth token
+    num_quizzes: int = 3,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db)
 ):
-    """Get active quiz for a category with quiz count information"""
-    # Verify category exists
-    category = db.query(QuizCategory).filter(
-        QuizCategory.id == category_id,
-        QuizCategory.is_active == True
-    ).first()
-    
+    """Generate multiple quizzes for a category"""
+    category = db.query(QuizCategory).filter(QuizCategory.id == category_id).first()
     if not category:
         raise HTTPException(status_code=404, detail="Category not found")
     
-    # Get all active quizzes for this category to count them
-    all_quizzes = db.query(Quiz).filter(
+    if background_tasks:
+        # Run in background for large numbers
+        def generate_task():
+            db_local = next(get_db())
+            try:
+                generate_quiz_variations(db_local, category_id, num_quizzes)
+            finally:
+                db_local.close()
+        
+        background_tasks.add_task(generate_task)
+        return {"message": f"Generating {num_quizzes} quizzes for {category.name} in background"}
+    else:
+        # Generate immediately
+        quizzes = generate_quiz_variations(db, category_id, num_quizzes)
+        return {
+            "message": f"Generated {len(quizzes)} quizzes for {category.name}",
+            "quiz_ids": [quiz.id for quiz in quizzes]
+        }
+
+@router.get("/category/{category_id}/quizzes")
+def get_all_quizzes_by_category(
+    category_id: int,
+    include_questions: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Get all quizzes for a category"""
+    category = db.query(QuizCategory).filter(QuizCategory.id == category_id).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    quizzes = db.query(Quiz).filter(
         Quiz.category_id == category_id,
         Quiz.is_active == True
-    ).all()
+    ).order_by(Quiz.last_updated.desc()).all()
     
-    quiz_count = len(all_quizzes)
+    quizzes_list = []
+    for quiz in quizzes:
+        quiz_data = {
+            "id": quiz.id,
+            "title": quiz.title,
+            "description": quiz.description,
+            "difficulty": quiz.difficulty,
+            "version": quiz.version,
+            "question_count": len(quiz.questions) if quiz.questions else 0,
+            "last_updated": quiz.last_updated.isoformat() if quiz.last_updated else None
+        }
+        
+        if include_questions:
+            quiz_data["questions"] = quiz.questions
+        
+        quizzes_list.append(quiz_data)
     
-    # Get the most recent active quiz
-    quiz = db.query(Quiz).filter(
-        Quiz.category_id == category_id,
-        Quiz.is_active == True
-    ).order_by(Quiz.last_updated.desc()).first()
-    
-    if not quiz:
-        # Create a new quiz if none exists
-        quiz = create_quiz_for_category(db, category_id)
-        quiz_count = 1
-    
-    # Check if user has previous score
-    previous_score = db.query(UserQuizScore).filter(
-        UserQuizScore.user_id == user_id,
-        UserQuizScore.quiz_id == quiz.id
-    ).order_by(UserQuizScore.completed_at.desc()).first()
-    
-    # Get only question count instead of full questions
-    question_count = len(quiz.questions) if quiz.questions else 0
-    
-    quiz_data = {
-        "id": quiz.id,
-        "title": quiz.title,
-        "description": quiz.description,
-        "category": {
-            "id": category.id,
-            "name": category.name,
-            "description": category.description,
-            "is_active": category.is_active,
-            "quiz_count": quiz_count,  # Now returns actual count
-            "created_at": category.created_at.isoformat() if category.created_at else None
-        },
-        "difficulty": quiz.difficulty,
-        "questions": [],  # Empty array instead of full questions
-        "source_type": quiz.source_type,
-        "version": quiz.version,
-        "last_updated": quiz.last_updated.isoformat() if quiz.last_updated else None,
-        "user_score": previous_score.score if previous_score else None,
-        "total_quizzes_in_category": quiz_count,
-        "question_count": question_count  # Add question count field
+    return {
+        "category_id": category_id,
+        "category_name": category.name,
+        "total_quizzes": len(quizzes_list),
+        "quizzes": quizzes_list
     }
-    
-    return quiz_data
 
 @router.get("/{quiz_id}", response_model=Dict[str, Any])
 def get_quiz_by_id(
