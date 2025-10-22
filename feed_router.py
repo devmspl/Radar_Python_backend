@@ -269,7 +269,7 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
         """
         
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system", 
