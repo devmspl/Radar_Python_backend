@@ -263,7 +263,7 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         if not isinstance(bullets, list):
             bullets = []
         
-        logger.info(f"Successfully generated slide: {title}")
+        # logger.info(f"Successfully generated slide: {title}")
         return {
             "title": title,
             "body": body,
@@ -372,36 +372,43 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         raise
 
 def generate_feed_background_color(title: str, content_type: str, categories: List[str]) -> str:
-    """Generate a unique background color for each feed (same for all slides in the feed)."""
+    """Generate background color from a predefined set of distinct colors."""
     import hashlib
     
-    # Create a unique seed from the title and categories to ensure different colors for different feeds
+    # Predefined set of visually distinct colors
+    distinct_colors = [
+        "#1e3a8a",  # Dark blue
+        "#166534",  # Dark green  
+        "#581c87",  # Dark purple
+        "#991b1b",  # Dark red
+        "#9a3412",  # Dark orange
+        "#115e59",  # Dark teal
+        "#831843",  # Dark pink
+        "#854d0e",  # Dark yellow
+        "#3730a3",  # Dark indigo
+        "#064e3b",  # Dark emerald
+        "#1d4ed8",  # Medium blue
+        "#15803d",  # Medium green
+        "#7c3aed",  # Medium purple
+        "#dc2626",  # Medium red
+        "#ea580c",  # Medium orange
+        "#0f766e",  # Medium teal
+        "#be185d",  # Medium pink
+        "#ca8a04",  # Medium yellow
+        "#4f46e5",  # Medium indigo
+        "#047857",  # Medium emerald
+    ]
+    
+    # Create a unique seed
     seed_string = f"{title}_{content_type}_{'_'.join(sorted(categories))}"
     hash_object = hashlib.md5(seed_string.encode())
-    hash_hex = hash_object.hexdigest()
+    hash_int = int(hash_object.hexdigest()[:8], 16)
     
-    # Use the hash to generate a color
-    color_hex = f"#{hash_hex[:6]}"
+    # Select color from the predefined list
+    color_index = hash_int % len(distinct_colors)
+    color_hex = distinct_colors[color_index]
     
-    # Ensure it's a visually appealing color (not too light or too dark)
-    r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
-    brightness = (r * 299 + g * 587 + b * 114) / 1000
-    
-    # Adjust color to be in a good range for readability
-    if brightness > 200:  # Too light
-        # Darken by 50%
-        r = int(r * 0.5)
-        g = int(g * 0.5)
-        b = int(b * 0.5)
-        color_hex = f"#{r:02x}{g:02x}{b:02x}"
-    elif brightness < 80:  # Too dark
-        # Lighten by 60%
-        r = min(255, int(r * 1.6))
-        g = min(255, int(g * 1.6))
-        b = min(255, int(b * 1.6))
-        color_hex = f"#{r:02x}{g:02x}{b:02x}"
-    
-    logger.info(f"Generated feed background color: {color_hex} for '{title}'")
+    logger.info(f"Generated predefined distinct color: {color_hex} for '{title}' (index: {color_index})")
     return color_hex
 
 # ------------------ Core Feed Creation Functions ------------------
@@ -849,7 +856,7 @@ def create_feeds_from_website(
         "source_type": "blog",
         "message": "Blog feed creation process started in background (AI-only, no fallbacks)",
         "status": "processing",
-        "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
+        # "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
     }
 
 @router.post("/feeds/youtube", response_model=dict)
@@ -908,7 +915,7 @@ def create_feeds_from_youtube(
         "source_type": "youtube",
         "message": f"YouTube transcript feed creation process started for {len(transcripts)} transcripts (AI-only, no fallbacks)",
         "status": "processing",
-        "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
+        # "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
     }
 
 @router.delete("/feeds/slides", response_model=dict)
