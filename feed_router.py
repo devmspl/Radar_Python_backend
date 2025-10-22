@@ -71,51 +71,32 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> list
 # ------------------ AI Content Generation Functions ------------------
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def generate_feed_content_with_ai(title: str, content: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
-    """Generate engaging feed content using AI for both blogs and transcripts."""
-    try:
-        truncated_content = content[:6000] + "..." if len(content) > 6000 else content
-        
-        system_prompt = {
-            "blog": "You are a content summarization and presentation expert. Create an engaging, structured feed from blog content. Return JSON with: title, summary, key_points (array), conclusion.",
-            "transcript": "You are a video content summarization expert. Create an engaging, structured feed from video transcript content. Focus on the main ideas, key takeaways, and actionable insights. Return JSON with: title, summary, key_points (array), conclusion."
-        }
-        
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {
-                    "role": "system", 
-                    "content": system_prompt.get(content_type, system_prompt["blog"])
-                },
-                {
-                    "role": "user",
-                    "content": f"Title: {title}\nContent Type: {content_type}\nCategories: {', '.join(categories)}\nContent:\n{truncated_content}\n\nGenerate engaging feed content in JSON format."
-                }
-            ],
-            temperature=0.7,
-            max_tokens=2000
-        )
-        content = response.choices[0].message.content
-        return json.loads(content)
-    except Exception as e:
-        logger.error(f"OpenAI feed generation error: {e}")
-        return generate_fallback_feed_content(title, content, content_type)
-
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_slide_with_ai(slide_type: str, context: str, categories: List[str], content_type: str = "blog", previous_slides: List[Dict] = None) -> Dict[str, Any]:
-    """Generate a specific slide type using AI for both blogs and transcripts."""
+    """Generate a specific slide type using AI with background colors."""
     try:
         content_type_context = f"This is based on {content_type} content."
         
+        # Enhanced system prompt for background colors
+        system_prompt = {
+            "role": "system", 
+            "content": """You are a presentation design expert. Create engaging, concise slides. 
+            Return JSON with: title, body, bullets (array), background_color (hex color code). 
+            
+            Choose appropriate background colors based on slide type:
+            - title: Use bold, professional colors like #1a365d (dark blue), #2c5530 (dark green), #742a2a (dark red)
+            - summary: Use medium colors like #2d3748 (dark gray), #4a5568 (gray-blue)
+            - key_point: Use lighter colors like #4a5568, #718096 (light gray-blue)
+            - conclusion: Use calming colors like #2c5282 (blue), #2b6cb0 (light blue)
+            - additional_insights: Use neutral colors like #4a5568, #718096
+            
+            Ensure background_color is always a valid hex color code."""
+        }
+        
         messages = [
-            {
-                "role": "system", 
-                "content": "You are a presentation design expert. Create engaging, concise slides. Return JSON with: title, body, bullets (array)."
-            },
+            system_prompt,
             {
                 "role": "user",
-                "content": f"Slide Type: {slide_type}\n{content_type_context}\nContext: {context}\nCategories: {', '.join(categories)}\nGenerate slide content in JSON format."
+                "content": f"Slide Type: {slide_type}\n{content_type_context}\nContext: {context}\nCategories: {', '.join(categories)}\nGenerate slide content in JSON format with a background_color."
             }
         ]
         
@@ -131,10 +112,24 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         content = response.choices[0].message.content
         slide_data = json.loads(content)
         
+        # Validate and ensure background_color is present and valid
+        background_color = slide_data.get("background_color", "")
+        if not background_color or not re.match(r'^#[0-9A-Fa-f]{6}$', background_color):
+            # Use default colors based on slide type
+            default_colors = {
+                "title": "#1a365d",      # Dark blue
+                "summary": "#2d3748",    # Dark gray
+                "key_point": "#4a5568",  # Medium gray
+                "conclusion": "#2c5282", # Blue gray
+                "additional_insights": "#718096"  # Light gray-blue
+            }
+            background_color = default_colors.get(slide_type, "#FFFFFF")
+        
         return {
             "title": slide_data.get("title", f"Slide {slide_type}"),
             "body": slide_data.get("body", ""),
-            "bullets": slide_data.get("bullets"),
+            "bullets": slide_data.get("bullets", []),
+            "background_color": background_color,
             "source_refs": [],
             "render_markdown": True
         }
@@ -143,51 +138,248 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         return generate_fallback_slide(slide_type, context, categories, content_type)
 
 def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict[str, Any], categories: List[str], content_type: str = "blog") -> List[Dict]:
-    """Generate exactly 5 presentation slides using AI without image generation."""
+    """Generate random number of presentation slides (1-10) using AI with background colors based on content richness."""
+    import random
+    
+    # Determine slide count based on content richness (1-10 slides)
+    content_length = len(content)
+    key_points_count = len(ai_generated_content.get("key_points", []))
+    summary_length = len(ai_generated_content.get("summary", ""))
+    
+    # Calculate content richness score
+    richness_score = min(
+        (content_length / 1000) +  # Content length factor
+        (key_points_count * 0.5) +  # Number of key points
+        (summary_length / 500),     # Summary completeness
+        10.0  # Cap at 10
+    )
+    
+    # Randomize slide count based on richness, but ensure at least 1 slide
+    base_slides = max(1, min(10, int(richness_score) + random.randint(-1, 2)))
+    slide_count = max(1, min(10, base_slides))  # Ensure between 1-10
+    
+    logger.info(f"Generating {slide_count} slides for '{title}' (richness: {richness_score:.2f})")
+    
     slides = []
     
-    # 1. Title slide
+    # Always start with title slide
     title_context = f"Content: {title}\nSummary: {ai_generated_content.get('summary', '')}\nType: {content_type}"
     title_slide = generate_slide_with_ai("title", title_context, categories, content_type)
     title_slide["order"] = 1
     slides.append(title_slide)
     
-    # 2. Summary/Overview slide
+    # If only 1 slide needed, return just title
+    if slide_count == 1:
+        return slides
+    
+    # Add summary slide if we have at least 2 slides
     summary_context = f"Summary: {ai_generated_content.get('summary', '')}\nContent: {title}\nType: {content_type}"
     summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
     summary_slide["order"] = 2
     slides.append(summary_slide)
     
-    # 3-5. Key point slides (only 3 key points max)
-    key_points = ai_generated_content.get("key_points", [])[:3]  # Limit to 3 key points
+    # If only 2 slides needed, return title + summary
+    if slide_count == 2:
+        return slides
     
-    for i, point in enumerate(key_points):
-        key_point_context = f"Key Point: {point}\nContent: {title}\nType: {content_type}"
-        key_slide = generate_slide_with_ai("key_point", key_point_context, categories, content_type, slides)
-        key_slide["order"] = len(slides) + 1
-        slides.append(key_slide)
+    # Add key points based on available content and remaining slide count
+    key_points = ai_generated_content.get("key_points", [])
+    remaining_slides = slide_count - 2  # Already used title and summary
     
-    # If we have less than 5 slides, add conclusion slide
-    if len(slides) < 5:
-        conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nKey Points: {', '.join(key_points)}\nType: {content_type}"
+    # Determine how many key point slides to create
+    key_point_slides_count = min(remaining_slides, len(key_points), 5)  # Max 5 key point slides
+    
+    for i in range(key_point_slides_count):
+        if i < len(key_points):
+            point = key_points[i]
+            key_point_context = f"Key Point: {point}\nContent: {title}\nType: {content_type}"
+            key_slide = generate_slide_with_ai("key_point", key_point_context, categories, content_type, slides)
+            key_slide["order"] = len(slides) + 1
+            slides.append(key_slide)
+    
+    # If we still have slides remaining, add conclusion
+    if len(slides) < slide_count:
+        conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nKey Points: {', '.join(key_points[:3])}\nType: {content_type}"
         conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, content_type, slides)
         conclusion_slide["order"] = len(slides) + 1
         slides.append(conclusion_slide)
     
-    # Ensure exactly 5 slides
-    while len(slides) < 5:
-        filler_context = f"Additional insights from: {title}\nType: {content_type}"
-        filler_slide = generate_slide_with_ai("additional_insights", filler_context, categories, content_type, slides)
-        filler_slide["order"] = len(slides) + 1
-        slides.append(filler_slide)
+    # Fill remaining slots with additional insights
+    while len(slides) < slide_count:
+        remaining_count = slide_count - len(slides)
+        insight_context = f"Additional insights from: {title}\nRemaining key points: {', '.join(key_points[len(slides)-2:]) if len(slides)-2 < len(key_points) else 'Various aspects'}\nType: {content_type}"
+        insight_slide = generate_slide_with_ai("additional_insights", insight_context, categories, content_type, slides)
+        insight_slide["order"] = len(slides) + 1
+        slides.append(insight_slide)
     
-    # Limit to exactly 5 slides
-    return slides[:5]
+    # Ensure we have exactly the determined number of slides
+    return slides[:slide_count]
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def generate_feed_content_with_ai(title: str, content: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
+    """Generate engaging feed content using AI for both blogs and transcripts."""
+    try:
+        truncated_content = content[:6000] + "..." if len(content) > 6000 else content
+        
+        system_prompt = {
+            "blog": """You are a content summarization and presentation expert. Create an engaging, structured feed from blog content. 
+            
+            Return JSON with the following structure:
+            {
+                "title": "Engaging title that captures the essence",
+                "summary": "2-3 paragraph comprehensive summary of the main content",
+                "key_points": ["Point 1", "Point 2", "Point 3", "Point 4", "Point 5"],
+                "conclusion": "1-2 paragraph concluding thoughts or key takeaways"
+            }
+            
+            Requirements:
+            - Title should be compelling and under 80 characters
+            - Summary should capture the main ideas comprehensively
+            - Key points should be 5-7 bullet points highlighting most important aspects
+            - Conclusion should provide clear takeaways
+            - Maintain the original meaning and key insights""",
+            
+            "transcript": """You are a video content summarization expert. Create an engaging, structured feed from video transcript content. Focus on the main ideas, key takeaways, and actionable insights.
+            
+            Return JSON with the following structure:
+            {
+                "title": "Engaging title that captures the video's essence", 
+                "summary": "2-3 paragraph summary of the video's main content and message",
+                "key_points": ["Key insight 1", "Key insight 2", "Key insight 3", "Key insight 4", "Key insight 5"],
+                "conclusion": "1-2 paragraph conclusion with main takeaways and actionable advice"
+            }
+            
+            Requirements:
+            - Title should be compelling and reflect the video's core message
+            - Summary should capture the video's main narrative and purpose
+            - Key points should highlight the most valuable insights from the video
+            - Conclusion should provide clear takeaways and practical applications
+            - Focus on actionable insights and main arguments"""
+        }
+        
+        user_prompt = f"""
+        Content Title: {title}
+        Content Type: {content_type}
+        Categories: {', '.join(categories)}
+        
+        Content:
+        {truncated_content}
+        
+        Please generate engaging feed content in the specified JSON format.
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": system_prompt.get(content_type, system_prompt["blog"])
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=2000,
+            response_format={ "type": "json_object" }
+        )
+        
+        content = response.choices[0].message.content
+        ai_content = json.loads(content)
+        
+        # Validate and ensure all required fields are present
+        required_fields = ["title", "summary", "key_points", "conclusion"]
+        for field in required_fields:
+            if field not in ai_content:
+                if field == "key_points":
+                    ai_content[field] = []
+                else:
+                    ai_content[field] = f"Default {field} for {title}"
+        
+        # Ensure key_points is a list and has reasonable length
+        if isinstance(ai_content["key_points"], list):
+            ai_content["key_points"] = ai_content["key_points"][:7]  # Limit to 7 points max
+        else:
+            ai_content["key_points"] = []
+        
+        logger.info(f"Successfully generated AI content for {content_type}: {title}")
+        return ai_content
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in AI response: {e}")
+        logger.info(f"Raw AI response: {content}")
+        return generate_fallback_feed_content(title, content, content_type)
+    
+    except Exception as e:
+        logger.error(f"OpenAI feed generation error: {e}")
+        return generate_fallback_feed_content(title, content, content_type)
+
+
+def generate_fallback_feed_content(title: str, content: str, content_type: str = "blog") -> Dict[str, Any]:
+    """Fallback content generation for both blogs and transcripts when AI fails."""
+    logger.info(f"Using fallback content generation for: {title}")
+    
+    if content_type == "transcript":
+        # For transcripts, split by sentences or natural breaks
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        # Filter out very short sentences and take meaningful ones
+        meaningful_sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
+        
+        if meaningful_sentences:
+            summary = meaningful_sentences[0]
+            # Use next 5-7 sentences as key points, ensuring they're substantial
+            key_points = []
+            for sentence in meaningful_sentences[1:6]:
+                if len(sentence) > 40 and len(key_points) < 5:
+                    key_points.append(sentence)
+        else:
+            summary = f"A comprehensive summary of the video: {title}"
+            key_points = [
+                f"Key insight about {title}",
+                f"Important point from the video",
+                f"Main takeaway from {title}",
+                f"Valuable information shared",
+                f"Core message of the content"
+            ]
+    else:
+        # For blogs, use paragraph-based approach
+        paragraphs = [p.strip() for p in content.split('\n\n') if len(p.strip()) > 50]
+        
+        if paragraphs:
+            summary = paragraphs[0]
+            # Use next paragraphs as key points, taking first sentence from each
+            key_points = []
+            for paragraph in paragraphs[1:6]:
+                if len(paragraph) > 30 and len(key_points) < 5:
+                    # Extract first sentence or first 100 characters
+                    first_sentence = re.split(r'(?<=[.!?]) +', paragraph)[0] if re.search(r'[.!?]', paragraph) else paragraph[:120] + "..."
+                    key_points.append(first_sentence)
+        else:
+            summary = f"An overview of the blog post: {title}"
+            key_points = [
+                f"Main idea from {title}",
+                f"Important concept discussed",
+                f"Key finding in the content",
+                f"Primary argument made",
+                f"Essential information shared"
+            ]
+    
+    # Ensure we have at least 3 key points
+    while len(key_points) < 3:
+        key_points.append(f"Additional insight from {title}")
+    
+    return {
+        "title": f"Summary: {title}",
+        "summary": summary,
+        "key_points": key_points[:7],  # Max 7 points
+        "conclusion": f"Key insights and main takeaways from {title}. This content provides valuable information on {', '.join(key_points[:2])}."
+    }
 
 # ------------------ Core Feed Creation Functions ------------------
 
 def create_feed_from_blog(db: Session, blog: Blog):
-    """Generate feed and slides from a blog using AI and store in DB."""
+    """Generate feed and slides from a blog using AI and store in DB with random slide count (1-10)."""
     try:
         # Check if feed already exists for this blog
         existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
@@ -195,55 +387,57 @@ def create_feed_from_blog(db: Session, blog: Blog):
             # Delete existing slides to regenerate
             db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
             db.flush()
-        else:
-            # Create new feed
-            admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
-            categories = categorize_content_with_openai(blog.content, admin_categories)
-            ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
-            slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
-            
-            feed_title = ai_generated_content.get("title", blog.title)
-            feed = Feed(
-                blog_id=blog.id, 
-                title=feed_title,
-                categories=categories, 
-                status="ready",
-                ai_generated_content=ai_generated_content,
-                image_generation_enabled=False,
-                source_type="blog",
+        
+        # Create new feed
+        admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
+        categories = categorize_content_with_openai(blog.content, admin_categories)
+        ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
+        
+        # Generate slides with random count between 1-10 based on content
+        slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
+        
+        feed_title = ai_generated_content.get("title", blog.title)
+        feed = Feed(
+            blog_id=blog.id, 
+            title=feed_title,
+            categories=categories, 
+            status="ready",
+            ai_generated_content=ai_generated_content,
+            image_generation_enabled=False,
+            source_type="blog",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(feed)
+        db.flush()
+        
+        for slide_data in slides_data:
+            slide = Slide(
+                feed_id=feed.id,
+                order=slide_data["order"],
+                title=slide_data["title"],
+                body=slide_data["body"],
+                bullets=slide_data.get("bullets"),
+                background_color=slide_data.get("background_color", "#FFFFFF"),
+                source_refs=slide_data.get("source_refs", []),
+                render_markdown=int(slide_data.get("render_markdown", True)),
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
-            db.add(feed)
-            db.flush()
-            
-            for slide_data in slides_data:
-                slide = Slide(
-                    feed_id=feed.id,
-                    order=slide_data["order"],
-                    title=slide_data["title"],
-                    body=slide_data["body"],
-                    bullets=slide_data.get("bullets"),
-                    background_image_url=None,
-                    background_image_prompt=None,
-                    source_refs=slide_data.get("source_refs", []),
-                    render_markdown=int(slide_data.get("render_markdown", True)),
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                db.add(slide)
-            
-            db.commit()
-            db.refresh(feed)
-            logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
-            return feed
+            db.add(slide)
+        
+        db.commit()
+        db.refresh(feed)
+        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id} with {len(slides_data)} slides")
+        return feed
+        
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
         raise
 
 def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: bool = False):
-    """Generate feed and slides from a YouTube transcript using AI and store in DB."""
+    """Generate feed and slides from a YouTube transcript using AI and store in DB with random slide count (1-10)."""
     try:
         # Check if feed already exists for this transcript
         existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
@@ -255,6 +449,8 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         categories = categorize_content_with_openai(transcript.transcript_text, admin_categories)
         ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
+        
+        # Generate slides with random count between 1-10 based on content
         slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
         
         feed_title = ai_generated_content.get("title", transcript.title)
@@ -271,7 +467,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
             db.flush()
             
-            # Create new slides
+            # Create new slides with random count
             for slide_data in slides_data:
                 slide = Slide(
                     feed_id=existing_feed.id,
@@ -279,8 +475,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
                     title=slide_data["title"],
                     body=slide_data["body"],
                     bullets=slide_data.get("bullets"),
-                    background_image_url=None,
-                    background_image_prompt=None,
+                    background_color=slide_data.get("background_color", "#FFFFFF"),
                     source_refs=slide_data.get("source_refs", []),
                     render_markdown=int(slide_data.get("render_markdown", True)),
                     created_at=datetime.utcnow(),
@@ -308,6 +503,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             db.add(feed)
             db.flush()
             
+            # Create slides with random count
             for slide_data in slides_data:
                 slide = Slide(
                     feed_id=feed.id,
@@ -315,8 +511,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
                     title=slide_data["title"],
                     body=slide_data["body"],
                     bullets=slide_data.get("bullets"),
-                    background_image_url=None,
-                    background_image_prompt=None,
+                    background_color=slide_data.get("background_color", "#FFFFFF"),
                     source_refs=slide_data.get("source_refs", []),
                     render_markdown=int(slide_data.get("render_markdown", True)),
                     created_at=datetime.utcnow(),
@@ -370,12 +565,23 @@ def generate_fallback_feed_content(title: str, content: str, content_type: str =
     }
 
 def generate_fallback_slide(slide_type: str, context: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
-    """Fallback slide generation."""
+    """Fallback slide generation with background colors."""
     content_type_label = "Video" if content_type == "transcript" else "Blog"
+    
+    # Default background colors for fallback slides
+    fallback_colors = {
+        "title": "#1a365d",  # Dark blue
+        "summary": "#2d3748",  # Dark gray
+        "key_point": "#4a5568",  # Medium gray
+        "conclusion": "#2c5282",  # Blue gray
+        "additional_insights": "#4a5568"  # Medium gray
+    }
+    
     return {
         "title": f"{slide_type.replace('_', ' ').title()} - {content_type_label}",
         "body": context[:500] + "..." if len(context) > 500 else context,
         "bullets": None,
+        "background_color": fallback_colors.get(slide_type, "#FFFFFF"),
         "source_refs": [],
         "render_markdown": True
     }
@@ -395,7 +601,7 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
             "title": blog.title if idx == 0 else f"Key Point {idx}",
             "body": p[:500],  # Limit body length
             "bullets": None,
-            "background_image_url": None,
+            # "background_image_url": None,
             "source_refs": [],
             "render_markdown": True
         })
@@ -418,7 +624,7 @@ def create_basic_feed_from_blog(db: Session, blog: Blog):
             title=s["title"],
             body=s["body"],
             bullets=s.get("bullets"),
-            background_image_url=None,
+            # background_image_url=None,
             source_refs=s.get("source_refs", []),
             render_markdown=int(s.get("render_markdown", True))
         )
@@ -444,7 +650,7 @@ def create_basic_feed_from_transcript(db: Session, transcript: Transcript):
             "title": transcript.title if idx == 0 else f"Key Insight {idx}",
             "body": chunk[:500],  # Limit body length
             "bullets": None,
-            "background_image_url": None,
+            # "background_image_url": None,
             "source_refs": [],
             "render_markdown": True
         })
@@ -467,7 +673,7 @@ def create_basic_feed_from_transcript(db: Session, transcript: Transcript):
             title=s["title"],
             body=s["body"],
             bullets=s.get("bullets"),
-            background_image_url=None,
+            # background_image_url=None,
             source_refs=s.get("source_refs", []),
             render_markdown=int(s.get("render_markdown", True))
         )
@@ -560,11 +766,12 @@ def get_all_feeds(
     limit: int = 20, 
     category: Optional[str] = None,
     status: Optional[str] = None,
-    source_type: Optional[str] = None,  # New filter: blog, youtube, or both
+    source_type: Optional[str] = None,
+    is_published: Optional[bool] = None,  # New filter parameter
     db: Session = Depends(get_db)
 ):
-    """Get all feeds summary with filtering options."""
-    query = db.query(Feed).options(joinedload(Feed.blog))
+    """Get all feeds summary with filtering options including is_published."""
+    query = db.query(Feed).options(joinedload(Feed.blog), joinedload(Feed.published_feed))
     
     if category:
         query = query.filter(Feed.categories.contains([category]))
@@ -572,6 +779,11 @@ def get_all_feeds(
         query = query.filter(Feed.status == status)
     if source_type:
         query = query.filter(Feed.source_type == source_type)
+    if is_published is not None:
+        if is_published:
+            query = query.filter(Feed.published_feed != None)  # Has published_feed relationship
+        else:
+            query = query.filter(Feed.published_feed == None)  # No published_feed relationship
     
     query = query.order_by(Feed.created_at.desc())
     total = query.count()
@@ -579,16 +791,19 @@ def get_all_feeds(
 
     items = []
     for f in feeds:
+        # Determine is_published status
+        is_published_status = f.published_feed is not None
+        
         # Determine source metadata based on source_type
         if f.source_type == "youtube":
             meta = {
                 "title": f.title,
-                "original_title": f.title,  # Transcript title is the original
+                "original_title": f.title,
                 "author": "YouTube Creator",
                 "source_url": f"https://www.youtube.com/watch?v={f.transcript_id}" if f.transcript_id else "#",
                 "source_type": "youtube"
             }
-        else:  # blog
+        else:
             meta = {
                 "title": f.title,
                 "original_title": f.blog.title if f.blog else "Unknown",
@@ -604,7 +819,9 @@ def get_all_feeds(
             "title": f.title,
             "categories": f.categories,
             "status": f.status,
-            "source_type": f.source_type or "blog",  # Default to blog for backward compatibility
+            "source_type": f.source_type or "blog",
+            "is_published": is_published_status,  # New field
+            "published_at": f.published_feed.published_at.isoformat() if is_published_status else None,
             "slides_count": len(f.slides),
             "meta": meta,
             "created_at": f.created_at.isoformat() if f.created_at else None,
@@ -624,17 +841,29 @@ def get_all_feeds(
         "limit": limit, 
         "total": total, 
         "has_more": has_more,
-        "filters": {"category": category, "status": status, "source_type": source_type}
+        "filters": {
+            "category": category, 
+            "status": status, 
+            "source_type": source_type,
+            "is_published": is_published
+        }
     }
-
 @router.get("/feeds/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
-    """Get full AI-generated feed with slides."""
-    feed = db.query(Feed).options(joinedload(Feed.blog), joinedload(Feed.slides)).filter(Feed.id == feed_id).first()
+    """Get full AI-generated feed with slides and is_published status."""
+    feed = db.query(Feed).options(
+        joinedload(Feed.blog), 
+        joinedload(Feed.slides),
+        joinedload(Feed.published_feed)  # Eager load published_feed relationship
+    ).filter(Feed.id == feed_id).first()
+    
     if not feed:
         raise HTTPException(status_code=404, detail="Feed not found")
 
     ai_content = getattr(feed, 'ai_generated_content', {})
+    
+    # Determine if the feed is published
+    is_published = feed.published_feed is not None
     
     # Determine source metadata based on source_type
     if feed.source_type == "youtube":
@@ -663,6 +892,8 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "status": feed.status,
         "source_type": feed.source_type or "blog",
         "ai_generated_content": ai_content,
+        "is_published": is_published,  # New field
+        "published_at": feed.published_feed.published_at.isoformat() if is_published else None,
         "meta": meta,
         "slides": sorted([
             {
@@ -671,7 +902,7 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
                 "title": s.title,
                 "body": s.body,
                 "bullets": s.bullets,
-                "background_image_url": None,
+                "background_color": s.background_color,
                 "background_image_prompt": None,
                 "source_refs": s.source_refs,
                 "render_markdown": bool(s.render_markdown),
@@ -779,25 +1010,6 @@ def create_feeds_from_youtube(
         "message": f"YouTube transcript feed creation process started for {len(transcripts)} transcripts",
         "status": "processing"
     }
-# Add the YouTubeFeedRequest schema to your schemas.py
-"""
-class YouTubeFeedRequest(BaseModel):
-    job_id: Optional[str] = None  # Create feeds from a specific transcript job
-    video_id: Optional[str] = None  # Create feed from a specific video
-    overwrite: bool = False  # Overwrite existing feeds
-    use_ai: bool = True  # Use AI for enhanced content generation
-"""
-
-# Also update your models.py to add the new fields to Feed model:
-"""
-class Feed(Base):
-    # ... existing fields ...
-    transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)  # Link to YouTube transcripts
-    source_type = Column(String, default='blog')  # 'blog' or 'youtube'
-"""
-
-# Keep all your existing endpoints (delete_slide_from_feed, get_categorized_feeds_by_source, etc.)
-# ... [rest of your existing endpoints remain unchanged] ...
 
 @router.delete("/feeds/slides", response_model=dict)
 def delete_slide_from_feed(

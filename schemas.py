@@ -262,6 +262,7 @@ class FeedDetailResponse(BaseModel):
     title: str
     categories: List[str]
     status: str
+    is_published: bool
     ai_generated_content: Optional[Dict[str, Any]]
     image_generation_enabled: bool
     created_at: datetime

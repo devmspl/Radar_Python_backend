@@ -185,13 +185,13 @@ class Slide(Base):
     title = Column(String(500), nullable=False)
     body = Column(Text, nullable=False)
     bullets = Column(JSONEncodedList, default=list)
-    background_image_url = Column(String(500), nullable=True)
-    background_image_prompt = Column(String(1000), nullable=True)
+    background_color = Column(String, default="#FFFFFF")
     source_refs = Column(JSONEncodedList, default=list)
     render_markdown = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    feed = relationship("Feed", back_populates="slides")
+    feed = relationship("Feed", back_populates="slides",overlaps="published_feed")
+
 # Add this to your models.py file
 class PublishedFeed(Base):
     __tablename__ = "published_feeds"
