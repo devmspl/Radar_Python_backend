@@ -72,31 +72,23 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> list
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_slide_with_ai(slide_type: str, context: str, categories: List[str], content_type: str = "blog", previous_slides: List[Dict] = None) -> Dict[str, Any]:
-    """Generate a specific slide type using AI with background colors."""
+    """Generate a specific slide type using AI (background color will be overridden later)."""
     try:
         content_type_context = f"This is based on {content_type} content."
         
-        # Enhanced system prompt for background colors
+        # Simplified system prompt - we'll handle background color separately
         system_prompt = {
             "role": "system", 
             "content": """You are a presentation design expert. Create engaging, concise slides. 
-            Return JSON with: title, body, bullets (array), background_color (hex color code). 
-            
-            Choose appropriate background colors based on slide type:
-            - title: Use bold, professional colors like #1a365d (dark blue), #2c5530 (dark green), #742a2a (dark red)
-            - summary: Use medium colors like #2d3748 (dark gray), #4a5568 (gray-blue)
-            - key_point: Use lighter colors like #4a5568, #718096 (light gray-blue)
-            - conclusion: Use calming colors like #2c5282 (blue), #2b6cb0 (light blue)
-            - additional_insights: Use neutral colors like #4a5568, #718096
-            
-            Ensure background_color is always a valid hex color code."""
+            Return JSON with: title, body, bullets (array).
+            Focus on creating clear, informative content. The background color will be handled separately."""
         }
         
         messages = [
             system_prompt,
             {
                 "role": "user",
-                "content": f"Slide Type: {slide_type}\n{content_type_context}\nContext: {context}\nCategories: {', '.join(categories)}\nGenerate slide content in JSON format with a background_color."
+                "content": f"Slide Type: {slide_type}\n{content_type_context}\nContext: {context}\nCategories: {', '.join(categories)}\nGenerate slide content in JSON format."
             }
         ]
         
@@ -112,24 +104,11 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         content = response.choices[0].message.content
         slide_data = json.loads(content)
         
-        # Validate and ensure background_color is present and valid
-        background_color = slide_data.get("background_color", "")
-        if not background_color or not re.match(r'^#[0-9A-Fa-f]{6}$', background_color):
-            # Use default colors based on slide type
-            default_colors = {
-                "title": "#1a365d",      # Dark blue
-                "summary": "#2d3748",    # Dark gray
-                "key_point": "#4a5568",  # Medium gray
-                "conclusion": "#2c5282", # Blue gray
-                "additional_insights": "#718096"  # Light gray-blue
-            }
-            background_color = default_colors.get(slide_type, "#FFFFFF")
-        
         return {
             "title": slide_data.get("title", f"Slide {slide_type}"),
             "body": slide_data.get("body", ""),
             "bullets": slide_data.get("bullets", []),
-            "background_color": background_color,
+            "background_color": "#FFFFFF",  # Default, will be overridden
             "source_refs": [],
             "render_markdown": True
         }
@@ -138,7 +117,7 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         return generate_fallback_slide(slide_type, context, categories, content_type)
 
 def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict[str, Any], categories: List[str], content_type: str = "blog") -> List[Dict]:
-    """Generate random number of presentation slides (1-10) using AI with background colors based on content richness."""
+    """Generate random number of presentation slides (1-10) using AI with same background color for all slides."""
     import random
     
     # Determine slide count based on content richness (1-10 slides)
@@ -160,12 +139,16 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
     
     logger.info(f"Generating {slide_count} slides for '{title}' (richness: {richness_score:.2f})")
     
+    # Generate a single background color for all slides in this feed
+    background_color = generate_unified_background_color(content_type, categories)
+    
     slides = []
     
     # Always start with title slide
     title_context = f"Content: {title}\nSummary: {ai_generated_content.get('summary', '')}\nType: {content_type}"
     title_slide = generate_slide_with_ai("title", title_context, categories, content_type)
     title_slide["order"] = 1
+    title_slide["background_color"] = background_color  # Override with unified color
     slides.append(title_slide)
     
     # If only 1 slide needed, return just title
@@ -176,6 +159,7 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
     summary_context = f"Summary: {ai_generated_content.get('summary', '')}\nContent: {title}\nType: {content_type}"
     summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
     summary_slide["order"] = 2
+    summary_slide["background_color"] = background_color  # Override with unified color
     slides.append(summary_slide)
     
     # If only 2 slides needed, return title + summary
@@ -195,6 +179,7 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
             key_point_context = f"Key Point: {point}\nContent: {title}\nType: {content_type}"
             key_slide = generate_slide_with_ai("key_point", key_point_context, categories, content_type, slides)
             key_slide["order"] = len(slides) + 1
+            key_slide["background_color"] = background_color  # Override with unified color
             slides.append(key_slide)
     
     # If we still have slides remaining, add conclusion
@@ -202,6 +187,7 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         conclusion_context = f"Conclusion: {ai_generated_content.get('conclusion', '')}\nKey Points: {', '.join(key_points[:3])}\nType: {content_type}"
         conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, content_type, slides)
         conclusion_slide["order"] = len(slides) + 1
+        conclusion_slide["background_color"] = background_color  # Override with unified color
         slides.append(conclusion_slide)
     
     # Fill remaining slots with additional insights
@@ -210,10 +196,65 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         insight_context = f"Additional insights from: {title}\nRemaining key points: {', '.join(key_points[len(slides)-2:]) if len(slides)-2 < len(key_points) else 'Various aspects'}\nType: {content_type}"
         insight_slide = generate_slide_with_ai("additional_insights", insight_context, categories, content_type, slides)
         insight_slide["order"] = len(slides) + 1
+        insight_slide["background_color"] = background_color  # Override with unified color
         slides.append(insight_slide)
     
     # Ensure we have exactly the determined number of slides
     return slides[:slide_count]
+
+def generate_unified_background_color(content_type: str, categories: List[str]) -> str:
+    """Generate a unified background color for all slides in a feed based on content type and categories."""
+    import random
+    
+    # Color palettes based on content type and categories
+    color_palettes = {
+        "blog": [
+            "#1a365d",  # Dark blue - professional
+            "#2d3748",  # Dark gray - formal
+            "#2c5530",  # Dark green - growth/learning
+            "#742a2a",  # Dark red - important/urgent
+            "#553c9a",  # Purple - creative/innovative
+        ],
+        "transcript": [
+            "#2c5282",  # Blue - video/content
+            "#4a5568",  # Gray-blue - neutral
+            "#2b6cb0",  # Light blue - engaging
+            "#1a202c",  # Very dark - professional
+            "#3182ce",  # Bright blue - dynamic
+        ],
+        "youtube": [
+            "#c53030",  # Red - YouTube brand
+            "#2b6cb0",  # Blue - professional
+            "#4a5568",  # Gray - neutral
+            "#2d3748",  # Dark gray - formal
+            "#744210",  # Brown - warm
+        ]
+    }
+    
+    # Category-based color mapping
+    category_colors = {
+        "technology": "#2b6cb0",      # Blue
+        "business": "#2d3748",        # Dark gray
+        "education": "#2c5530",       # Green
+        "entertainment": "#b83280",   # Pink
+        "news": "#c53030",            # Red
+        "podcasts": "#744210",        # Brown
+        "tutorials": "#3182ce",       # Light blue
+        "reviews": "#553c9a",         # Purple
+        "interviews": "#4a5568",      # Gray-blue
+        "how-to": "#2c5282",          # Blue-gray
+    }
+    
+    # Try to match categories first
+    for category in categories:
+        category_lower = category.lower()
+        for cat_key, color in category_colors.items():
+            if cat_key in category_lower:
+                return color
+    
+    # Fall back to content type palette
+    palette = color_palettes.get(content_type, color_palettes["blog"])
+    return random.choice(palette)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_feed_content_with_ai(title: str, content: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
