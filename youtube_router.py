@@ -16,7 +16,7 @@ async def transcribe_content(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Start YouTube transcription"""
+    """Start YouTube transcription with optional feed generation"""
     return create_transcript_job(db, request, current_user.id)
 
 @router.get("/job/{job_id}", response_model=schemas.JobContentStatusResponse)

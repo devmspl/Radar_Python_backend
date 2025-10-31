@@ -117,7 +117,8 @@ class Transcript(Base):
     # Foreign key to the job
     job_id = Column(Integer, ForeignKey("transcript_jobs.id"))
     job = relationship("TranscriptJob", back_populates="transcripts")
-
+    generate_feed = Column(Boolean, default=False)  # NEW: Auto-generate feed
+    feed_generated = Column(Boolean, default=False)  
 
 class Blog(Base):
     __tablename__ = "blogs"
@@ -132,6 +133,8 @@ class Blog(Base):
     job_uid = Column(String, index=True)
 
     feeds = relationship("Feed", back_populates="blog")
+    generate_feed = Column(Boolean, default=False)  # NEW: Auto-generate feed
+    feed_generated = Column(Boolean, default=False)  # NEW: Track if feed was generated
 class ScrapeJob(Base):
     __tablename__ = "scrape_jobs"
 

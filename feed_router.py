@@ -669,6 +669,80 @@ def process_transcript_feeds_creation(db: Session, transcripts: List[Transcript]
     finally:
         db.close()
 
+
+
+# In your feed_router.py
+
+def auto_generate_blog_feeds(db: Session, blog_ids: List[int]):
+    """Automatically generate feeds for newly scraped blogs."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        created_count = 0
+        error_count = 0
+        
+        for blog_id in blog_ids:
+            try:
+                blog = db.query(Blog).filter(Blog.id == blog_id).first()
+                if not blog or not blog.generate_feed:
+                    continue
+                
+                # Check if feed already exists
+                existing_feed = db.query(Feed).filter(Feed.blog_id == blog_id).first()
+                if existing_feed:
+                    blog.feed_generated = True
+                    continue
+                
+                # Generate feed
+                feed = create_feed_from_blog(db, blog)
+                if feed:
+                    # Mark as generated
+                    blog.feed_generated = True
+                    created_count += 1
+                    print(f"✅ Auto-generated feed for blog: {blog.title}")
+                    
+            except Exception as e:
+                error_count += 1
+                print(f"❌ Auto-feed generation failed for blog {blog_id}: {e}")
+                continue
+        
+        db.commit()
+        print(f"📊 Auto-generated {created_count} blog feeds, {error_count} errors")
+        
+    finally:
+        db.close()
+
+def auto_generate_transcript_feed(db: Session, transcript_id: int):
+    """Automatically generate feed for newly scraped transcript."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        transcript = db.query(Transcript).filter(Transcript.id == transcript_id).first()
+        if not transcript or not transcript.generate_feed:
+            return
+        
+        # Check if feed already exists
+        existing_feed = db.query(Feed).filter(
+            Feed.transcript_id == transcript.transcript_id
+        ).first()
+        if existing_feed:
+            transcript.feed_generated = True
+            return
+        
+        # Generate feed
+        feed = create_feed_from_transcript(db, transcript)
+        if feed:
+            # Mark as generated
+            transcript.feed_generated = True
+            db.commit()
+            print(f"✅ Auto-generated feed for transcript: {transcript.title}")
+        
+    except Exception as e:
+        print(f"❌ Auto-feed generation failed for transcript {transcript_id}: {e}")
+    finally:
+        db.close()
+
+    
 # ------------------ API Endpoints ------------------
 
 @router.get("/feeds/all", response_model=dict)

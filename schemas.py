@@ -95,6 +95,7 @@ class TranscriptRequest(BaseModel):
     youtube_url: str
     model_size: str = "base"
     store_in_db: bool = True
+    generate_feed: bool = False  # NEW: Auto-generate feed option
 
 class TranscriptResponse(BaseModel):
     job_id: str
@@ -204,6 +205,8 @@ class PlaylistWithVideos(BaseModel):
 class ScrapeRequest(BaseModel):
     url: str
     category: str = "general"
+    generate_feed: bool = False  # NEW: Auto-generate feed option
+
 class FeedRequest(BaseModel):
     website: str
     overwrite: bool = False
@@ -247,8 +250,9 @@ class SlideResponse(BaseModel):
     title: str
     body: str
     bullets: List[str]
-    background_image_url: Optional[str]
-    background_image_prompt: Optional[str]
+    background_color: Optional[str]
+    # background_image_url: Optional[str]
+    # background_image_prompt: Optional[str]
     source_refs: List[str]
     render_markdown: bool
     created_at: datetime
