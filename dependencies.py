@@ -52,3 +52,38 @@ async def get_current_admin(current_user: models.User = Depends(get_current_user
             detail="Admin privileges required"
         )
     return current_user
+    
+import utils
+
+security = HTTPBearer()
+
+async def get_current_user_from_reset_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    """
+    Special dependency for password reset token
+    """
+    token = credentials.credentials
+    
+    try:
+        payload = utils.verify_reset_token(token)
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid reset token"
+            )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired reset token"
+        )
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    return user

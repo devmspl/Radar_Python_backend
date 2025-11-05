@@ -388,3 +388,18 @@ class UserQuizHistory(BaseModel):
     score: float
     completed_at: str
     time_taken: int
+
+
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    otp_code: str
+
+class PasswordResetStep1(BaseModel):
+    email: EmailStr
+    otp_code: str
+
+class PasswordResetStep2(BaseModel):
+    email: EmailStr
+    new_password: str
+    confirm_password: str

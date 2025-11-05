@@ -99,3 +99,47 @@ def verify_otp(email: str, otp: str, purpose: str) -> bool:
 def delete_otp(email: str, purpose: str):
     key = f"{purpose}:{email}"
     redis_client.delete(key)
+    # Add these functions to your existing utils.py
+
+def create_reset_token(data: dict):
+    """
+    Create a short-lived token specifically for password reset
+    Valid for 15 minutes only
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire, "type": "password_reset"})
+    
+    encoded_jwt = jwt.encode(
+        to_encode, 
+        settings.SECRET_KEY, 
+        algorithm=settings.ALGORITHM
+    )
+    return encoded_jwt
+
+def verify_reset_token(token: str):
+    """
+    Verify password reset token
+    """
+    try:
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=[settings.ALGORITHM]
+        )
+        
+        # Check if this is a reset token
+        if payload.get("type") != "password_reset":
+            raise JWTError("Invalid token type")
+            
+        email: str = payload.get("sub")
+        if email is None:
+            raise JWTError("Invalid token payload")
+            
+        return payload
+        
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired reset token"
+        )

@@ -220,27 +220,27 @@ async def forgot_password(
     return {"message": "Password reset OTP sent to your email"}
 
 
-@auth_router.post("/reset-password")
-async def reset_password(reset_data: schemas.PasswordReset, db: Session = Depends(get_db)):
-    if not utils.verify_otp(reset_data.email, reset_data.otp_code, "password_reset"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired OTP"
-        )
+# @auth_router.post("/reset-password")
+# async def reset_password(reset_data: schemas.PasswordReset, db: Session = Depends(get_db)):
+#     if not utils.verify_otp(reset_data.email, reset_data.otp_code, "password_reset"):
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Invalid or expired OTP"
+#         )
 
-    db_user = db.query(models.User).filter(models.User.email == reset_data.email).first()
-    if not db_user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
+#     db_user = db.query(models.User).filter(models.User.email == reset_data.email).first()
+#     if not db_user:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="User not found"
+#         )
 
-    db_user.hashed_password = utils.get_password_hash(reset_data.new_password)
-    db.commit()
+#     db_user.hashed_password = utils.get_password_hash(reset_data.new_password)
+#     db.commit()
 
-    utils.delete_otp(reset_data.email, "password_reset")
+#     utils.delete_otp(reset_data.email, "password_reset")
 
-    return {"message": "Password reset successfully"}
+#     return {"message": "Password reset successfully"}
 
 
 @auth_router.get("/users", response_model=List[schemas.UserResponse])
@@ -276,7 +276,62 @@ def promote_to_admin(
     db.refresh(db_user)
 
     return {"message": "User promoted to admin successfully"}
+# In your auth_router
 
+@auth_router.post("/verify-reset-otp")
+async def verify_reset_otp(otp_data: schemas.PasswordResetStep1):
+    """
+    Step 1: Verify OTP for password reset
+    Returns a temporary token for password reset
+    """
+    if not utils.verify_otp(otp_data.email, otp_data.otp_code, "password_reset"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP"
+        )
+
+    # Create a short-lived reset token
+    reset_token = utils.create_reset_token(data={"sub": otp_data.email})
+    
+    return {
+        "message": "OTP verified successfully",
+        "reset_token": reset_token,
+        "token_type": "bearer"
+    }
+
+
+@auth_router.post("/reset-password")
+async def reset_password(
+    reset_data: schemas.PasswordResetStep2, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user_from_reset_token)
+):
+    """
+    Step 2: Reset password using the reset token
+    """
+    # Verify passwords match
+    if reset_data.new_password != reset_data.confirm_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Passwords do not match"
+        )
+
+    # Find user
+    db_user = db.query(models.User).filter(models.User.email == reset_data.email).first()
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    # Update password
+    db_user.hashed_password = utils.get_password_hash(reset_data.new_password)
+    db.commit()
+
+    # Clean up OTP
+    utils.delete_otp(reset_data.email, "password_reset")
+
+    return {"message": "Password reset successfully"}
 app.include_router(auth_router)
 app.include_router(admin_router)    
 app.include_router(youtube_router)
