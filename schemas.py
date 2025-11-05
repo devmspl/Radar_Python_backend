@@ -288,7 +288,7 @@ class PublishedFeedResponse(BaseModel):
     feed_title: str
     feed_categories: List[str]
     slides_count: int
-    
+    slides: Optional[List[SlideResponse]] = None
     class Config:
         from_attributes = True
 

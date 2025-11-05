@@ -298,9 +298,10 @@ def get_published_feeds(
     db: Session = Depends(get_db)
 ):
     """
-    Get all published feeds. No authentication required for viewing.
+    Get all published feeds with slides included.
     """
     try:
+        # Query with proper joins to load all related data
         query = db.query(PublishedFeed).options(
             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
             joinedload(PublishedFeed.feed).joinedload(Feed.blog)
@@ -318,8 +319,20 @@ def get_published_feeds(
         
         response_data = []
         for pf in published_feeds:
+            # Safely get feed data
             feed_title = pf.feed.title if pf.feed else "Unknown Feed"
-            blog_title = pf.feed.blog.title if pf.feed and pf.feed.blog else "Unknown Blog"
+            blog_title = pf.feed.blog.title if pf.feed and pf.feed.blog else None
+            categories = pf.feed.categories if pf.feed else []
+            
+            # Process slides
+            slides_data = []
+            if pf.feed and pf.feed.slides:
+                # Sort slides by order and format them
+                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
+                slides_data = [format_slide_response(slide) for slide in sorted_slides]
+            
+            # Count slides
+            slides_count = len(slides_data)
             
             response_data.append(PublishedFeedResponse(
                 id=pf.id,
@@ -330,8 +343,9 @@ def get_published_feeds(
                 is_active=pf.is_active,
                 feed_title=feed_title,
                 blog_title=blog_title,
-                feed_categories=pf.feed.categories if pf.feed else [],
-                slides_count=len(pf.feed.slides) if pf.feed and pf.feed.slides else 0
+                feed_categories=categories,
+                slides_count=slides_count,
+                slides=slides_data if slides_data else None
             ))
         
         return response_data
