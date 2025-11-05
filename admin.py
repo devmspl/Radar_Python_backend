@@ -46,7 +46,7 @@ def get_categories(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
-    admin_user: models.User = Depends(get_current_admin)
+    # admin_user: models.User = Depends(get_current_admin)
 ):
     categories = db.query(models.Category).offset(skip).limit(limit).all()
     return categories
