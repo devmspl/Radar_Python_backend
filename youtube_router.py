@@ -7,9 +7,105 @@ from dependencies import get_current_user
 import models
 import schemas
 from youtube_service import *
-
+from fastapi import UploadFile, File, Form
+import csv
+import io
+from typing import List
 router = APIRouter(prefix="/youtube", tags=["youtube"])
 
+@router.post("/batch-transcribe", response_model=schemas.BatchTranscriptResponse)
+async def batch_transcribe_content(
+    file: UploadFile = File(..., description="CSV file with 'name' and 'url' columns"),
+    generate_feed: bool = Form(False, description="Generate RSS feed for the content"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Batch transcribe YouTube content from CSV file
+    CSV should have columns 'name' and 'url' containing content names and YouTube URLs
+    """
+    # Validate file type
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only CSV files are allowed"
+        )
+    
+    try:
+        # Read and parse CSV file
+        content = await file.read()
+        csv_content = io.StringIO(content.decode('utf-8'))
+        csv_reader = csv.DictReader(csv_content)
+        
+        # Check if required columns exist
+        required_columns = ['name', 'url']
+        missing_columns = [col for col in required_columns if col not in csv_reader.fieldnames]
+        
+        if missing_columns:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"CSV must contain columns: {', '.join(required_columns)}. Missing: {', '.join(missing_columns)}"
+            )
+        
+        # Read all rows
+        rows = []
+        for row in csv_reader:
+            if row.get('url') and row.get('name'):
+                rows.append({
+                    'name': row['name'].strip(),
+                    'url': row['url'].strip()
+                })
+        
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid rows found in CSV file (must have both name and URL)"
+            )
+        
+        # Process each row
+        job_responses = []
+        failed_rows = []
+        
+        for row in rows:
+            try:
+                # Create transcript request for each URL with custom name
+                request = schemas.TranscriptRequest(
+                    url=row['url'],
+                    content_name=row['name'],  # Use the name from CSV
+                    generate_feed=generate_feed
+                )
+                
+                # Create job using existing service
+                job_response = create_transcript_job(db, request, current_user.id)
+                job_responses.append({
+                    'job_id': job_response.job_id,
+                    'name': row['name'],
+                    'url': row['url']
+                })
+                
+            except Exception as e:
+                failed_rows.append({
+                    'name': row['name'],
+                    'url': row['url'],
+                    'error': str(e)
+                })
+        
+        return schemas.BatchTranscriptResponse(
+            message=f"Processed {len(job_responses)} URLs successfully, {len(failed_rows)} failed",
+            total_rows=len(rows),
+            successful_jobs=len(job_responses),
+            failed_rows=failed_rows,
+            job_responses=job_responses
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing CSV file: {str(e)}"
+        )
+        
 @router.post("/transcribe", response_model=schemas.TranscriptResponse)
 async def transcribe_content(
     request: schemas.TranscriptRequest,

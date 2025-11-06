@@ -6,10 +6,14 @@ from scrapper import scrape_any_website
 import uuid
 from urllib.parse import urlparse
 import time
-
+from fastapi import UploadFile, File, Form
+import csv
+import io
+from typing import List
+from urllib.parse import urlparse
 router = APIRouter(prefix="/website", tags=["web"])
 from schemas import ScrapeRequest
-
+import schemas
 # Helper: start scraping in background
 # In your scrapper.py
 
@@ -67,8 +71,112 @@ def run_scraping_job(db: Session, url: str, category: str, job_uid: str, generat
 # 1️⃣ Start scraping job
 from fastapi import BackgroundTasks
 
-# In your website router
+@router.post("/batch-scrape", response_model=schemas.BatchScrapeResponse)
+async def batch_scrape_content(
+    file: UploadFile = File(..., description="CSV file with 'name' and 'url' columns"),
+    generate_feed: bool = Form(False, description="Generate RSS feed for the scraped content"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: Session = Depends(get_db)
+):
+    """
+    Batch scrape websites from CSV file
+    CSV should have columns 'name' and 'url' containing content names and website URLs
+    """
+    # Validate file type
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only CSV files are allowed"
+        )
+    
+    try:
+        # Read and parse CSV file
+        content = await file.read()
+        csv_content = io.StringIO(content.decode('utf-8'))
+        csv_reader = csv.DictReader(csv_content)
+        
+        # Check if required columns exist
+        required_columns = ['name', 'url']
+        missing_columns = [col for col in required_columns if col not in csv_reader.fieldnames]
+        
+        if missing_columns:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"CSV must contain columns: {', '.join(required_columns)}. Missing: {', '.join(missing_columns)}"
+            )
+        
+        # Read all rows
+        rows = []
+        for row in csv_reader:
+            if row.get('url') and row.get('name'):
+                rows.append({
+                    'name': row['name'].strip(),
+                    'url': row['url'].strip()
+                })
+        
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid rows found in CSV file (must have both name and URL)"
+            )
+        
+        # Process each row and create scraping jobs
+        job_responses = []
+        failed_rows = []
+        
+        for row in rows:
+            try:
+                # Create individual scraping job for each URL
+                job_uid = str(uuid.uuid4())
+                job = ScrapeJob(
+                    uid=job_uid, 
+                    website=urlparse(row['url']).netloc, 
+                    url=row['url'], 
+                    status="inprocess"
+                )
+                db.add(job)
+                db.commit()
+                db.refresh(job)
 
+                # Add to background tasks - category is now handled by the scraper
+                background_tasks.add_task(
+                    run_scraping_job, 
+                    db, 
+                    row['url'], 
+                    "",  # Empty category since it's removed
+                    job_uid,
+                    generate_feed  # Pass the flag
+                )
+
+                job_responses.append({
+                    'job_uid': job_uid,
+                    'name': row['name'],
+                    'url': row['url'],
+                    'generate_feed': generate_feed
+                })
+                
+            except Exception as e:
+                failed_rows.append({
+                    'name': row['name'],
+                    'url': row['url'],
+                    'error': str(e)
+                })
+        
+        return schemas.BatchScrapeResponse(
+            message=f"Started {len(job_responses)} scraping jobs successfully, {len(failed_rows)} failed",
+            total_rows=len(rows),
+            successful_jobs=len(job_responses),
+            failed_rows=failed_rows,
+            job_responses=job_responses
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing CSV file: {str(e)}"
+        )
 @router.post("/scrape/start")
 async def start_scraping(
     request: ScrapeRequest,

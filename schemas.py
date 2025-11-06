@@ -403,3 +403,39 @@ class PasswordResetStep2(BaseModel):
     email: EmailStr
     new_password: str
     confirm_password: str
+
+class FailedRow(BaseModel):
+    name: str
+    url: str
+    error: str
+
+class JobResponse(BaseModel):
+    job_id: str
+    name: str
+    url: str
+
+class BatchTranscriptResponse(BaseModel):
+    message: str
+    total_rows: int
+    successful_jobs: int
+    failed_rows: List[FailedRow]
+    job_responses: List[JobResponse]
+
+
+
+class FailedScrapeRow(BaseModel):
+    name: str
+    url: str
+    error: str
+class ScrapeJobResponse(BaseModel):
+    job_uid: str
+    name: str
+    url: str
+    generate_feed: bool
+
+class BatchScrapeResponse(BaseModel):
+    message: str
+    total_rows: int
+    successful_jobs: int
+    failed_rows: List[FailedScrapeRow]
+    job_responses: List[ScrapeJobResponse]
