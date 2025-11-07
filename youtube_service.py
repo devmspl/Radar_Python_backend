@@ -296,28 +296,35 @@ youtube_api = YouTubeAPI(YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
 # SELENIUM TRANSCRIPT FETCHER (Using your exact logic)
 # ===========================
 def copy_transcript(youtube_url, headless=True, max_retries=2):
-    """Fetch transcript using Selenium and Tactiq with retry logic"""
+    """Fetch transcript using Selenium and Tactiq with optimized settings"""
     
     for retry_count in range(max_retries + 1):
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
+        
+        # Optimized performance arguments
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        
-        # Performance optimizations
-        options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-plugins")
         options.add_argument("--disable-images")
         options.add_argument("--blink-settings=imagesEnabled=false")
+        options.add_argument("--disable-javascript")  # Try disabling JS
+        options.add_argument("--disable-web-security")
+        options.add_argument("--allow-running-insecure-content")
+        options.add_argument("--window-size=1920,1080")
         
-        # Timeout settings
+        # Timeout and performance settings
         options.add_argument("--disable-features=VizDisplayCompositor")
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-component-extensions-with-background-pages")
+        
+        # Set page load strategy to 'none' to avoid waiting for full page load
+        options.page_load_strategy = 'none'
 
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
@@ -326,17 +333,17 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
             if retry_count > 0:
                 print(f"🔄 Retry attempt {retry_count}/{max_retries} for: {youtube_url}")
             
-            # Set timeouts
-            driver.set_page_load_timeout(60)  # 60 seconds for page load
-            driver.implicitly_wait(10)  # 10 seconds for element finding
+            # Set shorter timeouts
+            driver.set_page_load_timeout(30)  # Reduced from 60 to 30 seconds
+            driver.implicitly_wait(5)  # Reduced from 10 to 5 seconds
 
             # 1. Open the Tactiq YouTube transcript tool
             print("Opening Tactiq transcript tool...")
             driver.get("https://tactiq.io/tools/youtube-transcript")
 
-            wait = WebDriverWait(driver, 20)  # Increased wait time
+            wait = WebDriverWait(driver, 15)  # Reduced from 20 to 15 seconds
 
-            # 2. Find the input field
+            # 2. Find the input field with more specific waiting
             print("Looking for input field...")
             input_selectors = [
                 "#yt-2",
@@ -350,6 +357,7 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
             input_box = None
             for selector in input_selectors:
                 try:
+                    # Wait for element to be present but not necessarily visible/clickable
                     input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     print(f"Found input with selector: {selector}")
                     break
@@ -357,12 +365,19 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
                     continue
             
             if not input_box:
-                if retry_count < max_retries:
-                    print("Input field not found, retrying...")
-                    continue
-                driver.save_screenshot("debug_input_not_found.png")
-                raise Exception("Could not find input field")
+                print("Input field not found, trying alternative approach...")
+                # Try to find any input element
+                try:
+                    input_box = driver.find_element(By.TAG_NAME, "input")
+                    print("Found input using tag name")
+                except:
+                    if retry_count < max_retries:
+                        print("Input field not found, retrying...")
+                        continue
+                    driver.save_screenshot("debug_input_not_found.png")
+                    raise Exception("Could not find input field")
             
+            # Clear and input URL
             input_box.clear()
             input_box.send_keys(youtube_url)
             print("YouTube URL entered")
@@ -374,34 +389,42 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
                 "button[type='submit']",
                 "input[type='submit']",
                 "button.primary",
-                ".w-button"
+                ".w-button",
+                "button",
+                "input[type='button']"
             ]
             
             submit_btn = None
             for selector in button_selectors:
                 try:
-                    submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                    submit_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     print(f"Found button with selector: {selector}")
                     break
                 except TimeoutException:
                     continue
             
             if not submit_btn:
-                if retry_count < max_retries:
-                    print("Submit button not found, retrying...")
-                    continue
-                driver.save_screenshot("debug_button_not_found.png")
-                raise Exception("Could not find submit button")
+                print("Submit button not found, trying alternative approach...")
+                # Try to find any button
+                try:
+                    submit_btn = driver.find_element(By.TAG_NAME, "button")
+                    print("Found button using tag name")
+                except:
+                    if retry_count < max_retries:
+                        print("Submit button not found, retrying...")
+                        continue
+                    driver.save_screenshot("debug_button_not_found.png")
+                    raise Exception("Could not find submit button")
             
             # Click using JavaScript for reliability
             driver.execute_script("arguments[0].click();", submit_btn)
             print("Submit button clicked")
 
-            # 4. Wait for transcript to load with better waiting strategy
+            # 4. Wait for transcript to load with shorter timeout
             print("Waiting for transcript to load...")
             
-            # Wait for processing to complete
-            transcript = wait_for_transcript_processing(driver, wait)
+            # Wait for processing to complete with shorter timeout
+            transcript = wait_for_transcript_processing_optimized(driver, wait)
             
             if transcript:
                 print(f"✅ Successfully extracted clean transcript ({len(transcript)} characters)")
@@ -414,7 +437,7 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
                 return None
 
         except TimeoutException as e:
-            print(f"⏰ Timeout error (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+            print(f"⏰ Timeout error (attempt {retry_count + 1}/{max_retries + 1})")
             if retry_count < max_retries:
                 print("Retrying after timeout...")
                 continue
@@ -436,59 +459,81 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
     
     return None
 
-
-def wait_for_transcript_processing(driver, wait, max_wait=60):
-    """Wait for transcript to process with better detection"""
+def wait_for_transcript_processing_optimized(driver, wait, max_wait=45):
+    """Wait for transcript to process with optimized detection and shorter timeout"""
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
         try:
-            # Check for loading indicators
-            loading_selectors = [
-                "//*[contains(text(), 'Loading')]",
-                "//*[contains(text(), 'Processing')]",
-                "//*[contains(@class, 'loading')]",
-                "//*[contains(@class, 'spinner')]",
-            ]
+            # Check if page has loaded any content
+            page_source = driver.page_source.lower()
             
-            # If loading indicators found, wait
-            loading_found = False
-            for selector in loading_selectors:
-                try:
-                    driver.find_element(By.XPATH, selector)
-                    loading_found = True
-                    break
-                except:
-                    continue
+            # Look for transcript indicators in page source
+            transcript_indicators = ['transcript', 'caption', 'subtitle', 'dialog', 'conversation']
+            if any(indicator in page_source for indicator in transcript_indicators):
+                print("📝 Found transcript content in page source")
+                # Try to extract transcript
+                transcript = extract_clean_transcript_from_page_optimized(driver)
+                if transcript and len(transcript.strip()) > 100:
+                    return transcript
             
-            if loading_found:
-                print("⏳ Still processing...")
-                time.sleep(3)
-                continue
-            
-            # Try to extract transcript
-            transcript = extract_clean_transcript_from_page(driver)
-            if transcript:
-                return transcript
+            # Check for error messages
+            error_indicators = ['error', 'failed', 'unavailable', 'not found', 'cannot']
+            if any(error in page_source for error in error_indicators):
+                print("❌ Error detected in page content")
+                return None
             
             # Wait before next attempt
             time.sleep(2)
+            print(f"⏳ Waiting for transcript... ({int(time.time() - start_time)}s)")
             
         except Exception as e:
             print(f"⚠️ Error during transcript wait: {e}")
             time.sleep(2)
     
     print("⏰ Timeout waiting for transcript processing")
-    return None
-
-
-def extract_clean_transcript_from_page(driver):
-    """Extract and clean transcript from the page"""
+    # Try one final extraction
     try:
-        # Get all text from the page
-        body_text = driver.find_element(By.TAG_NAME, "body").text
+        return extract_clean_transcript_from_page_optimized(driver)
+    except:
+        return None
+
+def extract_clean_transcript_from_page_optimized(driver):
+    """Extract and clean transcript from the page with optimized approach"""
+    try:
+        # Get page source and look for transcript content
+        page_source = driver.page_source
         
-        # Clean the transcript
+        # Simple text extraction - look for content between tags
+        import re
+        # Extract text from paragraph tags, divs with content, etc.
+        text_patterns = [
+            r'<p[^>]*>(.*?)</p>',
+            r'<div[^>]*>(.*?)</div>',
+            r'<span[^>]*>(.*?)</span>',
+        ]
+        
+        all_text = []
+        for pattern in text_patterns:
+            matches = re.findall(pattern, page_source, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                # Clean HTML tags from the match
+                clean_text = re.sub(r'<[^>]+>', '', match)
+                clean_text = clean_text.strip()
+                if len(clean_text) > 20:  # Only keep substantial text
+                    all_text.append(clean_text)
+        
+        if all_text:
+            full_text = ' '.join(all_text)
+            # Basic cleaning
+            full_text = re.sub(r'\s+', ' ', full_text)
+            full_text = full_text.strip()
+            
+            if len(full_text) > 100:
+                return full_text
+        
+        # Fallback to body text
+        body_text = driver.find_element(By.TAG_NAME, "body").text
         clean_transcript = clean_transcript_text(body_text)
         
         if clean_transcript and len(clean_transcript.strip()) > 100:
@@ -498,7 +543,6 @@ def extract_clean_transcript_from_page(driver):
         print(f"Error extracting transcript: {e}")
     
     return None
-
 
 def clean_transcript_text(raw_text):
     """Clean the raw transcript text to remove timestamps and Tactiq headers"""
