@@ -293,38 +293,34 @@ class YouTubeAPI:
 youtube_api = YouTubeAPI(YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
 
 # ===========================
-# SELENIUM TRANSCRIPT FETCHER (Using your exact logic)
+# OPTIMIZED SELENIUM TRANSCRIPT FETCHER
 # ===========================
+
 def copy_transcript(youtube_url, headless=True, max_retries=2):
-    """Fetch transcript using Selenium and Tactiq with optimized settings"""
+    """Fetch transcript using Selenium and Tactiq with improved timeout handling"""
     
     for retry_count in range(max_retries + 1):
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
-        
-        # Optimized performance arguments
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        
+        # Performance optimizations
+        options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-plugins")
-        options.add_argument("--disable-images")
-        options.add_argument("--blink-settings=imagesEnabled=false")
-        options.add_argument("--disable-javascript")  # Try disabling JS
-        options.add_argument("--disable-web-security")
-        options.add_argument("--allow-running-insecure-content")
-        options.add_argument("--window-size=1920,1080")
         
-        # Timeout and performance settings
+        # IMPORTANT: Keep images enabled for Tactiq to work properly
+        # options.add_argument("--disable-images")  # REMOVED - Tactiq needs images
+        # options.add_argument("--blink-settings=imagesEnabled=false")  # REMOVED
+        
+        # Timeout settings
         options.add_argument("--disable-features=VizDisplayCompositor")
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
-        options.add_argument("--disable-component-extensions-with-background-pages")
-        
-        # Set page load strategy to 'none' to avoid waiting for full page load
-        options.page_load_strategy = 'none'
 
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
@@ -333,226 +329,260 @@ def copy_transcript(youtube_url, headless=True, max_retries=2):
             if retry_count > 0:
                 print(f"🔄 Retry attempt {retry_count}/{max_retries} for: {youtube_url}")
             
-            # Set shorter timeouts
-            driver.set_page_load_timeout(30)  # Reduced from 60 to 30 seconds
-            driver.implicitly_wait(5)  # Reduced from 10 to 5 seconds
+            # Set shorter timeouts to avoid hanging
+            driver.set_page_load_timeout(45)  # Reduced from 60 to 45 seconds
+            driver.implicitly_wait(8)  # Reduced from 10 to 8 seconds
 
             # 1. Open the Tactiq YouTube transcript tool
-            print("Opening Tactiq transcript tool...")
-            driver.get("https://tactiq.io/tools/youtube-transcript")
+            print("🌐 Opening Tactiq transcript tool...")
+            try:
+                driver.get("https://tactiq.io/tools/youtube-transcript")
+                print("✅ Tactiq page loaded successfully")
+            except TimeoutException:
+                print("⚠️ Page load timed out, but continuing...")
+                # Continue even if page load times out
 
             wait = WebDriverWait(driver, 15)  # Reduced from 20 to 15 seconds
 
-            # 2. Find the input field with more specific waiting
-            print("Looking for input field...")
+            # 2. Find the input field with better error handling
+            print("🔍 Looking for input field...")
+            input_box = None
+            
+            # Try multiple selectors with shorter timeouts
             input_selectors = [
                 "#yt-2",
                 "input[type='url']",
                 "input[placeholder*='youtube']",
                 "input[placeholder*='YouTube']",
                 "input.youtube-url",
-                "input#youtube-url"
+                "input#youtube-url",
+                "input[type='text']"  # Added fallback
             ]
             
-            input_box = None
             for selector in input_selectors:
                 try:
-                    # Wait for element to be present but not necessarily visible/clickable
-                    input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    print(f"Found input with selector: {selector}")
+                    # Use shorter timeout for each selector
+                    input_box = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    print(f"✅ Found input with selector: {selector}")
                     break
                 except TimeoutException:
                     continue
+                except Exception as e:
+                    print(f"⚠️ Error with selector {selector}: {e}")
+                    continue
             
             if not input_box:
-                print("Input field not found, trying alternative approach...")
-                # Try to find any input element
-                try:
-                    input_box = driver.find_element(By.TAG_NAME, "input")
-                    print("Found input using tag name")
-                except:
-                    if retry_count < max_retries:
-                        print("Input field not found, retrying...")
-                        continue
+                print("❌ Input field not found after trying all selectors")
+                if retry_count < max_retries:
+                    print("🔄 Retrying...")
+                    continue
+                else:
                     driver.save_screenshot("debug_input_not_found.png")
-                    raise Exception("Could not find input field")
+                    return None
             
             # Clear and input URL
-            input_box.clear()
-            input_box.send_keys(youtube_url)
-            print("YouTube URL entered")
+            try:
+                input_box.clear()
+                input_box.send_keys(youtube_url)
+                print("📝 YouTube URL entered")
+            except Exception as e:
+                print(f"❌ Error entering URL: {e}")
+                if retry_count < max_retries:
+                    continue
+                else:
+                    return None
 
             # 3. Find and click the submit button
-            print("Looking for submit button...")
+            print("🔍 Looking for submit button...")
+            submit_btn = None
+            
             button_selectors = [
                 "input.button-primary.w-button",
                 "button[type='submit']",
                 "input[type='submit']",
                 "button.primary",
                 ".w-button",
-                "button",
-                "input[type='button']"
+                "button",  # Added fallback
+                "input[type='button']"  # Added fallback
             ]
             
-            submit_btn = None
             for selector in button_selectors:
                 try:
-                    submit_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    print(f"Found button with selector: {selector}")
+                    # Use shorter timeout for each selector
+                    submit_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    print(f"✅ Found button with selector: {selector}")
                     break
                 except TimeoutException:
                     continue
+                except Exception as e:
+                    print(f"⚠️ Error with selector {selector}: {e}")
+                    continue
             
             if not submit_btn:
-                print("Submit button not found, trying alternative approach...")
-                # Try to find any button
-                try:
-                    submit_btn = driver.find_element(By.TAG_NAME, "button")
-                    print("Found button using tag name")
-                except:
-                    if retry_count < max_retries:
-                        print("Submit button not found, retrying...")
-                        continue
+                print("❌ Submit button not found after trying all selectors")
+                if retry_count < max_retries:
+                    print("🔄 Retrying...")
+                    continue
+                else:
                     driver.save_screenshot("debug_button_not_found.png")
-                    raise Exception("Could not find submit button")
+                    return None
             
             # Click using JavaScript for reliability
-            driver.execute_script("arguments[0].click();", submit_btn)
-            print("Submit button clicked")
+            try:
+                driver.execute_script("arguments[0].click();", submit_btn)
+                print("🖱️ Submit button clicked")
+            except Exception as e:
+                print(f"❌ Error clicking button: {e}")
+                if retry_count < max_retries:
+                    continue
+                else:
+                    return None
 
-            # 4. Wait for transcript to load with shorter timeout
-            print("Waiting for transcript to load...")
-            
-            # Wait for processing to complete with shorter timeout
-            transcript = wait_for_transcript_processing_optimized(driver, wait)
+            # 4. Wait for transcript to load with improved strategy
+            print("⏳ Waiting for transcript to load...")
+            transcript = wait_for_transcript_processing_optimized(driver)
             
             if transcript:
-                print(f"✅ Successfully extracted clean transcript ({len(transcript)} characters)")
+                print(f"✅ Successfully extracted transcript ({len(transcript)} characters)")
                 return transcript
             else:
+                print("❌ No transcript found")
                 if retry_count < max_retries:
-                    print("Transcript not found, retrying...")
+                    print("🔄 Retrying...")
                     continue
-                print("❌ Could not extract transcript after all retries")
-                return None
+                else:
+                    return None
 
         except TimeoutException as e:
-            print(f"⏰ Timeout error (attempt {retry_count + 1}/{max_retries + 1})")
+            print(f"⏰ Timeout error (attempt {retry_count + 1}): {e}")
             if retry_count < max_retries:
-                print("Retrying after timeout...")
+                print("🔄 Retrying after timeout...")
                 continue
             else:
-                print("Max retries exceeded for timeout")
+                print("❌ Max retries exceeded for timeout")
                 return None
                 
         except Exception as e:
-            print(f"❌ Error (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+            print(f"❌ Unexpected error (attempt {retry_count + 1}): {e}")
             if retry_count < max_retries:
-                print("Retrying after error...")
+                print("🔄 Retrying after error...")
                 continue
             else:
-                print("Max retries exceeded")
+                print("❌ Max retries exceeded")
                 return None
 
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            except:
+                pass  # Ignore errors during driver cleanup
     
     return None
 
-def wait_for_transcript_processing_optimized(driver, wait, max_wait=45):
-    """Wait for transcript to process with optimized detection and shorter timeout"""
+
+def wait_for_transcript_processing_optimized(driver, max_wait=50):
+    """Wait for transcript to process with improved detection and timeout handling"""
     start_time = time.time()
+    last_state = ""
+    
+    print("🔄 Waiting for transcript processing...")
     
     while time.time() - start_time < max_wait:
         try:
-            # Check if page has loaded any content
-            page_source = driver.page_source.lower()
+            current_time = int(time.time() - start_time)
+            current_state = f"Waiting... ({current_time}s)"
             
-            # Look for transcript indicators in page source
-            transcript_indicators = ['transcript', 'caption', 'subtitle', 'dialog', 'conversation']
-            if any(indicator in page_source for indicator in transcript_indicators):
-                print("📝 Found transcript content in page source")
-                # Try to extract transcript
+            if current_state != last_state:
+                print(current_state)
+                last_state = current_state
+            
+            # Check for various page states
+            current_url = driver.current_url
+            page_title = driver.title.lower()
+            
+            # If we've been redirected from the tools page, we might be on a results page
+            if "tools/youtube-transcript" not in current_url:
+                print("🔄 Page redirected, checking for transcript...")
                 transcript = extract_clean_transcript_from_page_optimized(driver)
-                if transcript and len(transcript.strip()) > 100:
+                if transcript:
                     return transcript
             
+            # Check for loading indicators
+            loading_indicators = [
+                "loading", "processing", "spinner", "progress"
+            ]
+            
+            page_source = driver.page_source.lower()
+            if any(indicator in page_source for indicator in loading_indicators):
+                print("⏳ Page still loading...")
+                time.sleep(3)
+                continue
+            
             # Check for error messages
-            error_indicators = ['error', 'failed', 'unavailable', 'not found', 'cannot']
+            error_indicators = [
+                "error", "failed", "unavailable", "not found", "cannot"
+            ]
             if any(error in page_source for error in error_indicators):
-                print("❌ Error detected in page content")
+                print("❌ Error detected on page")
                 return None
+            
+            # Try to extract transcript
+            transcript = extract_clean_transcript_from_page_optimized(driver)
+            if transcript:
+                return transcript
             
             # Wait before next attempt
             time.sleep(2)
-            print(f"⏳ Waiting for transcript... ({int(time.time() - start_time)}s)")
             
         except Exception as e:
             print(f"⚠️ Error during transcript wait: {e}")
             time.sleep(2)
     
     print("⏰ Timeout waiting for transcript processing")
-    # Try one final extraction
+    # One final attempt before giving up
     try:
         return extract_clean_transcript_from_page_optimized(driver)
     except:
         return None
 
+
 def extract_clean_transcript_from_page_optimized(driver):
-    """Extract and clean transcript from the page with optimized approach"""
+    """Extract and clean transcript from the page with improved detection"""
     try:
-        # Get page source and look for transcript content
-        page_source = driver.page_source
+        # Wait a moment for any dynamic content to load
+        time.sleep(2)
         
-        # Simple text extraction - look for content between tags
-        import re
-        # Extract text from paragraph tags, divs with content, etc.
-        text_patterns = [
-            r'<p[^>]*>(.*?)</p>',
-            r'<div[^>]*>(.*?)</div>',
-            r'<span[^>]*>(.*?)</span>',
-        ]
-        
-        all_text = []
-        for pattern in text_patterns:
-            matches = re.findall(pattern, page_source, re.DOTALL | re.IGNORECASE)
-            for match in matches:
-                # Clean HTML tags from the match
-                clean_text = re.sub(r'<[^>]+>', '', match)
-                clean_text = clean_text.strip()
-                if len(clean_text) > 20:  # Only keep substantial text
-                    all_text.append(clean_text)
-        
-        if all_text:
-            full_text = ' '.join(all_text)
-            # Basic cleaning
-            full_text = re.sub(r'\s+', ' ', full_text)
-            full_text = full_text.strip()
-            
-            if len(full_text) > 100:
-                return full_text
-        
-        # Fallback to body text
+        # Get all text from the page
         body_text = driver.find_element(By.TAG_NAME, "body").text
-        clean_transcript = clean_transcript_text(body_text)
+        
+        # Enhanced cleaning
+        clean_transcript = clean_transcript_text_enhanced(body_text)
         
         if clean_transcript and len(clean_transcript.strip()) > 100:
+            print(f"📄 Extracted {len(clean_transcript)} characters")
             return clean_transcript.strip()
+        else:
+            print("❌ Transcript too short or empty after cleaning")
+            return None
         
     except Exception as e:
-        print(f"Error extracting transcript: {e}")
-    
-    return None
+        print(f"❌ Error extracting transcript: {e}")
+        return None
 
-def clean_transcript_text(raw_text):
-    """Clean the raw transcript text to remove timestamps and Tactiq headers"""
+
+def clean_transcript_text_enhanced(raw_text):
+    """Enhanced cleaning of transcript text with better filtering"""
     if not raw_text:
         return None
     
     lines = raw_text.split('\n')
     clean_lines = []
     
-    # Patterns to exclude
+    # Enhanced patterns to exclude
     exclude_patterns = [
         'Get started for FREE',
         'Get the transcript:',
@@ -563,10 +593,18 @@ def clean_transcript_text(raw_text):
         '©.*Tactiq',
         'All rights reserved',
         'Made with',
-        'Tactiq'
+        'Tactiq',
+        'Quick and simple',
+        'No catch',
+        'How to get the transcript',
+        'Frequently Asked Questions',
+        'Need to transcribe and summarize',
+        'One-click AI summary',
+        'Use the Tactiq Chrome Extension'
     ]
     
     found_transcript_start = False
+    consecutive_content_lines = 0
     
     for line in lines:
         line = line.strip()
@@ -579,32 +617,54 @@ def clean_transcript_text(raw_text):
             continue
             
         # Skip timestamp lines
-        if re.match(r'^\d{2}:\d{2}:\d{2}\.\d{3}$', line) or re.match(r'^\d{2}:\d{2}:\d{2}$', line):
+        if re.match(r'^\d{1,2}:\d{2}(:\d{2})?\.?\d{0,3}$', line) or re.match(r'^\d{1,2}:\d{2}:\d{2}$', line):
             continue
             
-        # Skip very short lines
+        # Skip very short lines (likely UI elements)
         if len(line) < 5:
+            continue
+            
+        # Skip lines that are all caps (likely headings)
+        if line.isupper() and len(line) < 50:
             continue
             
         # Find start of actual content
         if not found_transcript_start:
-            if (len(line) > 10 and 
-                not any(keyword in line.lower() for keyword in ['transcript', 'get', 'free', 'started']) and
-                not line.isupper()):
+            # Look for natural language content (not UI text)
+            if (len(line) > 15 and 
+                not any(keyword in line.lower() for keyword in [
+                    'transcript', 'get', 'free', 'started', 'click', 'enter', 
+                    'paste', 'copy', 'download', 'share', 'submit'
+                ]) and
+                not line.startswith('http') and
+                not re.match(r'^[A-Z][a-z]+:', line)):  # Skip speaker labels
+                
                 found_transcript_start = True
                 clean_lines.append(line)
+                consecutive_content_lines += 1
         else:
             clean_lines.append(line)
+            consecutive_content_lines += 1
+    
+    # If we didn't find enough content, it might be Tactiq UI
+    if consecutive_content_lines < 3:
+        print("⚠️ Not enough content lines found, likely UI text")
+        return None
     
     clean_text = '\n'.join(clean_lines)
     
     # Remove remaining timestamps
-    clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3}', '', clean_text)
-    clean_text = re.sub(r'\d{2}:\d{2}:\d{2}', '', clean_text)
+    clean_text = re.sub(r'\d{1,2}:\d{2}:\d{2}\.\d{3}', '', clean_text)
+    clean_text = re.sub(r'\d{1,2}:\d{2}:\d{2}', '', clean_text)
+    clean_text = re.sub(r'\d{1,2}:\d{2}', '', clean_text)
     
     # Clean up whitespace
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text = clean_text.strip()
+    
+    # Final validation
+    if len(clean_text) < 50:
+        return None
     
     return clean_text
 # ===========================
@@ -786,7 +846,7 @@ def update_job_status(job_id: str, status: JobStatus, total_items: int = None, p
 # In your youtube_service.py
 
 def process_video_background(video_url: str, job_id: str, model_size: str, store_in_db: bool, playlist_id: Optional[str] = None, generate_feed: bool = False):
-    """Process a single video in background with feed generation option"""
+    """Process a single video in background with improved validation"""
     try:
         video_id = extract_video_id(video_url)
         if not video_id:
@@ -796,16 +856,21 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
         title = get_youtube_title(video_url)
         print(f"🎬 Processing video: {title}")
         
-        # Use Selenium to get transcript with retry logic
+        # Use optimized Selenium to get transcript
         transcript = copy_transcript(video_url, headless=True, max_retries=2)
         
         if not transcript:
             print(f"❌ Failed to fetch transcript for: {title}")
             return False
         
-        # Additional validation
+        # Enhanced validation
         if len(transcript.strip()) < 50:
             print(f"❌ Transcript too short for: {title}")
+            return False
+        
+        # Check if it's actually Tactiq UI content
+        if is_tactiq_ui_content(transcript):
+            print(f"❌ Got Tactiq UI content instead of transcript for: {title}")
             return False
         
         print(f"✅ Successfully extracted transcript ({len(transcript)} characters)")
@@ -832,9 +897,7 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
                     # Auto-generate feed if requested
                     if generate_feed:
                         try:
-                            # Import here to avoid circular imports
                             from feed_router import auto_generate_transcript_feed
-                            # Start feed generation in background
                             import threading
                             threading.Thread(
                                 target=auto_generate_transcript_feed,
@@ -857,7 +920,23 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
     except Exception as e:
         print(f"❌ Error processing video {video_url}: {e}")
         return False
-
+def is_tactiq_ui_content(text):
+    """Check if the extracted text is just Tactiq UI content"""
+    text_lower = text.lower()
+    tactiq_indicators = [
+        'get started for free',
+        'tactiq',
+        'chrome extension',
+        'copy the url',
+        'simply paste',
+        'frequently asked questions',
+        'how do i transcribe',
+        '© 2024 tactiq'
+    ]
+    
+    # If multiple Tactiq indicators are present, it's likely UI content
+    indicator_count = sum(1 for indicator in tactiq_indicators if indicator in text_lower)
+    return indicator_count >= 3
 def process_playlist_background(playlist_url: str, job_id: str, model_size: str, store_in_db: bool, generate_feed: bool = False):
     """Process playlist in background - process all videos in the playlist"""
     db = next(get_db_session())
