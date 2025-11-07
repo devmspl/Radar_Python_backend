@@ -25,6 +25,13 @@ from models import TranscriptJob, Transcript, ContentType, JobStatus
 from schemas import TranscriptRequest, TranscriptResponse, JobStatusResponse
 from schemas import *
 import utils
+try:
+    from feed_router import auto_generate_transcript_feed
+except ImportError:
+    # Create a fallback function if the import fails
+    def auto_generate_transcript_feed(db, transcript_id):
+        print(f"⚠️ Feed generation not available for transcript {transcript_id}")
+        return None
 
 # ===========================
 # GLOBALS
@@ -772,8 +779,7 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
                         transcript_text=transcript,
                         word_count=len(transcript.split()),
                         description=None,
-                        job_id=job.id,
-                        generate_feed=generate_feed  # Set the flag
+                        job_id=job.id
                     )
                     db.add(transcript_obj)
                     db.commit()
@@ -781,15 +787,19 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
                     
                     # Auto-generate feed if requested
                     if generate_feed:
-                        from feed_router import auto_generate_transcript_feed
-                        # Start feed generation in background
-                        import threading
-                        threading.Thread(
-                            target=auto_generate_transcript_feed,
-                            args=(db, transcript_obj.id),
-                            daemon=True
-                        ).start()
-                        print(f"🚀 Started auto-feed generation for transcript: {title}")
+                        try:
+                            # Import here to avoid circular imports
+                            from feed_router import auto_generate_transcript_feed
+                            # Start feed generation in background
+                            import threading
+                            threading.Thread(
+                                target=auto_generate_transcript_feed,
+                                args=(db, transcript_obj.id),
+                                daemon=True
+                            ).start()
+                            print(f"🚀 Started auto-feed generation for transcript: {title}")
+                        except Exception as feed_error:
+                            print(f"⚠️ Failed to start feed generation: {feed_error}")
                         
             except Exception as e:
                 print(f"❌ Database error for {title}: {e}")
@@ -803,7 +813,8 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
     except Exception as e:
         print(f"❌ Error processing video {video_url}: {e}")
         return False
-def process_playlist_background(playlist_url: str, job_id: str, model_size: str, store_in_db: bool):
+
+def process_playlist_background(playlist_url: str, job_id: str, model_size: str, store_in_db: bool, generate_feed: bool = False):
     """Process playlist in background - process all videos in the playlist"""
     db = next(get_db_session())
     try:
@@ -835,7 +846,7 @@ def process_playlist_background(playlist_url: str, job_id: str, model_size: str,
             print(f"📹 Processing video {i+1}/{len(videos)}: {video['title']}")
             
             try:
-                success = process_video_background(video['url'], job_id, model_size, store_in_db, playlist_id)
+                success = process_video_background(video['url'], job_id, model_size, store_in_db, playlist_id, generate_feed)
                 if success:
                     successful_count += 1
                     print(f"✅ Successfully processed: {video['title']}")
@@ -870,7 +881,7 @@ def process_playlist_background(playlist_url: str, job_id: str, model_size: str,
     finally:
         db.close()
 
-def process_channel_background(channel_url: str, job_id: str, model_size: str, store_in_db: bool):
+def process_channel_background(channel_url: str, job_id: str, model_size: str, store_in_db: bool, generate_feed: bool = False):
     """Process channel in background using only YouTube API and Selenium"""
     try:
         print(f"🏢 Starting channel processing: {channel_url}")
@@ -976,7 +987,8 @@ def process_channel_background(channel_url: str, job_id: str, model_size: str, s
                         job_id, 
                         model_size, 
                         store_in_db, 
-                        playlist_id
+                        playlist_id,
+                        generate_feed  # Pass the generate_feed flag
                     )
                     
                     if success:
@@ -1020,6 +1032,7 @@ def process_channel_background(channel_url: str, job_id: str, model_size: str, s
 # Update the create_transcript_job function to pass generate_feed
 def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int) -> TranscriptResponse:
     """Create a new transcript job with feed generation option"""
+    job = None  # Initialize job variable at the start
     try:
         print(f"🎬 Creating transcript job for URL: {request.youtube_url}")
         
@@ -1084,7 +1097,6 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
                 print("🚀 Started video background processing" + (" with feed generation" if request.generate_feed else ""))
                 
             elif content_type == ContentType.PLAYLIST:
-                # Update process_playlist_background to pass generate_feed
                 background_executor.submit(
                     process_playlist_background,
                     url, job.job_id, request.model_size, request.store_in_db, request.generate_feed
@@ -1092,7 +1104,6 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
                 print("🚀 Started playlist background processing" + (" with feed generation" if request.generate_feed else ""))
                 
             elif content_type == ContentType.CHANNEL:
-                # Update process_channel_background to pass generate_feed
                 background_executor.submit(
                     process_channel_background,
                     url, job.job_id, request.model_size, request.store_in_db, request.generate_feed
@@ -1101,9 +1112,10 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
                 
         except Exception as e:
             print(f"❌ Error starting background processing: {e}")
-            # Update job status to failed
-            job.status = JobStatus.FAILED
-            db.commit()
+            # Update job status to failed if job was created
+            if job:
+                job.status = JobStatus.FAILED
+                db.commit()
             raise HTTPException(status_code=500, detail=f"Failed to start background processing: {str(e)}")
         
         return TranscriptResponse(
@@ -1121,7 +1133,11 @@ def create_transcript_job(db: Session, request: TranscriptRequest, user_id: int)
         raise
     except Exception as e:
         print(f"❌ Critical error in create_transcript_job: {e}")
-        db.rollback()
+        # Rollback the transaction if job was created but there was an error
+        if job and job.id:
+            db.rollback()
+        else:
+            db.rollback()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Keep all other existing functions exactly as they were...
