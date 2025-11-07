@@ -68,9 +68,9 @@ async def batch_transcribe_content(
         
         for row in rows:
             try:
-                # Create transcript request for each URL with custom name
+                # Create transcript request for each URL with correct field name
                 request = schemas.TranscriptRequest(
-                    url=row['url'],
+                    youtube_url=row['url'],  # Fixed: use youtube_url instead of url
                     content_name=row['name'],  # Use the name from CSV
                     generate_feed=generate_feed
                 )
@@ -105,7 +105,6 @@ async def batch_transcribe_content(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing CSV file: {str(e)}"
         )
-        
 @router.post("/transcribe", response_model=schemas.TranscriptResponse)
 async def transcribe_content(
     request: schemas.TranscriptRequest,
