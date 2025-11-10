@@ -829,6 +829,7 @@ def update_job_status(job_id: str, status: JobStatus, total_items: int = None, p
     try:
         job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
         if not job:
+            print(f"❌ Job not found: {job_id}")
             return
         
         job.status = status
@@ -840,17 +841,24 @@ def update_job_status(job_id: str, status: JobStatus, total_items: int = None, p
             job.processed_items = processed_items
         
         db.commit()
+        print(f"✅ Updated job {job_id} status to {status}, processed: {processed_items}/{total_items}")
+        
+    except Exception as e:
+        print(f"❌ Error updating job status: {e}")
+        db.rollback()
     finally:
         db.close()
 
 # In your youtube_service.py
 
 def process_video_background(video_url: str, job_id: str, model_size: str, store_in_db: bool, playlist_id: Optional[str] = None, generate_feed: bool = False):
-    """Process a single video in background with improved validation"""
+    """Process a single video in background with proper status updates"""
     try:
         video_id = extract_video_id(video_url)
         if not video_id:
             print(f"❌ Could not extract video ID from: {video_url}")
+            # Update job status to failed
+            update_job_status(job_id, JobStatus.FAILED, 1, 0)
             return False
         
         title = get_youtube_title(video_url)
@@ -861,16 +869,20 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
         
         if not transcript:
             print(f"❌ Failed to fetch transcript for: {title}")
+            # Update job status to failed
+            update_job_status(job_id, JobStatus.FAILED, 1, 0)
             return False
         
         # Enhanced validation
         if len(transcript.strip()) < 50:
             print(f"❌ Transcript too short for: {title}")
+            update_job_status(job_id, JobStatus.FAILED, 1, 0)
             return False
         
         # Check if it's actually Tactiq UI content
         if is_tactiq_ui_content(transcript):
             print(f"❌ Got Tactiq UI content instead of transcript for: {title}")
+            update_job_status(job_id, JobStatus.FAILED, 1, 0)
             return False
         
         print(f"✅ Successfully extracted transcript ({len(transcript)} characters)")
@@ -907,18 +919,26 @@ def process_video_background(video_url: str, job_id: str, model_size: str, store
                             print(f"🚀 Started auto-feed generation for transcript: {title}")
                         except Exception as feed_error:
                             print(f"⚠️ Failed to start feed generation: {feed_error}")
+                    
+                    # UPDATE JOB STATUS TO COMPLETED
+                    update_job_status(job_id, JobStatus.COMPLETED, 1, 1)
                         
             except Exception as e:
                 print(f"❌ Database error for {title}: {e}")
                 db.rollback()
+                update_job_status(job_id, JobStatus.FAILED, 1, 0)
                 return False
             finally:
                 db.close()
+        else:
+            # If not storing in DB, still update job status
+            update_job_status(job_id, JobStatus.COMPLETED, 1, 1)
         
         return True
         
     except Exception as e:
         print(f"❌ Error processing video {video_url}: {e}")
+        update_job_status(job_id, JobStatus.FAILED, 1, 0)
         return False
 def is_tactiq_ui_content(text):
     """Check if the extracted text is just Tactiq UI content"""
@@ -1274,47 +1294,30 @@ def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse
         raise HTTPException(status_code=404, detail="Job not found")
 
     transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
+    
+    # For video jobs, check if transcript exists to determine actual status
+    if job.type == ContentType.VIDEO:
+        if transcripts and len(transcripts) > 0:
+            # If transcript exists, job is actually completed
+            if job.status != JobStatus.COMPLETED:
+                # Update the job status in database
+                job.status = JobStatus.COMPLETED
+                job.completed_at = datetime.now()
+                job.total_items = 1
+                job.processed_items = 1
+                db.commit()
+                print(f"✅ Auto-corrected job {job_id} status to COMPLETED")
+        else:
+            # If no transcript and still processing for too long, mark as failed
+            time_since_creation = datetime.now() - job.created_at
+            if time_since_creation.total_seconds() > 3600:  # 1 hour timeout
+                job.status = JobStatus.FAILED
+                job.completed_at = datetime.now()
+                db.commit()
+                print(f"⚠️ Auto-marked job {job_id} as FAILED due to timeout")
+
     processed_items = job.processed_items or len(transcripts)
     total_items = job.total_items or (len(transcripts) if job.type == ContentType.VIDEO else 0)
-
-    # Remove yt-dlp dependencies from content
-    content = {}
-
-    if job.type == ContentType.CHANNEL:
-        playlists = json.loads(job.playlists or "[]")
-        channel_content = []
-        for pl in playlists:
-            # Use YouTube API instead of yt-dlp
-            try:
-                pl_videos = get_playlist_videos_api(pl["url"])
-                channel_content.append({
-                    "id": pl["id"],
-                    "title": pl["title"],
-                    "videos": [v["title"] for v in pl_videos]
-                })
-            except:
-                channel_content.append({
-                    "id": pl["id"],
-                    "title": pl["title"],
-                    "videos": []
-                })
-        content = {"playlists": channel_content}
-
-    elif job.type == ContentType.PLAYLIST:
-        try:
-            videos = get_playlist_videos_api(job.url)
-            content = {
-                "playlist_name": job.content_name,
-                "videos": [v["title"] for v in videos]
-            }
-        except:
-            content = {
-                "playlist_name": job.content_name,
-                "videos": []
-            }
-
-    elif job.type == ContentType.VIDEO:
-        content = {"video_title": job.content_name}
 
     return JobContentStatusResponse(
         job_id=job.job_id,
@@ -1323,7 +1326,6 @@ def get_job_status_service(db: Session, job_id: str) -> JobContentStatusResponse
         total_items=total_items,
         type=job.type,
     )
-
 
 
 def fetch_job_content(db: Session, job_id: str, user_id: int):
@@ -1522,3 +1524,41 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
         description=playlist_description,
         videos=video_list,
     )
+
+def fix_stuck_jobs():
+    """Fix jobs stuck in processing status"""
+    db = next(get_db_session())
+    try:
+        stuck_jobs = db.query(TranscriptJob).filter(
+            TranscriptJob.status == JobStatus.PROCESSING,
+            TranscriptJob.type == ContentType.VIDEO
+        ).all()
+        
+        for job in stuck_jobs:
+            transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
+            if transcripts and len(transcripts) > 0:
+                # Job has transcripts but status is still processing
+                job.status = JobStatus.COMPLETED
+                job.completed_at = datetime.now()
+                job.total_items = 1
+                job.processed_items = 1
+                print(f"✅ Fixed stuck job: {job.job_id}")
+            else:
+                # No transcripts and job is old, mark as failed
+                time_since_creation = datetime.now() - job.created_at
+                if time_since_creation.total_seconds() > 3600:  # 1 hour
+                    job.status = JobStatus.FAILED
+                    job.completed_at = datetime.now()
+                    print(f"⚠️ Marked old stuck job as failed: {job.job_id}")
+        
+        db.commit()
+        print(f"🎉 Fixed {len(stuck_jobs)} stuck jobs")
+        
+    except Exception as e:
+        print(f"❌ Error fixing stuck jobs: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+# Run this once to fix existing stuck jobs
+fix_stuck_jobs()
