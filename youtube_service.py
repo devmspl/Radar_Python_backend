@@ -1525,40 +1525,40 @@ def fetch_playlist_by_id(playlist_url: str) -> PlaylistWithVideos:
         videos=video_list,
     )
 
-def fix_stuck_jobs():
-    """Fix jobs stuck in processing status"""
-    db = next(get_db_session())
-    try:
-        stuck_jobs = db.query(TranscriptJob).filter(
-            TranscriptJob.status == JobStatus.PROCESSING,
-            TranscriptJob.type == ContentType.VIDEO
-        ).all()
+# def fix_stuck_jobs():
+#     """Fix jobs stuck in processing status"""
+#     db = next(get_db_session())
+#     try:
+#         stuck_jobs = db.query(TranscriptJob).filter(
+#             TranscriptJob.status == JobStatus.PROCESSING,
+#             TranscriptJob.type == ContentType.VIDEO
+#         ).all()
         
-        for job in stuck_jobs:
-            transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
-            if transcripts and len(transcripts) > 0:
-                # Job has transcripts but status is still processing
-                job.status = JobStatus.COMPLETED
-                job.completed_at = datetime.now()
-                job.total_items = 1
-                job.processed_items = 1
-                print(f"✅ Fixed stuck job: {job.job_id}")
-            else:
-                # No transcripts and job is old, mark as failed
-                time_since_creation = datetime.now() - job.created_at
-                if time_since_creation.total_seconds() > 3600:  # 1 hour
-                    job.status = JobStatus.FAILED
-                    job.completed_at = datetime.now()
-                    print(f"⚠️ Marked old stuck job as failed: {job.job_id}")
+#         for job in stuck_jobs:
+#             transcripts = db.query(Transcript).filter(Transcript.job_id == job.id).all()
+#             if transcripts and len(transcripts) > 0:
+#                 # Job has transcripts but status is still processing
+#                 job.status = JobStatus.COMPLETED
+#                 job.completed_at = datetime.now()
+#                 job.total_items = 1
+#                 job.processed_items = 1
+#                 print(f"✅ Fixed stuck job: {job.job_id}")
+#             else:
+#                 # No transcripts and job is old, mark as failed
+#                 time_since_creation = datetime.now() - job.created_at
+#                 if time_since_creation.total_seconds() > 3600:  # 1 hour
+#                     job.status = JobStatus.FAILED
+#                     job.completed_at = datetime.now()
+#                     print(f"⚠️ Marked old stuck job as failed: {job.job_id}")
         
-        db.commit()
-        print(f"🎉 Fixed {len(stuck_jobs)} stuck jobs")
+#         db.commit()
+#         print(f"🎉 Fixed {len(stuck_jobs)} stuck jobs")
         
-    except Exception as e:
-        print(f"❌ Error fixing stuck jobs: {e}")
-        db.rollback()
-    finally:
-        db.close()
+#     except Exception as e:
+#         print(f"❌ Error fixing stuck jobs: {e}")
+#         db.rollback()
+#     finally:
+#         db.close()
 
-# Run this once to fix existing stuck jobs
-fix_stuck_jobs()
+# # Run this once to fix existing stuck jobs
+# fix_stuck_jobs()
