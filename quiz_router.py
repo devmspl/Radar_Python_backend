@@ -991,3 +991,195 @@ def get_performance_tier(score: float) -> str:
     else:
         return "novice"
 
+@router.get("/stats/overall")
+def get_overall_quiz_stats(db: Session = Depends(get_db)):
+    """Get comprehensive overall quiz statistics"""
+    
+    # Total quizzes taken
+    total_quizzes_taken = db.query(func.count(UserQuizScore.id)).scalar() or 0
+    
+    # Total unique users who took quizzes
+    total_unique_users = db.query(func.count(func.distinct(UserQuizScore.user_id))).scalar() or 0
+    
+    # Average score across all quizzes
+    average_score = db.query(func.avg(UserQuizScore.score)).scalar() or 0
+    
+    # Total questions answered
+    total_questions_answered = db.query(func.sum(UserQuizScore.total_questions)).scalar() or 0
+    
+    # Total correct answers
+    total_correct_answers = db.query(func.sum(UserQuizScore.correct_answers)).scalar() or 0
+    
+    # Overall accuracy
+    overall_accuracy = (total_correct_answers / total_questions_answered * 100) if total_questions_answered > 0 else 0
+    
+    # Category-wise statistics
+    category_stats = db.query(
+        QuizCategory.name,
+        QuizCategory.id,
+        func.count(UserQuizScore.id).label('quiz_count'),
+        func.avg(UserQuizScore.score).label('avg_score'),
+        func.count(func.distinct(UserQuizScore.user_id)).label('unique_users')
+    ).join(
+        Quiz, Quiz.id == UserQuizScore.quiz_id
+    ).join(
+        QuizCategory, QuizCategory.id == Quiz.category_id
+    ).group_by(
+        QuizCategory.name, QuizCategory.id
+    ).all()
+    
+    # Daily activity (last 7 days)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    daily_activity = db.query(
+        func.date(UserQuizScore.completed_at).label('date'),
+        func.count(UserQuizScore.id).label('quiz_count'),
+        func.avg(UserQuizScore.score).label('avg_score'),
+        func.count(func.distinct(UserQuizScore.user_id)).label('unique_users')
+    ).filter(
+        UserQuizScore.completed_at >= seven_days_ago
+    ).group_by(
+        func.date(UserQuizScore.completed_at)
+    ).order_by(
+        func.date(UserQuizScore.completed_at).desc()
+    ).all()
+    
+    # Top performers (users with highest average scores, min 5 quizzes)
+    top_performers = db.query(
+        UserQuizScore.user_id,
+        User.full_name,
+        User.last_name,
+        func.avg(UserQuizScore.score).label('avg_score'),
+        func.count(UserQuizScore.id).label('quiz_count'),
+        func.max(UserQuizScore.score).label('best_score')
+    ).join(
+        User, User.id == UserQuizScore.user_id
+    ).group_by(
+        UserQuizScore.user_id, User.full_name, User.last_name
+    ).having(
+        func.count(UserQuizScore.id) >= 3  # At least 3 quizzes
+    ).order_by(
+        func.avg(UserQuizScore.score).desc()
+    ).limit(10).all()
+    
+    # Most popular categories (by number of attempts)
+    popular_categories = db.query(
+        QuizCategory.name,
+        QuizCategory.id,
+        func.count(UserQuizScore.id).label('attempt_count'),
+        func.avg(UserQuizScore.score).label('avg_score')
+    ).join(
+        Quiz, Quiz.id == UserQuizScore.quiz_id
+    ).join(
+        QuizCategory, QuizCategory.id == Quiz.category_id
+    ).group_by(
+        QuizCategory.name, QuizCategory.id
+    ).order_by(
+        func.count(UserQuizScore.id).desc()
+    ).limit(5).all()
+    
+    # Difficulty level statistics
+    difficulty_stats = db.query(
+        Quiz.difficulty,
+        func.count(UserQuizScore.id).label('quiz_count'),
+        func.avg(UserQuizScore.score).label('avg_score'),
+        func.avg(UserQuizScore.time_taken).label('avg_time_taken')
+    ).join(
+        Quiz, Quiz.id == UserQuizScore.quiz_id
+    ).group_by(
+        Quiz.difficulty
+    ).all()
+    
+    # Time-based statistics
+    today = datetime.utcnow().date()
+    today_stats = db.query(
+        func.count(UserQuizScore.id).label('today_quizzes'),
+        func.avg(UserQuizScore.score).label('today_avg_score'),
+        func.count(func.distinct(UserQuizScore.user_id)).label('today_unique_users')
+    ).filter(
+        func.date(UserQuizScore.completed_at) == today
+    ).first()
+    
+    # Weekly growth
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    last_week_stats = db.query(
+        func.count(UserQuizScore.id).label('last_week_quizzes'),
+        func.avg(UserQuizScore.score).label('last_week_avg_score')
+    ).filter(
+        UserQuizScore.completed_at >= week_ago - timedelta(days=7),
+        UserQuizScore.completed_at < week_ago
+    ).first()
+    
+    # Calculate growth percentages
+    weekly_quiz_growth = 0
+    weekly_score_growth = 0
+    
+    if last_week_stats and last_week_stats.last_week_quizzes > 0:
+        weekly_quiz_growth = ((today_stats.today_quizzes or 0) - last_week_stats.last_week_quizzes) / last_week_stats.last_week_quizzes * 100
+        weekly_score_growth = ((today_stats.today_avg_score or 0) - last_week_stats.last_week_avg_score) / last_week_stats.last_week_avg_score * 100
+    
+    return {
+        "summary": {
+            "total_quizzes_taken": total_quizzes_taken,
+            "total_unique_users": total_unique_users,
+            "average_score": round(average_score, 2),
+            "total_questions_answered": total_questions_answered,
+            "total_correct_answers": total_correct_answers,
+            "overall_accuracy": round(overall_accuracy, 2),
+            "today_quizzes": today_stats.today_quizzes or 0,
+            "today_unique_users": today_stats.today_unique_users or 0,
+            "today_avg_score": round(today_stats.today_avg_score or 0, 2)
+        },
+        "growth_metrics": {
+            "weekly_quiz_growth": round(weekly_quiz_growth, 2),
+            "weekly_score_growth": round(weekly_score_growth, 2),
+            "trend": "up" if weekly_quiz_growth > 0 else "down"
+        },
+        "category_performance": [
+            {
+                "category_id": stat.id,
+                "category_name": stat.name,
+                "quiz_count": stat.quiz_count,
+                "average_score": round(stat.avg_score or 0, 2),
+                "unique_users": stat.unique_users
+            }
+            for stat in category_stats
+        ],
+        "daily_activity": [
+            {
+                "date": activity.date,
+                "quiz_count": activity.quiz_count,
+                "average_score": round(activity.avg_score or 0, 2),
+                "unique_users": activity.unique_users
+            }
+            for activity in daily_activity
+        ],
+        "top_performers": [
+            {
+                "user_id": performer.user_id,
+                "user_name": f"{performer.full_name} {performer.last_name}".strip(),
+                "average_score": round(performer.avg_score or 0, 2),
+                "quiz_count": performer.quiz_count,
+                "best_score": round(performer.best_score or 0, 2),
+                "performance_tier": get_performance_tier(performer.avg_score or 0)
+            }
+            for performer in top_performers
+        ],
+        "popular_categories": [
+            {
+                "category_id": category.id,
+                "category_name": category.name,
+                "attempt_count": category.attempt_count,
+                "average_score": round(category.avg_score or 0, 2)
+            }
+            for category in popular_categories
+        ],
+        "difficulty_analysis": [
+            {
+                "difficulty": stat.difficulty,
+                "quiz_count": stat.quiz_count,
+                "average_score": round(stat.avg_score or 0, 2),
+                "average_time_taken": round(stat.avg_time_taken or 0, 2)
+            }
+            for stat in difficulty_stats
+        ]
+    }
