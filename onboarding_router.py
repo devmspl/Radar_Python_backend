@@ -6,7 +6,7 @@ import json
 from database import get_db
 import models, schemas
 from dependencies import get_current_user
-
+from datetime import datetime
 router = APIRouter(
     prefix="/onboarding",
     tags=["Onboarding"]
@@ -453,10 +453,10 @@ QUESTIONNAIRE_DATA = {
     ]
 }
 
-@router.get("/questionnaire", response_model=schemas.QuestionnaireResponse)
-async def get_questionnaire():
-    """Get the complete onboarding questionnaire"""
-    return QUESTIONNAIRE_DATA
+# @router.get("/questionnaire", response_model=schemas.QuestionnaireResponse)
+# async def get_questionnaire():
+#     """Get the complete onboarding questionnaire"""
+#     return QUESTIONNAIRE_DATA
 
 @router.get("/status")
 async def get_onboarding_status(
@@ -554,7 +554,17 @@ async def save_onboarding_step(
         if "personal_email" in step_data:
             onboarding_data.personal_email = step_data["personal_email"]
     elif isinstance(field_name, str):
-        setattr(onboarding_data, field_name, step_data)
+    # 🩹 Handle {"selected_options": [...]} or {"value": "..."} wrappers
+      if isinstance(step_data, dict):
+          if "selected_options" in step_data:
+            step_data = step_data["selected_options"]
+          elif "value" in step_data:
+            step_data = step_data["value"]
+          elif "selected_value" in step_data:  # just in case
+            step_data = step_data["selected_value"]
+      setattr(onboarding_data, field_name, step_data)
+
+
     
     db.commit()
     db.refresh(onboarding_data)
