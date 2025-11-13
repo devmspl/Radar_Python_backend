@@ -388,13 +388,13 @@ async def delete_my_account(
     return {"message": "Your account has been deleted successfully"}
 
 app.include_router(auth_router)
+app.include_router(onboarding_router) 
 app.include_router(admin_router)    
 app.include_router(youtube_router)
 app.include_router(scrapping_router)  
 app.include_router(feed_router)
 app.include_router(publish_router)
 app.include_router(quiz_router)
-app.include_router(onboarding_router) 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7878)
