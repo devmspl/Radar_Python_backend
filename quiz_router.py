@@ -13,6 +13,8 @@ import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from schemas import QuizCategoryResponse,QuizResponse,QuizResultResponse,QuizSubmission,UserQuizHistory
+from sqlalchemy import func
+
 router = APIRouter(prefix="/quizzes", tags=["Quizzes"])
 
 logger = logging.getLogger(__name__)
@@ -705,31 +707,287 @@ def refresh_category_quiz(
     background_tasks.add_task(refresh_task)
     
     return {"message": f"Quiz refresh started for {category.name}"}
+    
+def get_username(db: Session, user_id: int) -> str:
+    """Helper function to get user's display name"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if user:
+        # Combine full_name and last_name, or use just full_name if last_name is empty
+        if user.last_name:
+            return f"{user.full_name} {user.last_name}".strip()
+        else:
+            return user.full_name
+    else:
+        return f"User_{user_id}"
+
+@router.get("/leaderboard/overall")
+def get_overall_leaderboard(
+    timeframe: str = "all_time",  # "today", "weekly", "monthly", "all_time"
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    """Get overall leaderboard across all categories"""
+    
+    # Base query
+    query = db.query(UserQuizScore)
+    
+    # Apply timeframe filter
+    if timeframe == "today":
+        today = datetime.utcnow().date()
+        query = query.filter(func.date(UserQuizScore.completed_at) == today)
+    elif timeframe == "weekly":
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        query = query.filter(UserQuizScore.completed_at >= week_ago)
+    elif timeframe == "monthly":
+        month_ago = datetime.utcnow() - timedelta(days=30)
+        query = query.filter(UserQuizScore.completed_at >= month_ago)
+    
+    # Get top scores
+    top_scores = query.order_by(
+        UserQuizScore.score.desc()
+    ).limit(limit).all()
+    
+    leaderboard = []
+    for i, score in enumerate(top_scores, 1):
+        # Get user and category info
+        user = db.query(User).filter(User.id == score.user_id).first()
+        category = db.query(QuizCategory).join(Quiz).filter(
+            Quiz.id == score.quiz_id
+        ).first()
+        
+        leaderboard.append({
+            "rank": i,
+            "user_id": score.user_id,
+            "username": get_username(db, score.user_id),
+            "email": user.email if user else None,
+            "score": round(score.score, 2),
+            "category": category.name if category else "Unknown",
+            "quiz_title": score.quiz.title,
+            "correct_answers": score.correct_answers,
+            "total_questions": score.total_questions,
+            "time_taken": score.time_taken,
+            "completed_at": score.completed_at.isoformat(),
+            "medal": get_medal(i)
+        })
+    
+    return {
+        "timeframe": timeframe,
+        "limit": limit,
+        "total_records": len(leaderboard),
+        "leaderboard": leaderboard
+    }
+
+@router.get("/leaderboard/today-top")
+def get_today_top_scorers(
+    limit: int = 5,
+    db: Session = Depends(get_db)
+):
+    """Get top scorers for today"""
+    
+    today = datetime.utcnow().date()
+    
+    # Get today's top scores
+    today_scores = db.query(UserQuizScore).filter(
+        func.date(UserQuizScore.completed_at) == today
+    ).order_by(
+        UserQuizScore.score.desc()
+    ).limit(limit).all()
+    
+    top_scorers = []
+    for i, score in enumerate(today_scores, 1):
+        user = db.query(User).filter(User.id == score.user_id).first()
+        category = db.query(QuizCategory).join(Quiz).filter(
+            Quiz.id == score.quiz_id
+        ).first()
+        
+        top_scorers.append({
+            "rank": i,
+            "user_id": score.user_id,
+            "username": get_username(db, score.user_id),
+            "email": user.email if user else None,
+            "score": round(score.score, 2),
+            "category": category.name if category else "Unknown",
+            "quiz_title": score.quiz.title,
+            "correct_answers": score.correct_answers,
+            "total_questions": score.total_questions,
+            "completed_at": score.completed_at.isoformat(),
+            "medal": get_medal(i)
+        })
+    
+    # Get today's statistics
+    today_stats = db.query(
+        func.count(UserQuizScore.id).label('total_attempts'),
+        func.count(func.distinct(UserQuizScore.user_id)).label('unique_users'),
+        func.avg(UserQuizScore.score).label('average_score')
+    ).filter(
+        func.date(UserQuizScore.completed_at) == today
+    ).first()
+    
+    return {
+        "date": today.isoformat(),
+        "total_attempts": today_stats.total_attempts or 0,
+        "unique_users": today_stats.unique_users or 0,
+        "average_score": round(today_stats.average_score, 2) if today_stats.average_score else 0,
+        "top_scorers": top_scorers
+    }
 
 @router.get("/leaderboard/{category_id}")
-def get_leaderboard(
+def get_category_leaderboard(
     category_id: int,
     db: Session = Depends(get_db)
 ):
-    """Get leaderboard for a category"""
+    """Get leaderboard for a specific category"""
+    
     # Get top scores for this category
     top_scores = db.query(UserQuizScore).join(Quiz).filter(
         Quiz.category_id == category_id
     ).order_by(UserQuizScore.score.desc()).limit(10).all()
     
+    category = db.query(QuizCategory).filter(QuizCategory.id == category_id).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
     leaderboard = []
-    for i, score in enumerate(top_scores):
+    for i, score in enumerate(top_scores, 1):
+        user = db.query(User).filter(User.id == score.user_id).first()
+        
         leaderboard.append({
-            "rank": i + 1,
+            "rank": i,
             "user_id": score.user_id,
-            "score": score.score,
+            "username": get_username(db, score.user_id),
+            "email": user.email if user else None,
+            "score": round(score.score, 2),
             "correct_answers": score.correct_answers,
             "total_questions": score.total_questions,
             "time_taken": score.time_taken,
-            "completed_at": score.completed_at.isoformat()
+            "completed_at": score.completed_at.isoformat(),
+            "medal": get_medal(i)
         })
     
     return {
         "category_id": category_id,
+        "category_name": category.name,
+        "total_players": len(leaderboard),
         "leaderboard": leaderboard
     }
+
+def get_medal(rank: int) -> str:
+    """Get medal emoji based on rank"""
+    if rank == 1:
+        return "🥇"
+    elif rank == 2:
+        return "🥈"
+    elif rank == 3:
+        return "🥉"
+    else:
+        return "🎯"
+
+@router.get("/user/{user_id}/stats")
+def get_user_stats(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get detailed statistics for a specific user"""
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Overall stats
+    overall_stats = db.query(
+        func.count(UserQuizScore.id).label('total_quizzes'),
+        func.avg(UserQuizScore.score).label('average_score'),
+        func.max(UserQuizScore.score).label('best_score'),
+        func.min(UserQuizScore.score).label('worst_score'),
+        func.sum(UserQuizScore.correct_answers).label('total_correct'),
+        func.sum(UserQuizScore.total_questions).label('total_questions')
+    ).filter(
+        UserQuizScore.user_id == user_id
+    ).first()
+    
+    # Category-wise performance
+    category_stats = db.query(
+        QuizCategory.name,
+        func.count(UserQuizScore.id).label('quiz_count'),
+        func.avg(UserQuizScore.score).label('average_score'),
+        func.max(UserQuizScore.score).label('best_score')
+    ).join(
+        Quiz, Quiz.id == UserQuizScore.quiz_id
+    ).join(
+        QuizCategory, QuizCategory.id == Quiz.category_id
+    ).filter(
+        UserQuizScore.user_id == user_id
+    ).group_by(
+        QuizCategory.name
+    ).all()
+    
+    # Recent activity
+    recent_scores = db.query(
+        UserQuizScore.score,
+        Quiz.title,
+        QuizCategory.name,
+        UserQuizScore.completed_at
+    ).join(
+        Quiz, Quiz.id == UserQuizScore.quiz_id
+    ).join(
+        QuizCategory, QuizCategory.id == Quiz.category_id
+    ).filter(
+        UserQuizScore.user_id == user_id
+    ).order_by(
+        UserQuizScore.completed_at.desc()
+    ).limit(5).all()
+    
+    # Calculate accuracy
+    total_questions = overall_stats.total_questions or 1
+    total_correct = overall_stats.total_correct or 0
+    accuracy = (total_correct / total_questions) * 100
+    
+    return {
+        "user_id": user_id,
+        "user_info": {
+            "full_name": user.full_name,
+            "last_name": user.last_name,
+            "email": user.email
+        },
+        "overall_stats": {
+            "total_quizzes": overall_stats.total_quizzes or 0,
+            "average_score": round(overall_stats.average_score, 2) if overall_stats.average_score else 0,
+            "best_score": round(overall_stats.best_score, 2) if overall_stats.best_score else 0,
+            "worst_score": round(overall_stats.worst_score, 2) if overall_stats.worst_score else 0,
+            "accuracy": round(accuracy, 2),
+            "total_correct_answers": total_correct,
+            "total_questions_attempted": total_questions
+        },
+        "category_performance": [
+            {
+                "category": stat.name,
+                "quiz_count": stat.quiz_count,
+                "average_score": round(stat.average_score, 2) if stat.average_score else 0,
+                "best_score": round(stat.best_score, 2) if stat.best_score else 0
+            }
+            for stat in category_stats
+        ],
+        "recent_activity": [
+            {
+                "quiz_title": score.title,
+                "category": score.name,
+                "score": round(score.score, 2),
+                "completed_at": score.completed_at.isoformat()
+            }
+            for score in recent_scores
+        ]
+    }
+
+def get_performance_tier(score: float) -> str:
+    """Determine performance tier based on average score"""
+    if score >= 90:
+        return "expert"
+    elif score >= 80:
+        return "advanced"
+    elif score >= 70:
+        return "intermediate"
+    elif score >= 60:
+        return "beginner"
+    else:
+        return "novice"
+
