@@ -32,14 +32,6 @@ class UserCreate(UserBase):
             raise ValueError('You must agree to the terms and conditions')
         return v
 
-class UserResponse(UserBase):
-    id: int
-    is_verified: bool
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
@@ -439,3 +431,65 @@ class BatchScrapeResponse(BaseModel):
     successful_jobs: int
     failed_rows: List[FailedScrapeRow]
     job_responses: List[ScrapeJobResponse]
+
+class OnboardingBase(BaseModel):
+    domains_of_interest: Optional[List[str]] = None
+    skills_tools: Optional[List[str]] = None
+    interested_roles: Optional[List[str]] = None
+    social_links: Optional[Dict[str, str]] = None
+    work_email: Optional[EmailStr] = None
+    personal_email: Optional[EmailStr] = None
+    looking_for_job: Optional[str] = None
+    career_stage: Optional[str] = None
+    years_experience: Optional[str] = None
+    goals: Optional[List[str]] = None
+    market_geography: Optional[List[str]] = None
+    qualifications: Optional[List[str]] = None
+    education: Optional[Dict[str, str]] = None
+    companies: Optional[List[str]] = None
+    certifications: Optional[Dict[str, List[str]]] = None
+
+class OnboardingCreate(OnboardingBase):
+    user_id: int
+
+class OnboardingUpdate(OnboardingBase):
+    pass
+
+class OnboardingResponse(OnboardingBase):
+    id: int
+    user_id: int
+    is_completed: bool
+    completed_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UserResponse(UserBase):
+    id: int
+    is_verified: bool
+    created_at: datetime
+    onboarding_data: Optional[OnboardingResponse] = None
+    
+    class Config:
+        from_attributes = True
+
+        
+class OnboardingStepUpdate(BaseModel):
+    step_id: str
+    data: Dict[str, Any]
+
+class OnboardingComplete(BaseModel):
+    pass
+
+# Questionnaire schemas
+class QuestionnaireResponse(BaseModel):
+    id: str
+    title: str
+    totalSteps: int
+    questions: List[Dict[str, Any]]
+
+    class Config:
+        from_attributes = True

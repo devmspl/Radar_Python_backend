@@ -33,13 +33,73 @@ class User(Base):
     agreed_terms = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    
+    is_blocked = Column(Boolean, default=False)
     # Relationship to categories created by this admin
     categories = relationship("Category", back_populates="admin_user")
     # Relationship to transcript jobs created by this user
     transcript_jobs = relationship("TranscriptJob", back_populates="user")
 
     quiz_scores = relationship("UserQuizScore", back_populates="user")
+     # Relationship to onboarding data
+    onboarding_data = relationship("UserOnboarding", back_populates="user", uselist=False)
+
+class UserOnboarding(Base):
+    __tablename__ = "user_onboarding"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    
+    # Question 1: Domains of interest
+    domains_of_interest = Column(JSON, nullable=True)
+    
+    # Question 2: Skills & Tools
+    skills_tools = Column(JSON, nullable=True)
+    
+    # Question 3: Roles interested in
+    interested_roles = Column(JSON, nullable=True)
+    
+    # Question 4: Social links
+    social_links = Column(JSON, nullable=True)
+    
+    # Question 5: Emails
+    work_email = Column(String(255), nullable=True)
+    personal_email = Column(String(255), nullable=True)
+    
+    # Question 6: Job seeking status
+    looking_for_job = Column(String(50), nullable=True)
+    
+    # Question 7: Career stage
+    career_stage = Column(String(50), nullable=True)
+    
+    # Question 8: Years of experience
+    years_experience = Column(String(50), nullable=True)
+    
+    # Question 9: Goals
+    goals = Column(JSON, nullable=True)
+    
+    # Question 10: Market/Geography
+    market_geography = Column(JSON, nullable=True)
+    
+    # Question 11: Qualifications
+    qualifications = Column(JSON, nullable=True)
+    
+    # Question 12: Education
+    education = Column(JSON, nullable=True)
+    
+    # Question 13: Companies
+    companies = Column(JSON, nullable=True)
+    
+    # Question 14: Certifications
+    certifications = Column(JSON, nullable=True)
+    
+    # Completion status
+    is_completed = Column(Boolean, default=False)
+    completed_at = Column(DateTime, nullable=True)
+    
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    
+    user = relationship("User", back_populates="onboarding_data")
 class OTP(Base):
     __tablename__ = "otps"
 

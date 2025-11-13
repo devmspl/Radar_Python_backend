@@ -15,6 +15,7 @@ from scraping import router as scrapping_router
 from feed_router import router as feed_router
 from publish_router import router as publish_router
 from quiz_router import router as quiz_router
+from onboarding_router import router as onboarding_router
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
@@ -175,15 +176,18 @@ async def login(user_data: schemas.UserLogin, db: Session = Depends(get_db)):
 
     access_token = utils.create_access_token(data={"sub": db_user.email})
 
+    # Check onboarding status
+    onboarding_completed = db_user.onboarding_data.is_completed if db_user.onboarding_data else False
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "user_id": db_user.id,
         "full_name": db_user.full_name,
         "last_name": db_user.last_name,
-        "role": "admin" if db_user.is_admin else "user"
+        "role": "admin" if db_user.is_admin else "user",
+        "onboarding_completed": onboarding_completed  # Add this field
     }
-
 
 @auth_router.get("/users/{user_id}", response_model=schemas.UserResponse)
 async def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
@@ -332,6 +336,57 @@ async def reset_password(
     utils.delete_otp(reset_data.email, "password_reset")
 
     return {"message": "Password reset successfully"}
+
+
+@auth_router.patch("/users/{user_id}/block", status_code=status.HTTP_200_OK)
+async def block_or_unblock_user(
+    user_id: int,
+    block: bool,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_admin)
+):
+    """
+    Block or unblock a user (Admin only)
+    Example: PATCH /auth/users/5/block?block=true
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can block or unblock users"
+        )
+
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    if db_user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Admins cannot block themselves"
+        )
+
+    db_user.is_blocked = block
+    db.commit()
+
+    action = "blocked" if block else "unblocked"
+    return {"message": f"User with ID {user_id} has been {action} successfully"}
+
+
+@auth_router.delete("/users/me", status_code=status.HTTP_200_OK)
+async def delete_my_account(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user)
+):
+    """
+    Permanently delete the logged-in user's account
+    """
+    db.delete(current_user)
+    db.commit()
+    return {"message": "Your account has been deleted successfully"}
+
 app.include_router(auth_router)
 app.include_router(admin_router)    
 app.include_router(youtube_router)
@@ -339,6 +394,7 @@ app.include_router(scrapping_router)
 app.include_router(feed_router)
 app.include_router(publish_router)
 app.include_router(quiz_router)
+app.include_router(onboarding_router) 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7878)
