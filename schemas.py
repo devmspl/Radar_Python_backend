@@ -469,6 +469,7 @@ class OnboardingResponse(OnboardingBase):
 
 class UserResponse(UserBase):
     id: int
+    profile_photo: Optional[str] = None
     is_verified: bool
     created_at: datetime
     onboarding_data: Optional[OnboardingResponse] = None
@@ -476,6 +477,10 @@ class UserResponse(UserBase):
     class Config:
         from_attributes = True
 
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    profile_photo: Optional[str] = None
         
 class OnboardingStepUpdate(BaseModel):
     step_id: str

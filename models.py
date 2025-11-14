@@ -38,7 +38,7 @@ class User(Base):
     categories = relationship("Category", back_populates="admin_user")
     # Relationship to transcript jobs created by this user
     transcript_jobs = relationship("TranscriptJob", back_populates="user")
-
+    profile_photo = Column(String(500), nullable=True)
     quiz_scores = relationship("UserQuizScore", back_populates="user")
      # Relationship to onboarding data
     onboarding_data = relationship("UserOnboarding", back_populates="user", uselist=False)

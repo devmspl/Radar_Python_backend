@@ -7,6 +7,10 @@ from typing import List
 import models, schemas, utils, dependencies
 from database import get_db, engine
 from config import settings
+from fastapi import File, UploadFile, Form
+import shutil
+from file_utils import handle_profile_photo_upload, delete_profile_photo
+from typing import Optional
 
 # Import routers
 from admin import router as admin_router
@@ -185,6 +189,7 @@ async def login(user_data: schemas.UserLogin, db: Session = Depends(get_db)):
         "user_id": db_user.id,
         "full_name": db_user.full_name,
         "last_name": db_user.last_name,
+        "Profile_photo": db_user.profile_photo,
         "role": "admin" if db_user.is_admin else "user",
         "onboarding_completed": onboarding_completed  # Add this field
     }
@@ -387,6 +392,129 @@ async def delete_my_account(
     db.commit()
     return {"message": "Your account has been deleted successfully"}
 
+
+@auth_router.post("/users/me/profile-photo", response_model=schemas.UserResponse)
+async def upload_profile_photo(
+    profile_photo: UploadFile = File(..., description="Profile photo file (JPEG, PNG, GIF, WebP) max 5MB"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user)
+):
+    """
+    Upload or replace user's profile photo
+    
+    - **profile_photo**: Image file (max 5MB)
+    - Returns: Updated user object
+    """
+    try:
+        # Handle the file upload (this will delete old photo if exists)
+        new_photo_path = await handle_profile_photo_upload(
+            profile_photo, 
+            current_user.id, 
+            current_user.profile_photo
+        )
+        
+        # Update user record
+        current_user.profile_photo = new_photo_path
+        db.commit()
+        db.refresh(current_user)
+        
+        return current_user
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error uploading profile photo: {str(e)}"
+        )
+
+
+@auth_router.put("/users/me/profile-photo", response_model=schemas.UserResponse)
+async def update_profile_photo(
+    profile_photo: UploadFile = File(..., description="New profile photo file (JPEG, PNG, GIF, WebP) max 5MB"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user)
+):
+    """
+    Update user's profile photo (same as upload but PUT method)
+    
+    - **profile_photo**: New image file (max 5MB)
+    - Returns: Updated user object
+    """
+    try:
+        # Handle the file upload (this will delete old photo if exists)
+        new_photo_path = await handle_profile_photo_upload(
+            profile_photo, 
+            current_user.id, 
+            current_user.profile_photo
+        )
+        
+        # Update user record
+        current_user.profile_photo = new_photo_path
+        db.commit()
+        db.refresh(current_user)
+        
+        return current_user
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating profile photo: {str(e)}"
+        )
+
+
+@auth_router.delete("/users/me/profile-photo", response_model=schemas.UserResponse)
+async def delete_profile_photo_endpoint(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user)
+):
+    """
+    Delete user's profile photo
+    
+    - Returns: Updated user object
+    """
+    if not current_user.profile_photo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No profile photo found to delete"
+        )
+    
+    try:
+        # Delete the photo file
+        delete_profile_photo(current_user.profile_photo)
+        
+        # Update user record
+        current_user.profile_photo = None
+        db.commit()
+        db.refresh(current_user)
+        
+        return current_user
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error deleting profile photo: {str(e)}"
+        )
+
+
+# @auth_router.get("/users/me/profile", response_model=schemas.UserResponse)
+# async def get_user_profile(
+#     current_user: models.User = Depends(dependencies.get_current_user)
+# ):
+#     """
+#     Get current user's profile with photo URL
+    
+#     - Returns: User profile data
+#     """
+#     return current_user
+
+from fastapi.staticfiles import StaticFiles
+
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.include_router(auth_router)
 app.include_router(onboarding_router) 
 app.include_router(admin_router)    
