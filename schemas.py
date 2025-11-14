@@ -447,7 +447,7 @@ class OnboardingBase(BaseModel):
     qualifications: Optional[List[str]] = None
     education: Optional[Dict[str, str]] = None
     companies: Optional[List[str]] = None
-     certifications: Optional[Dict[str, List[str]]] = None
+    certifications: Optional[Dict[str, List[str]]] = None
 
     @field_validator("certifications", mode="before")
     def normalize_certifications(cls, v):
