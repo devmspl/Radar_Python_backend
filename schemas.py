@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, validator,field_validator
 from typing import Optional, List, Dict,Any
 from datetime import datetime
 from enum import Enum
@@ -447,7 +447,27 @@ class OnboardingBase(BaseModel):
     qualifications: Optional[List[str]] = None
     education: Optional[Dict[str, str]] = None
     companies: Optional[List[str]] = None
-    certifications: Optional[Dict[str, List[str]]] = None
+     certifications: Optional[Dict[str, List[str]]] = None
+
+    @field_validator("certifications", mode="before")
+    def normalize_certifications(cls, v):
+        """
+        Convert string values to lists automatically.
+        Example:
+        {"industryAffiliations": "cert_b"} → {"industryAffiliations": ["cert_b"]}
+        """
+        if v is None:
+            return v
+
+        fixed = {}
+        for key, value in v.items():
+            if isinstance(value, str):
+                fixed[key] = [value]
+            elif isinstance(value, list):
+                fixed[key] = value
+            else:
+                fixed[key] = []
+        return fixed
 
 class OnboardingCreate(OnboardingBase):
     user_id: int
