@@ -327,3 +327,48 @@ class UserQuizScore(Base):
 # QuizCategory.quizzes = relationship("Quiz", back_populates="category")
 # Feed.quizzes = relationship("Quiz", back_populates="feed")
 # User.quiz_scores = relationship("UserQuizScore", back_populates="user")
+
+# Add to your models.py
+
+class Topic(Base):
+    __tablename__ = "topics"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(Text, nullable=True)
+    follower_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Source(Base):
+    __tablename__ = "sources"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True, nullable=False)
+    website = Column(String, nullable=False)
+    source_type = Column(String, nullable=False)  # 'blog' or 'youtube'
+    follower_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class UserTopicFollow(Base):
+    __tablename__ = "user_topic_follows"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False)  # You can integrate with your user system
+    topic_id = Column(Integer, ForeignKey('topics.id'))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    topic = relationship("Topic")
+
+class UserSourceFollow(Base):
+    __tablename__ = "user_source_follows"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False)  # You can integrate with your user system
+    source_id = Column(Integer, ForeignKey('sources.id'))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    source = relationship("Source")

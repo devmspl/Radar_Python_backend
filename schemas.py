@@ -232,6 +232,17 @@ class DeleteSlideRequest(BaseModel):
     feed_id: int
     slide_id: int   
 
+class FeedMeta(BaseModel):
+    title: str
+    original_title: str
+    author: str
+    source_url: str
+    source_type: str
+
+    class Config:
+        from_attributes = True
+
+
 class PublishFeedRequest(BaseModel):
     feed_id: int
     admin_id: int   # <-- NEW
@@ -281,6 +292,7 @@ class PublishedFeedResponse(BaseModel):
     feed_categories: List[str]
     slides_count: int
     slides: Optional[List[SlideResponse]] = None
+    meta: FeedMeta
     class Config:
         from_attributes = True
 
@@ -295,6 +307,7 @@ class PublishedFeedDetailResponse(BaseModel):
     # Complete feed details with slides
     feed: FeedDetailResponse
     blog_title: str
+    meta: FeedMeta
     
     class Config:
         from_attributes = True

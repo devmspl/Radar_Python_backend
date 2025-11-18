@@ -118,7 +118,81 @@ def format_feed_response(feed: Feed) -> FeedDetailResponse:
         updated_at=feed.updated_at,
         slides=[format_slide_response(slide) for slide in slides]
     )
+# Add this helper function to your publish_router.py
 
+def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, Any]:
+    """Extract metadata from feed for the meta field."""
+    try:
+        # Check if feed exists and has source_type
+        if not feed or not hasattr(feed, 'source_type'):
+            logger.warning("Feed is None or missing source_type attribute")
+            return {
+                "title": "Unknown",
+                "original_title": "Unknown", 
+                "author": "Unknown",
+                "source_url": "#",
+                "source_type": "unknown"
+            }
+        
+        if feed.source_type == "youtube":
+            # Get the actual YouTube video ID from the transcript
+            video_id = None
+            
+            if feed.transcript_id:
+                try:
+                    # Query the transcript to get the video_id
+                    from models import Transcript
+                    transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+                    
+                    if transcript and transcript.video_id:
+                        video_id = transcript.video_id
+                        logger.info(f"Found YouTube video_id: {video_id} for feed {feed.id}")
+                    else:
+                        logger.warning(f"No transcript or video_id found for transcript_id: {feed.transcript_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error fetching transcript for {feed.transcript_id}: {e}")
+            
+            # Validate video_id format (YouTube IDs are typically 11 characters)
+            if video_id and len(video_id) == 11:
+                source_url = f"https://www.youtube.com/watch?v={video_id}"
+                logger.info(f"Created valid YouTube URL: {source_url}")
+            else:
+                # If we can't get a valid video_id, use a placeholder
+                source_url = "#"
+                logger.warning(f"Invalid video_id format: {video_id}. Using placeholder.")
+            
+            return {
+                "title": feed.title if feed.title else "Unknown Title",
+                "original_title": feed.title if feed.title else "Unknown Title",
+                "author": "YouTube Creator",
+                "source_url": source_url,
+                "source_type": "youtube"
+            }
+        else:
+            # For blog sources with safe attribute access
+            blog_title = blog.title if blog else "Unknown"
+            blog_author = getattr(blog, 'author', 'Admin') if blog else 'Admin'
+            blog_url = getattr(blog, 'url', '#') if blog else '#'
+            
+            return {
+                "title": feed.title if feed.title else "Unknown Title",
+                "original_title": blog_title,
+                "author": blog_author,
+                "source_url": blog_url,
+                "source_type": "blog"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in get_feed_metadata: {e}")
+        # Return a safe fallback
+        return {
+            "title": "Error",
+            "original_title": "Error",
+            "author": "Unknown", 
+            "source_url": "#",
+            "source_type": "unknown"
+        }
 # ------------------ API Endpoints ------------------
 
 @router.post("/feed", response_model=PublishStatusResponse)
@@ -334,6 +408,9 @@ def get_published_feeds(
             # Count slides
             slides_count = len(slides_data)
             
+            # Get metadata - UPDATED: Pass db session as first parameter
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog if pf.feed else None)
+            
             response_data.append(PublishedFeedResponse(
                 id=pf.id,
                 feed_id=pf.feed_id,
@@ -345,7 +422,8 @@ def get_published_feeds(
                 blog_title=blog_title,
                 feed_categories=categories,
                 slides_count=slides_count,
-                slides=slides_data if slides_data else None
+                slides=slides_data if slides_data else None,
+                meta=meta_data
             ))
         
         return response_data
@@ -356,7 +434,6 @@ def get_published_feeds(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch published feeds"
         )
-
 # @router.get("/feed/{published_feed_id}", response_model=PublishedFeedDetailResponse)
 # def get_published_feed_by_id(
 #     published_feed_id: int,
@@ -404,18 +481,18 @@ def get_published_feeds(
 #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
 #             detail="Failed to fetch published feed"
 #         )
-
-@router.get("/feed/{published_feed_id}/slides", response_model=List[SlideResponse])
-def get_published_feed_slides(
+@router.get("/feed/{published_feed_id}/slides/with-metadata", response_model=Dict[str, Any])
+def get_published_feed_slides_with_metadata(
     published_feed_id: int,
     db: Session = Depends(get_db)
 ):
     """
-    Get only the slides for a specific published feed.
+    Get slides for a specific published feed with comprehensive metadata.
     """
     try:
         published_feed = db.query(PublishedFeed).options(
-            joinedload(PublishedFeed.feed).joinedload(Feed.slides)
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
         ).filter(PublishedFeed.id == published_feed_id).first()
         
         if not published_feed:
@@ -424,20 +501,36 @@ def get_published_feed_slides(
                 detail=f"Published feed with ID {published_feed_id} not found"
             )
         
+        # Check if feed exists and has the necessary attributes
         if not published_feed.feed:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Associated feed not found for published feed ID {published_feed_id}"
             )
         
-        slides = sorted(published_feed.feed.slides, key=lambda x: x.order) if published_feed.feed.slides else []
+        # Safely get feed attributes
+        feed = published_feed.feed
+        feed_title = feed.title if feed else "Unknown Feed"
         
-        return [format_slide_response(slide) for slide in slides]
+        # Process slides
+        slides = sorted(feed.slides, key=lambda x: x.order) if feed.slides else []
+        formatted_slides = [format_slide_response(slide) for slide in slides]
+        
+        # Get metadata with safe access
+        meta_data = get_feed_metadata(db, feed, feed.blog if feed else None)
+        
+        return {
+            "published_feed_id": published_feed_id,
+            "feed_id": feed.id,
+            "feed_title": feed_title,
+            "slides": formatted_slides,
+            "meta": meta_data
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching slides for published feed {published_feed_id}: {e}")
+        logger.error(f"Error fetching slides with metadata for published feed {published_feed_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch slides"
@@ -574,3 +667,29 @@ def unpublish_feed(
 #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
 #             detail="Failed to fetch publishing statistics"
 #         )
+@router.get("/debug/feed/{feed_id}/transcript-info")
+def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
+    """Debug endpoint to see transcript information for a feed."""
+    feed = db.query(Feed).filter(Feed.id == feed_id).first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+    
+    transcript_info = None
+    if feed.transcript_id:
+        from models import Transcript
+        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        if transcript:
+            transcript_info = {
+                "transcript_id": transcript.transcript_id,
+                "video_id": transcript.video_id,
+                "title": transcript.title,
+                "all_attributes": {column.name: getattr(transcript, column.name) for column in transcript.__table__.columns}
+            }
+    
+    return {
+        "feed_id": feed.id,
+        "feed_title": feed.title,
+        "transcript_id": feed.transcript_id,
+        "source_type": feed.source_type,
+        "transcript_info": transcript_info
+    }
