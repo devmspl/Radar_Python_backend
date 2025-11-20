@@ -531,3 +531,44 @@ class QuestionnaireResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+# Bookmark Schemas
+class BookmarkBase(BaseModel):
+    feed_id: int
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+class BookmarkCreate(BookmarkBase):
+    pass
+
+class BookmarkUpdate(BaseModel):
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+class BookmarkResponse(BaseModel):
+    id: int
+    user_id: int
+    feed_id: int
+    notes: Optional[str]
+    tags: Optional[List[str]]
+    created_at: datetime
+    updated_at: datetime
+    
+    # Feed information
+    feed: Dict[str, Any]
+    
+    class Config:
+        from_attributes = True
+
+class BookmarkListResponse(BaseModel):
+    items: List[BookmarkResponse]
+    total: int
+    page: int
+    limit: int
+    has_more: bool
+
+class BookmarkCreateResponse(BaseModel):
+    message: str
+    bookmark_id: int
+    feed_id: int
+    user_id: int

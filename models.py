@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey, ARRAY, JSON, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey, ARRAY, JSON, Enum, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 import uuid
@@ -42,6 +42,8 @@ class User(Base):
     quiz_scores = relationship("UserQuizScore", back_populates="user")
      # Relationship to onboarding data
     onboarding_data = relationship("UserOnboarding", back_populates="user", uselist=False)
+    # Add this relationship
+    bookmarks = relationship("Bookmark", back_populates="user")
 
 class UserOnboarding(Base):
     __tablename__ = "user_onboarding"
@@ -238,6 +240,8 @@ class Feed(Base):
     source_type = Column(String, default='blog')  # 'blog' or 'youtube'
     published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False)
     quizzes = relationship("Quiz", back_populates="feed")
+    # Add this relationship
+    bookmarks = relationship("Bookmark", back_populates="feed")
 
 class Slide(Base):
     __tablename__ = "slides"
@@ -372,3 +376,26 @@ class UserSourceFollow(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     source = relationship("Source")
+
+
+# Add this to your existing models
+class Bookmark(Base):
+    __tablename__ = "bookmarks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    feed_id = Column(Integer, ForeignKey("feeds.id"), nullable=False, index=True)
+    
+    # Additional metadata
+    notes = Column(Text, nullable=True)  # User can add personal notes
+    tags = Column(JSON, nullable=True)   # User-defined tags for organization
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User", back_populates="bookmarks")
+    feed = relationship("Feed", back_populates="bookmarks")
+    
+    # Unique constraint to prevent duplicate bookmarks
+    __table_args__ = (UniqueConstraint('user_id', 'feed_id', name='unique_user_feed_bookmark'),)

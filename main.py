@@ -20,6 +20,7 @@ from feed_router import router as feed_router
 from publish_router import router as publish_router
 from quiz_router import router as quiz_router
 from onboarding_router import router as onboarding_router
+from bookmark_router import bookmark_router as bookmark_router
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
@@ -500,6 +501,35 @@ async def delete_profile_photo_endpoint(
             detail=f"Error deleting profile photo: {str(e)}"
         )
 
+@auth_router.delete("/admin/users/{user_id}", status_code=status.HTTP_200_OK)
+async def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_admin)
+):
+    """
+    Delete any user by admin (except themselves)
+    """
+    # Cannot delete themselves
+    if current_user.id == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Admins cannot delete themselves"
+        )
+
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    db.delete(db_user)
+    db.commit()
+
+    return {"message": f"User with ID {user_id} has been deleted successfully"}
+
 
 # @auth_router.get("/users/me/profile", response_model=schemas.UserResponse)
 # async def get_user_profile(
@@ -523,6 +553,7 @@ app.include_router(scrapping_router)
 app.include_router(feed_router)
 app.include_router(publish_router)
 app.include_router(quiz_router)
+app.include_router(bookmark_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7878)
