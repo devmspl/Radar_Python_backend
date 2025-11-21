@@ -3,9 +3,12 @@ from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging
+import os
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from database import get_db
-from models import PublishedFeed, Feed, User, Blog, Slide
+from models import PublishedFeed, Feed, User, Blog, Slide, Transcript
 from schemas import (
     PublishFeedRequest, 
     PublishedFeedResponse, 
@@ -22,6 +25,20 @@ from schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/publish", tags=["Publish Management"])
+
+# Initialize YouTube API client
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+youtube_service = None
+
+if YOUTUBE_API_KEY:
+    try:
+        youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        logger.info("YouTube API client initialized successfully in publish router")
+    except Exception as e:
+        logger.error(f"Failed to initialize YouTube API client: {e}")
+        youtube_service = None
+else:
+    logger.warning("YOUTUBE_API_KEY not found in environment variables")
 
 # ------------------ Helper Functions ------------------
 
@@ -94,8 +111,6 @@ def format_slide_response(slide: Slide) -> SlideResponse:
         title=slide.title,
         body=slide.body,
         bullets=slide.bullets or [],
-        # background_image_url=slide.background_image_url,
-        # background_image_prompt=slide.background_image_prompt,
         background_color=slide.background_color,
         source_refs=slide.source_refs or [],
         render_markdown=bool(slide.render_markdown),
@@ -118,81 +133,208 @@ def format_feed_response(feed: Feed) -> FeedDetailResponse:
         updated_at=feed.updated_at,
         slides=[format_slide_response(slide) for slide in slides]
     )
-# Add this helper function to your publish_router.py
 
-def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, Any]:
-    """Extract metadata from feed for the meta field."""
+def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
+    """Get comprehensive channel information from YouTube API."""
+    if not youtube_service or not video_id:
+        return {
+            "channel_name": "YouTube Creator", 
+            "channel_id": None,
+            "thumbnails": {}
+        }
+    
     try:
-        # Check if feed exists and has source_type
-        if not feed or not hasattr(feed, 'source_type'):
-            logger.warning("Feed is None or missing source_type attribute")
+        # First, get video details to extract channel ID
+        video_response = youtube_service.videos().list(
+            part="snippet",
+            id=video_id
+        ).execute()
+        
+        if not video_response.get('items'):
+            logger.warning(f"No video found for ID: {video_id}")
             return {
-                "title": "Unknown",
-                "original_title": "Unknown", 
-                "author": "Unknown",
-                "source_url": "#",
-                "source_type": "unknown"
+                "channel_name": "YouTube Creator",
+                "channel_id": None,
+                "thumbnails": {}
             }
         
-        if feed.source_type == "youtube":
-            # Get the actual YouTube video ID from the transcript
-            video_id = None
-            
-            if feed.transcript_id:
-                try:
-                    # Query the transcript to get the video_id
-                    from models import Transcript
-                    transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
-                    
-                    if transcript and transcript.video_id:
-                        video_id = transcript.video_id
-                        logger.info(f"Found YouTube video_id: {video_id} for feed {feed.id}")
-                    else:
-                        logger.warning(f"No transcript or video_id found for transcript_id: {feed.transcript_id}")
-                        
-                except Exception as e:
-                    logger.error(f"Error fetching transcript for {feed.transcript_id}: {e}")
-            
-            # Validate video_id format (YouTube IDs are typically 11 characters)
-            if video_id and len(video_id) == 11:
-                source_url = f"https://www.youtube.com/watch?v={video_id}"
-                logger.info(f"Created valid YouTube URL: {source_url}")
-            else:
-                # If we can't get a valid video_id, use a placeholder
-                source_url = "#"
-                logger.warning(f"Invalid video_id format: {video_id}. Using placeholder.")
+        video_snippet = video_response['items'][0]['snippet']
+        channel_id = video_snippet.get('channelId')
+        channel_title = video_snippet.get('channelTitle', 'YouTube Creator')
+        
+        if not channel_id:
+            return {
+                "channel_name": channel_title,
+                "channel_id": None,
+                "thumbnails": {}
+            }
+        
+        # Get detailed channel information
+        channel_response = youtube_service.channels().list(
+            part="snippet,statistics",
+            id=channel_id
+        ).execute()
+        
+        if channel_response.get('items'):
+            channel_snippet = channel_response['items'][0]['snippet']
+            channel_stats = channel_response['items'][0].get('statistics', {})
             
             return {
-                "title": feed.title if feed.title else "Unknown Title",
-                "original_title": feed.title if feed.title else "Unknown Title",
-                "author": "YouTube Creator",
+                "channel_name": channel_snippet.get('title', channel_title),
+                "channel_id": channel_id,
+                "description": channel_snippet.get('description', ''),
+                "custom_url": channel_snippet.get('customUrl', ''),
+                "published_at": channel_snippet.get('publishedAt', ''),
+                "thumbnails": channel_snippet.get('thumbnails', {}),
+                "subscriber_count": channel_stats.get('subscriberCount'),
+                "video_count": channel_stats.get('videoCount'),
+                "view_count": channel_stats.get('viewCount')
+            }
+        
+        return {
+            "channel_name": channel_title,
+            "channel_id": channel_id,
+            "thumbnails": {}
+        }
+        
+    except HttpError as e:
+        logger.error(f"YouTube API error for video {video_id}: {e}")
+        return {
+            "channel_name": "YouTube Creator",
+            "channel_id": None,
+            "thumbnails": {}
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error fetching YouTube channel info for {video_id}: {e}")
+        return {
+            "channel_name": "YouTube Creator", 
+            "channel_id": None,
+            "thumbnails": {}
+        }
+
+def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, Any]:
+    """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
+    if feed.source_type == "youtube":
+        # Get the transcript to access YouTube-specific data
+        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        
+        if transcript:
+            # Extract video ID from transcript data
+            video_id = getattr(transcript, 'video_id', None)
+            if not video_id:
+                # Try to extract from transcript_id or other fields
+                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
+            
+            # Get original title from transcript
+            original_title = transcript.title if transcript else feed.title
+            
+            # Get channel information from YouTube API
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            # Construct proper YouTube URL
+            source_url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            return {
+                "title": feed.title,
+                "original_title": original_title,
+                "author": channel_name,
                 "source_url": source_url,
-                "source_type": "youtube"
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                # "channel_info": channel_info,  # Include full channel info for frontend
+                # Enhanced fields
+                "website_name": "YouTube",
+                "favicon": "https://www.youtube.com/favicon.ico",
+                "channel_logo": channel_info.get("thumbnails", {}).get('default', {}).get('url') if channel_info.get("thumbnails") else None,
+                "channel_description": channel_info.get("description", ""),
+                "channel_custom_url": channel_info.get("custom_url", ""),
+                "subscriber_count": channel_info.get("subscriber_count"),
+                "video_count": channel_info.get("video_count"),
+                "view_count": channel_info.get("view_count"),
+                "published_at": channel_info.get("published_at")
             }
         else:
-            # For blog sources with safe attribute access
-            blog_title = blog.title if blog else "Unknown"
-            blog_author = getattr(blog, 'author', 'Admin') if blog else 'Admin'
-            blog_url = getattr(blog, 'url', '#') if blog else '#'
+            # Fallback if transcript not found
+            video_id = feed.transcript_id
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
             
             return {
-                "title": feed.title if feed.title else "Unknown Title",
-                "original_title": blog_title,
-                "author": blog_author,
-                "source_url": blog_url,
-                "source_type": "blog"
+                "title": feed.title,
+                "original_title": feed.title,
+                "author": channel_name,
+                "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info,
+                # Enhanced fields
+                "website_name": "YouTube",
+                "favicon": "https://www.youtube.com/favicon.ico",
+                "channel_logo": channel_info.get("thumbnails", {}).get('default', {}).get('url') if channel_info.get("thumbnails") else None,
+                "channel_description": channel_info.get("description", ""),
+                "channel_custom_url": channel_info.get("custom_url", ""),
+                "subscriber_count": channel_info.get("subscriber_count"),
+                "video_count": channel_info.get("video_count"),
+                "view_count": channel_info.get("view_count"),
+                "published_at": channel_info.get("published_at")
             }
+    
+    else:  # blog source type
+        blog = feed.blog
+        if blog:
+            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+            author = getattr(blog, 'author', 'Admin') or 'Admin'
             
-    except Exception as e:
-        logger.error(f"Error in get_feed_metadata: {e}")
-        # Return a safe fallback
-        return {
-            "title": "Error",
-            "original_title": "Error",
-            "author": "Unknown", 
-            "source_url": "#",
-            "source_type": "unknown"
-        }
+            return {
+                "title": feed.title,
+                "original_title": blog.title,
+                "author": author,
+                "source_url": blog.url,
+                "source_type": "blog",
+                "website_name": website_name,
+                "website": blog.website,
+                # Enhanced fields
+                "favicon": f"https://{website_name}/favicon.ico",
+                "channel_name": website_name,
+                "channel_logo": f"https://{website_name}/favicon.ico",
+                "channel_description": "",
+                "channel_custom_url": "",
+                "subscriber_count": None,
+                "video_count": None,
+                "view_count": None,
+                "published_at": getattr(blog, 'published_at', None),
+                "video_id": None,
+                "channel_id": None
+            }
+        else:
+            # Fallback if blog not found
+            return {
+                "title": feed.title,
+                "original_title": "Unknown",
+                "author": "Admin",
+                "source_url": "#",
+                "source_type": "blog",
+                "website_name": "Unknown",
+                "website": "Unknown",
+                # Enhanced fields
+                "favicon": None,
+                "channel_name": "Unknown",
+                "channel_logo": None,
+                "channel_description": "",
+                "channel_custom_url": "",
+                "subscriber_count": None,
+                "video_count": None,
+                "view_count": None,
+                "published_at": None,
+                "video_id": None,
+                "channel_id": None
+            }
+
 # ------------------ API Endpoints ------------------
 
 @router.post("/feed", response_model=PublishStatusResponse)
@@ -372,7 +514,7 @@ def get_published_feeds(
     db: Session = Depends(get_db)
 ):
     """
-    Get all published feeds with slides included.
+    Get all published feeds with slides included and enhanced metadata.
     """
     try:
         # Query with proper joins to load all related data
@@ -394,13 +536,16 @@ def get_published_feeds(
         response_data = []
         for pf in published_feeds:
             # Safely get feed data
-            feed_title = pf.feed.title if pf.feed else "Unknown Feed"
-            blog_title = pf.feed.blog.title if pf.feed and pf.feed.blog else None
-            categories = pf.feed.categories if pf.feed else []
+            if not pf.feed:
+                continue  # Skip if no feed associated
+                
+            feed_title = pf.feed.title
+            blog_title = pf.feed.blog.title if pf.feed.blog else None
+            categories = pf.feed.categories or []
             
             # Process slides
             slides_data = []
-            if pf.feed and pf.feed.slides:
+            if pf.feed.slides:
                 # Sort slides by order and format them
                 sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
                 slides_data = [format_slide_response(slide) for slide in sorted_slides]
@@ -408,8 +553,8 @@ def get_published_feeds(
             # Count slides
             slides_count = len(slides_data)
             
-            # Get metadata - UPDATED: Pass db session as first parameter
-            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog if pf.feed else None)
+            # Get enhanced metadata with channel info, logos, and website data
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
             
             response_data.append(PublishedFeedResponse(
                 id=pf.id,
@@ -434,53 +579,7 @@ def get_published_feeds(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch published feeds"
         )
-# @router.get("/feed/{published_feed_id}", response_model=PublishedFeedDetailResponse)
-# def get_published_feed_by_id(
-#     published_feed_id: int,
-#     db: Session = Depends(get_db)
-# ):
-#     """
-#     Get specific published feed by its published ID with complete feed data including slides.
-#     """
-#     try:
-#         published_feed = db.query(PublishedFeed).options(
-#             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-#             joinedload(PublishedFeed.feed).joinedload(Feed.blog)
-#         ).filter(PublishedFeed.id == published_feed_id).first()
-        
-#         if not published_feed:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail=f"Published feed with ID {published_feed_id} not found"
-#             )
-        
-#         if not published_feed.feed:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail=f"Associated feed not found for published feed ID {published_feed_id}"
-#             )
-        
-#         blog_title = published_feed.feed.blog.title if published_feed.feed.blog else "Unknown Blog"
-        
-#         return PublishedFeedDetailResponse(
-#             id=published_feed.id,
-#             feed_id=published_feed.feed_id,
-#             admin_id=published_feed.admin_id,
-#             admin_name=published_feed.admin_name,
-#             published_at=published_feed.published_at,
-#             is_active=published_feed.is_active,
-#             feed=format_feed_response(published_feed.feed),
-#             blog_title=blog_title
-#         )
-        
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"Error fetching published feed {published_feed_id}: {e}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to fetch published feed"
-#         )
+
 @router.get("/feed/{published_feed_id}/slides/with-metadata", response_model=Dict[str, Any])
 def get_published_feed_slides_with_metadata(
     published_feed_id: int,
@@ -516,7 +615,7 @@ def get_published_feed_slides_with_metadata(
         slides = sorted(feed.slides, key=lambda x: x.order) if feed.slides else []
         formatted_slides = [format_slide_response(slide) for slide in slides]
         
-        # Get metadata with safe access
+        # Get metadata with enhanced information
         meta_data = get_feed_metadata(db, feed, feed.blog if feed else None)
         
         return {
@@ -592,81 +691,6 @@ def unpublish_feed(
             detail="Failed to unpublish feed"
         )
 
-# @router.get("/feed/{feed_id}/status", response_model=dict)
-# def get_feed_publish_status(
-#     feed_id: int,
-#     db: Session = Depends(get_db)
-# ):
-#     """
-#     Check if a feed is published and get its publish status.
-#     """
-#     try:
-#         published_feed = db.query(PublishedFeed).options(
-#             joinedload(PublishedFeed.feed)
-#         ).filter(PublishedFeed.feed_id == feed_id).first()
-        
-#         if not published_feed:
-#             return {
-#                 "is_published": False,
-#                 "feed_id": feed_id,
-#                 "message": "Feed is not published"
-#             }
-        
-#         return {
-#             "is_published": published_feed.is_active,
-#             "feed_id": feed_id,
-#             "published_feed_id": published_feed.id,
-#             "admin_id": published_feed.admin_id,
-#             "admin_name": published_feed.admin_name,
-#             "published_at": published_feed.published_at,
-#             "is_active": published_feed.is_active
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Error checking publish status for feed {feed_id}: {e}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to check publish status"
-#         )
-
-# @router.get("/stats", response_model=dict)
-# def get_publishing_stats(db: Session = Depends(get_db)):
-#     """
-#     Get statistics about published feeds.
-#     """
-#     try:
-#         from sqlalchemy import func
-        
-#         total_published = db.query(PublishedFeed).count()
-#         active_published = db.query(PublishedFeed).filter(PublishedFeed.is_active == True).count()
-#         inactive_published = db.query(PublishedFeed).filter(PublishedFeed.is_active == False).count()
-        
-#         # Count by admin
-#         admin_stats = db.query(
-#             PublishedFeed.admin_id,
-#             PublishedFeed.admin_name,
-#             func.count(PublishedFeed.id).label('feed_count')
-#         ).group_by(PublishedFeed.admin_id, PublishedFeed.admin_name).all()
-        
-#         return {
-#             "total_published": total_published,
-#             "active_published": active_published,
-#             "inactive_published": inactive_published,
-#             "admin_stats": [
-#                 {
-#                     "admin_id": stat.admin_id,
-#                     "admin_name": stat.admin_name,
-#                     "feed_count": stat.feed_count
-#                 } for stat in admin_stats
-#             ]
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Error fetching publishing stats: {e}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to fetch publishing statistics"
-#         )
 @router.get("/debug/feed/{feed_id}/transcript-info")
 def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
     """Debug endpoint to see transcript information for a feed."""
@@ -676,7 +700,6 @@ def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
     
     transcript_info = None
     if feed.transcript_id:
-        from models import Transcript
         transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
         if transcript:
             transcript_info = {

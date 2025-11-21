@@ -292,7 +292,7 @@ class PublishedFeedResponse(BaseModel):
     feed_categories: List[str]
     slides_count: int
     slides: Optional[List[SlideResponse]] = None
-    meta: FeedMeta
+    meta: Dict[str, Any]
     class Config:
         from_attributes = True
 
@@ -307,7 +307,7 @@ class PublishedFeedDetailResponse(BaseModel):
     # Complete feed details with slides
     feed: FeedDetailResponse
     blog_title: str
-    meta: FeedMeta
+    meta: Dict[str, Any]
     
     class Config:
         from_attributes = True
