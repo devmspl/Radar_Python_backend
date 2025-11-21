@@ -223,7 +223,7 @@ class Blog(BlogBase):
     id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class BlogListResponse(BaseModel):
     blogs: List[Blog]

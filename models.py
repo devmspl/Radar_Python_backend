@@ -238,7 +238,7 @@ class Feed(Base):
     slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
     transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)  # Link to YouTube transcripts
     source_type = Column(String, default='blog')  # 'blog' or 'youtube'
-    published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False)
+    published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False,overlaps="published_feed")
     quizzes = relationship("Quiz", back_populates="feed")
     # Add this relationship
     bookmarks = relationship("Bookmark", back_populates="feed")
