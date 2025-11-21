@@ -14,12 +14,30 @@ from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
 from sqlalchemy import or_, String
 router = APIRouter(prefix="/get", tags=["Feeds"])
 from models import Topic,Source
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Add YouTube API client initialization
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+youtube_service = None
+
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+if YOUTUBE_API_KEY:
+    try:
+        youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        logger.info("YouTube API client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize YouTube API client: {e}")
+        youtube_service = None
+else:
+    logger.warning("YOUTUBE_API_KEY not found in environment variables")
+
 
 # ------------------ AI Categorization Function ------------------
 
@@ -573,6 +591,138 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
         logger.error(f"Error creating/updating AI-generated feed for transcript {transcript.transcript_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create feed for transcript: {str(e)}")
 
+
+def get_youtube_channel_info(video_id: str) -> Dict[str, str]:
+    """Get channel information from YouTube API using video ID."""
+    if not youtube_service or not video_id:
+        return {"channel_name": "YouTube Creator", "channel_id": None}
+    
+    try:
+        # First, get video details to extract channel ID
+        video_response = youtube_service.videos().list(
+            part="snippet",
+            id=video_id
+        ).execute()
+        
+        if not video_response.get('items'):
+            logger.warning(f"No video found for ID: {video_id}")
+            return {"channel_name": "YouTube Creator", "channel_id": None}
+        
+        video_snippet = video_response['items'][0]['snippet']
+        channel_id = video_snippet.get('channelId')
+        channel_title = video_snippet.get('channelTitle', 'YouTube Creator')
+        
+        if channel_id:
+            # Get detailed channel information
+            channel_response = youtube_service.channels().list(
+                part="snippet,statistics",
+                id=channel_id
+            ).execute()
+            
+            if channel_response.get('items'):
+                channel_snippet = channel_response['items'][0]['snippet']
+                channel_title = channel_snippet.get('title', channel_title)
+                
+                logger.info(f"Retrieved channel info: {channel_title} for video {video_id}")
+                return {
+                    "channel_name": channel_title,
+                    "channel_id": channel_id,
+                    "description": channel_snippet.get('description', ''),
+                    "custom_url": channel_snippet.get('customUrl', ''),
+                    "published_at": channel_snippet.get('publishedAt', ''),
+                    "thumbnails": channel_snippet.get('thumbnails', {})
+                }
+        
+        return {
+            "channel_name": channel_title,
+            "channel_id": channel_id
+        }
+        
+    except HttpError as e:
+        logger.error(f"YouTube API error for video {video_id}: {e}")
+        return {"channel_name": "YouTube Creator", "channel_id": None}
+    except Exception as e:
+        logger.error(f"Unexpected error fetching YouTube channel info for {video_id}: {e}")
+        return {"channel_name": "YouTube Creator", "channel_id": None}
+
+def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
+    """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
+    if feed.source_type == "youtube":
+        # Get the transcript to access YouTube-specific data
+        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        
+        if transcript:
+            # Extract video ID from transcript data
+            video_id = getattr(transcript, 'video_id', None)
+            if not video_id:
+                # Try to extract from transcript_id or other fields
+                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
+            
+            # Get original title from transcript
+            original_title = transcript.title if transcript else feed.title
+            
+            # Get channel information from YouTube API
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            # Construct proper YouTube URL
+            source_url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            return {
+                "title": feed.title,
+                "original_title": original_title,
+                "author": channel_name,
+                "source_url": source_url,
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info  # Include full channel info for frontend
+            }
+        else:
+            # Fallback if transcript not found
+            video_id = feed.transcript_id
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            return {
+                "title": feed.title,
+                "original_title": feed.title,
+                "author": channel_name,
+                "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info
+            }
+    
+    else:  # blog source type
+        blog = feed.blog
+        if blog:
+            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+            author = getattr(blog, 'author', 'Admin') or 'Admin'
+            
+            return {
+                "title": feed.title,
+                "original_title": blog.title,
+                "author": author,
+                "source_url": blog.url,
+                "source_type": "blog",
+                "website_name": website_name,
+                "website": blog.website
+            }
+        else:
+            # Fallback if blog not found
+            return {
+                "title": feed.title,
+                "original_title": "Unknown",
+                "author": "Admin",
+                "source_url": "#",
+                "source_type": "blog",
+                "website_name": "Unknown",
+                "website": "Unknown"
+            }
 # ... (rest of the code remains the same for API endpoints)
 # ------------------ Background Processing Functions ------------------
 
@@ -745,7 +895,7 @@ def auto_generate_transcript_feed(db: Session, transcript_id: int):
     
 # ------------------ API Endpoints ------------------
 
-@router.get("/feeds/all", response_model=dict)
+@router.get("/all", response_model=dict)
 def get_all_feeds(
     response: Response, 
     page: int = 1, 
@@ -753,7 +903,7 @@ def get_all_feeds(
     category: Optional[str] = None,
     status: Optional[str] = None,
     source_type: Optional[str] = None,
-    is_published: Optional[bool] = None,  # New filter parameter
+    is_published: Optional[bool] = None,
     db: Session = Depends(get_db)
 ):
     """Get all feeds summary with filtering options including is_published."""
@@ -767,9 +917,9 @@ def get_all_feeds(
         query = query.filter(Feed.source_type == source_type)
     if is_published is not None:
         if is_published:
-            query = query.filter(Feed.published_feed != None)  # Has published_feed relationship
+            query = query.filter(Feed.published_feed != None)
         else:
-            query = query.filter(Feed.published_feed == None)  # No published_feed relationship
+            query = query.filter(Feed.published_feed == None)
     
     query = query.order_by(Feed.created_at.desc())
     total = query.count()
@@ -780,23 +930,8 @@ def get_all_feeds(
         # Determine is_published status
         is_published_status = f.published_feed is not None
         
-        # Determine source metadata based on source_type
-        if f.source_type == "youtube":
-            meta = {
-                "title": f.title,
-                "original_title": f.title,
-                "author": "YouTube Creator",
-                "source_url": f"https://www.youtube.com/watch?v={f.transcript_id}" if f.transcript_id else "#",
-                "source_type": "youtube"
-            }
-        else:
-            meta = {
-                "title": f.title,
-                "original_title": f.blog.title if f.blog else "Unknown",
-                "author": getattr(f.blog, 'author', 'Admin'),
-                "source_url": getattr(f.blog, 'url', '#'),
-                "source_type": "blog"
-            }
+        # Get proper metadata
+        meta = get_feed_metadata(f, db)
 
         items.append({
             "id": f.id,
@@ -806,7 +941,7 @@ def get_all_feeds(
             "categories": f.categories,
             "status": f.status,
             "source_type": f.source_type or "blog",
-            "is_published": is_published_status,  # New field
+            "is_published": is_published_status,
             "published_at": f.published_feed.published_at.isoformat() if is_published_status else None,
             "slides_count": len(f.slides),
             "meta": meta,
@@ -834,13 +969,13 @@ def get_all_feeds(
             "is_published": is_published
         }
     }
-@router.get("/feeds/{feed_id}", response_model=dict)
+@router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     """Get full AI-generated feed with slides and is_published status."""
     feed = db.query(Feed).options(
         joinedload(Feed.blog), 
         joinedload(Feed.slides),
-        joinedload(Feed.published_feed)  # Eager load published_feed relationship
+        joinedload(Feed.published_feed)
     ).filter(Feed.id == feed_id).first()
     
     if not feed:
@@ -851,23 +986,8 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     # Determine if the feed is published
     is_published = feed.published_feed is not None
     
-    # Determine source metadata based on source_type
-    if feed.source_type == "youtube":
-        meta = {
-            "title": feed.title,
-            "original_title": feed.title,
-            "author": "YouTube Creator",
-            "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
-            "source_type": "youtube"
-        }
-    else:
-        meta = {
-            "title": feed.title,
-            "original_title": feed.blog.title if feed.blog else "Unknown",
-            "author": getattr(feed.blog, 'author', 'Admin'),
-            "source_url": getattr(feed.blog, 'url', '#'),
-            "source_type": "blog"
-        }
+    # Get proper metadata
+    meta = get_feed_metadata(feed, db)
     
     return {
         "id": feed.id,
@@ -878,7 +998,7 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "status": feed.status,
         "source_type": feed.source_type or "blog",
         "ai_generated_content": ai_content,
-        "is_published": is_published,  # New field
+        "is_published": is_published,
         "published_at": feed.published_feed.published_at.isoformat() if is_published else None,
         "meta": meta,
         "slides": sorted([
@@ -1034,7 +1154,7 @@ def delete_slide_from_feed(
         logger.error(f"Error deleting slide {slide_id} from feed {feed_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete slide")
 
-@router.get("/feeds/source/{website}/categorized", response_model=dict)
+@router.get("/source/{website}/categorized", response_model=dict)
 def get_categorized_feeds_by_source(
     website: str,
     response: Response, 
@@ -1074,6 +1194,9 @@ def get_categorized_feeds_by_source(
     for f in feeds:
         # Additional validation to ensure meaningful categories
         if f.categories and (not exclude_uncategorized or "Uncategorized" not in f.categories):
+            # Get proper metadata
+            meta = get_feed_metadata(f, db)
+            
             items.append({
                 "id": f.id,
                 "blog_id": f.blog_id,
@@ -1081,17 +1204,11 @@ def get_categorized_feeds_by_source(
                 "categories": f.categories,
                 "status": f.status,
                 "slides_count": len(f.slides),
-                "meta": {
-                    "title": f.title,
-                    "original_title": f.blog.title if f.blog else "Unknown",
-                    "author": getattr(f.blog, 'author', 'Admin'),
-                    "source_url": getattr(f.blog, 'url', '#'),
-                    "website": website
-                },
+                "meta": meta,
                 "created_at": f.created_at.isoformat() if f.created_at else None,
                 "updated_at": f.updated_at.isoformat() if f.updated_at else None,
                 "ai_generated": hasattr(f, 'ai_generated_content') and f.ai_generated_content is not None,
-                "images_generated": False  # Always false now
+                "images_generated": False
             })
 
     has_more = (page * limit) < total
@@ -1114,721 +1231,721 @@ def get_categorized_feeds_by_source(
 
 # ------------------ Search & Topic Management ------------------
 
-@router.get("/search", response_model=dict)
-def search_feeds_and_topics(
-    query: str,
-    page: int = 1,
-    limit: int = 20,
-    search_type: str = "all",  # all, topics, feeds, sources
-    user_id: Optional[int] = None,
-    auto_create: bool = True,  # Auto-create topics/sources if none exist
-    db: Session = Depends(get_db)
-):
-    """Search across feeds, topics, and sources."""
-    if not query or len(query.strip()) < 2:
-        raise HTTPException(status_code=400, detail="Query must be at least 2 characters long")
+# @router.get("/search", response_model=dict)
+# def search_feeds_and_topics(
+#     query: str,
+#     page: int = 1,
+#     limit: int = 20,
+#     search_type: str = "all",  # all, topics, feeds, sources
+#     user_id: Optional[int] = None,
+#     auto_create: bool = True,  # Auto-create topics/sources if none exist
+#     db: Session = Depends(get_db)
+# ):
+#     """Search across feeds, topics, and sources."""
+#     if not query or len(query.strip()) < 2:
+#         raise HTTPException(status_code=400, detail="Query must be at least 2 characters long")
     
-    # Auto-create topics and sources if none exist and flag is enabled
-    if auto_create:
-        auto_create_topics_from_feeds(db)
-        auto_create_sources_from_feeds(db)
+#     # Auto-create topics and sources if none exist and flag is enabled
+#     if auto_create:
+#         auto_create_topics_from_feeds(db)
+#         auto_create_sources_from_feeds(db)
     
-    search_query = f"%{query.strip().lower()}%"
-    results = {
-        "query": query,
-        "page": page,
-        "limit": limit,
-        "search_type": search_type
-    }
+#     search_query = f"%{query.strip().lower()}%"
+#     results = {
+#         "query": query,
+#         "page": page,
+#         "limit": limit,
+#         "search_type": search_type
+#     }
     
-    # Search topics - improved search
-    if search_type in ["all", "topics"]:
-        topics_query = db.query(Topic).filter(
-            Topic.is_active == True,
-            or_(
-                Topic.name.ilike(search_query),
-                Topic.description.ilike(search_query)
-            )
-        )
+#     # Search topics - improved search
+#     if search_type in ["all", "topics"]:
+#         topics_query = db.query(Topic).filter(
+#             Topic.is_active == True,
+#             or_(
+#                 Topic.name.ilike(search_query),
+#                 Topic.description.ilike(search_query)
+#             )
+#         )
         
-        total_topics = topics_query.count()
+#         total_topics = topics_query.count()
         
-        # If no topics found, try to find relevant categories from feeds
-        if total_topics == 0 and search_type in ["all", "topics"]:
-            # Search for categories in feeds that match the query
-            matching_feeds = db.query(Feed).filter(
-                Feed.status == "ready",
-                Feed.categories.isnot(None),
-                or_(
-                    Feed.categories.cast(String).ilike(search_query),
-                    Feed.title.ilike(search_query)
-                )
-            ).all()
+#         # If no topics found, try to find relevant categories from feeds
+#         if total_topics == 0 and search_type in ["all", "topics"]:
+#             # Search for categories in feeds that match the query
+#             matching_feeds = db.query(Feed).filter(
+#                 Feed.status == "ready",
+#                 Feed.categories.isnot(None),
+#                 or_(
+#                     Feed.categories.cast(String).ilike(search_query),
+#                     Feed.title.ilike(search_query)
+#                 )
+#             ).all()
             
-            # Extract unique categories from matching feeds
-            relevant_categories = set()
-            for feed in matching_feeds:
-                if feed.categories:
-                    for category in feed.categories:
-                        if query.lower() in category.lower():
-                            relevant_categories.add(category)
+#             # Extract unique categories from matching feeds
+#             relevant_categories = set()
+#             for feed in matching_feeds:
+#                 if feed.categories:
+#                     for category in feed.categories:
+#                         if query.lower() in category.lower():
+#                             relevant_categories.add(category)
             
-            # Create temporary topic results
-            topic_results = []
-            for category_name in list(relevant_categories)[:limit]:
-                feed_count = db.query(Feed).filter(
-                    Feed.categories.contains([category_name]),
-                    Feed.status == "ready"
-                ).count()
+#             # Create temporary topic results
+#             topic_results = []
+#             for category_name in list(relevant_categories)[:limit]:
+#                 feed_count = db.query(Feed).filter(
+#                     Feed.categories.contains([category_name]),
+#                     Feed.status == "ready"
+#                 ).count()
                 
-                # Check if user follows this topic (by name since it might not be in Topic table yet)
-                is_following = False
-                if user_id:
-                    topic_in_db = db.query(Topic).filter(Topic.name == category_name).first()
-                    if topic_in_db:
-                        is_following = db.query(UserTopicFollow).filter(
-                            UserTopicFollow.user_id == user_id,
-                            UserTopicFollow.topic_id == topic_in_db.id
-                        ).first() is not None
+#                 # Check if user follows this topic (by name since it might not be in Topic table yet)
+#                 is_following = False
+#                 if user_id:
+#                     topic_in_db = db.query(Topic).filter(Topic.name == category_name).first()
+#                     if topic_in_db:
+#                         is_following = db.query(UserTopicFollow).filter(
+#                             UserTopicFollow.user_id == user_id,
+#                             UserTopicFollow.topic_id == topic_in_db.id
+#                         ).first() is not None
                 
-                topic_results.append({
-                    "id": None,  # Not in Topic table yet
-                    "name": category_name,
-                    "description": f"Category from feeds: {category_name}",
-                    "feed_count": feed_count,
-                    "follower_count": 0,
-                    "is_following": is_following,
-                    "created_at": None,
-                    "is_auto_discovered": True  # Flag to indicate this came from feed categories
-                })
+#                 topic_results.append({
+#                     "id": None,  # Not in Topic table yet
+#                     "name": category_name,
+#                     "description": f"Category from feeds: {category_name}",
+#                     "feed_count": feed_count,
+#                     "follower_count": 0,
+#                     "is_following": is_following,
+#                     "created_at": None,
+#                     "is_auto_discovered": True  # Flag to indicate this came from feed categories
+#                 })
             
-            results["topics"] = {
-                "items": topic_results,
-                "total": len(topic_results),
-                "has_more": False,
-                "auto_discovered": True  # Indicate these are from feed categories
-            }
-        else:
-            # Use existing topics from database
-            topics = topics_query.offset((page - 1) * limit).limit(limit).all()
+#             results["topics"] = {
+#                 "items": topic_results,
+#                 "total": len(topic_results),
+#                 "has_more": False,
+#                 "auto_discovered": True  # Indicate these are from feed categories
+#             }
+#         else:
+#             # Use existing topics from database
+#             topics = topics_query.offset((page - 1) * limit).limit(limit).all()
             
-            topic_results = []
-            for topic in topics:
-                # Get feed count for this topic
-                feed_count = db.query(Feed).filter(
-                    Feed.categories.contains([topic.name]),
-                    Feed.status == "ready"
-                ).count()
+#             topic_results = []
+#             for topic in topics:
+#                 # Get feed count for this topic
+#                 feed_count = db.query(Feed).filter(
+#                     Feed.categories.contains([topic.name]),
+#                     Feed.status == "ready"
+#                 ).count()
                 
-                # Check if user follows this topic
-                is_following = False
-                if user_id:
-                    is_following = db.query(UserTopicFollow).filter(
-                        UserTopicFollow.user_id == user_id,
-                        UserTopicFollow.topic_id == topic.id
-                    ).first() is not None
+#                 # Check if user follows this topic
+#                 is_following = False
+#                 if user_id:
+#                     is_following = db.query(UserTopicFollow).filter(
+#                         UserTopicFollow.user_id == user_id,
+#                         UserTopicFollow.topic_id == topic.id
+#                     ).first() is not None
                 
-                topic_results.append({
-                    "id": topic.id,
-                    "name": topic.name,
-                    "description": topic.description,
-                    "feed_count": feed_count,
-                    "follower_count": topic.follower_count,
-                    "is_following": is_following,
-                    "created_at": topic.created_at.isoformat() if topic.created_at else None,
-                    "is_auto_discovered": False
-                })
+#                 topic_results.append({
+#                     "id": topic.id,
+#                     "name": topic.name,
+#                     "description": topic.description,
+#                     "feed_count": feed_count,
+#                     "follower_count": topic.follower_count,
+#                     "is_following": is_following,
+#                     "created_at": topic.created_at.isoformat() if topic.created_at else None,
+#                     "is_auto_discovered": False
+#                 })
             
-            results["topics"] = {
-                "items": topic_results,
-                "total": total_topics,
-                "has_more": (page * limit) < total_topics,
-                "auto_discovered": False
-            }
+#             results["topics"] = {
+#                 "items": topic_results,
+#                 "total": total_topics,
+#                 "has_more": (page * limit) < total_topics,
+#                 "auto_discovered": False
+#             }
     
-    # Search feeds - improved to find more results
-    if search_type in ["all", "feeds"]:
-        feeds_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
-            Feed.status == "ready",
-            or_(
-                Feed.title.ilike(search_query),
-                Feed.categories.cast(String).ilike(search_query),
-                Feed.ai_generated_content.cast(String).ilike(search_query),
-                Feed.source_type.ilike(search_query)
-            )
-        ).order_by(Feed.created_at.desc())
+#     # Search feeds - improved to find more results
+#     if search_type in ["all", "feeds"]:
+#         feeds_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
+#             Feed.status == "ready",
+#             or_(
+#                 Feed.title.ilike(search_query),
+#                 Feed.categories.cast(String).ilike(search_query),
+#                 Feed.ai_generated_content.cast(String).ilike(search_query),
+#                 Feed.source_type.ilike(search_query)
+#             )
+#         ).order_by(Feed.created_at.desc())
         
-        total_feeds = feeds_query.count()
-        feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
+#         total_feeds = feeds_query.count()
+#         feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
         
-        feed_results = []
-        for feed in feeds:
-            # Determine source metadata
-            if feed.source_type == "youtube":
-                meta = {
-                    "title": feed.title,
-                    "original_title": feed.title,
-                    "author": "YouTube Creator",
-                    "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
-                    "source_type": "youtube"
-                }
-            else:
-                meta = {
-                    "title": feed.title,
-                    "original_title": feed.blog.title if feed.blog else "Unknown",
-                    "author": getattr(feed.blog, 'author', 'Admin'),
-                    "source_url": getattr(feed.blog, 'url', '#'),
-                    "source_type": "blog"
-                }
+#         feed_results = []
+#         for feed in feeds:
+#             # Determine source metadata
+#             if feed.source_type == "youtube":
+#                 meta = {
+#                     "title": feed.title,
+#                     "original_title": feed.title,
+#                     "author": "YouTube Creator",
+#                     "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
+#                     "source_type": "youtube"
+#                 }
+#             else:
+#                 meta = {
+#                     "title": feed.title,
+#                     "original_title": feed.blog.title if feed.blog else "Unknown",
+#                     "author": getattr(feed.blog, 'author', 'Admin'),
+#                     "source_url": getattr(feed.blog, 'url', '#'),
+#                     "source_type": "blog"
+#                 }
             
-            feed_results.append({
-                "id": feed.id,
-                "title": feed.title,
-                "categories": feed.categories,
-                "source_type": feed.source_type,
-                "slides_count": len(feed.slides),
-                "meta": meta,
-                "created_at": feed.created_at.isoformat() if feed.created_at else None,
-                "ai_generated": bool(feed.ai_generated_content)
-            })
+#             feed_results.append({
+#                 "id": feed.id,
+#                 "title": feed.title,
+#                 "categories": feed.categories,
+#                 "source_type": feed.source_type,
+#                 "slides_count": len(feed.slides),
+#                 "meta": meta,
+#                 "created_at": feed.created_at.isoformat() if feed.created_at else None,
+#                 "ai_generated": bool(feed.ai_generated_content)
+#             })
         
-        results["feeds"] = {
-            "items": feed_results,
-            "total": total_feeds,
-            "has_more": (page * limit) < total_feeds
-        }
+#         results["feeds"] = {
+#             "items": feed_results,
+#             "total": total_feeds,
+#             "has_more": (page * limit) < total_feeds
+#         }
     
-    # Search sources
-    if search_type in ["all", "sources"]:
-        sources_query = db.query(Source).filter(
-            Source.is_active == True,
-            or_(
-                Source.name.ilike(search_query),
-                Source.website.ilike(search_query),
-                Source.source_type.ilike(search_query)
-            )
-        )
+#     # Search sources
+#     if search_type in ["all", "sources"]:
+#         sources_query = db.query(Source).filter(
+#             Source.is_active == True,
+#             or_(
+#                 Source.name.ilike(search_query),
+#                 Source.website.ilike(search_query),
+#                 Source.source_type.ilike(search_query)
+#             )
+#         )
         
-        total_sources = sources_query.count()
-        sources = sources_query.offset((page - 1) * limit).limit(limit).all()
+#         total_sources = sources_query.count()
+#         sources = sources_query.offset((page - 1) * limit).limit(limit).all()
         
-        source_results = []
-        for source in sources:
-            # Get feed count for this source
-            if source.source_type == "blog":
-                feed_count = db.query(Feed).join(Blog).filter(
-                    Blog.website == source.website,
-                    Feed.status == "ready"
-                ).count()
-            else:
-                feed_count = db.query(Feed).filter(
-                    Feed.source_type == "youtube",
-                    Feed.status == "ready"
-                ).count()
+#         source_results = []
+#         for source in sources:
+#             # Get feed count for this source
+#             if source.source_type == "blog":
+#                 feed_count = db.query(Feed).join(Blog).filter(
+#                     Blog.website == source.website,
+#                     Feed.status == "ready"
+#                 ).count()
+#             else:
+#                 feed_count = db.query(Feed).filter(
+#                     Feed.source_type == "youtube",
+#                     Feed.status == "ready"
+#                 ).count()
             
-            # Check if user follows this source
-            is_following = False
-            if user_id:
-                is_following = db.query(UserSourceFollow).filter(
-                    UserSourceFollow.user_id == user_id,
-                    UserSourceFollow.source_id == source.id
-                ).first() is not None
+#             # Check if user follows this source
+#             is_following = False
+#             if user_id:
+#                 is_following = db.query(UserSourceFollow).filter(
+#                     UserSourceFollow.user_id == user_id,
+#                     UserSourceFollow.source_id == source.id
+#                 ).first() is not None
             
-            source_results.append({
-                "id": source.id,
-                "name": source.name,
-                "website": source.website,
-                "source_type": source.source_type,
-                "feed_count": feed_count,
-                "follower_count": source.follower_count,
-                "is_following": is_following,
-                "created_at": source.created_at.isoformat() if source.created_at else None
-            })
+#             source_results.append({
+#                 "id": source.id,
+#                 "name": source.name,
+#                 "website": source.website,
+#                 "source_type": source.source_type,
+#                 "feed_count": feed_count,
+#                 "follower_count": source.follower_count,
+#                 "is_following": is_following,
+#                 "created_at": source.created_at.isoformat() if source.created_at else None
+#             })
         
-        results["sources"] = {
-            "items": source_results,
-            "total": total_sources,
-            "has_more": (page * limit) < total_sources
-        }
+#         results["sources"] = {
+#             "items": source_results,
+#             "total": total_sources,
+#             "has_more": (page * limit) < total_sources
+#         }
     
-    return results
+#     return results
 
-@router.get("/topics/popular", response_model=dict)
-def get_popular_topics(
-    page: int = 1,
-    limit: int = 20,
-    user_id: Optional[int] = None,
-    db: Session = Depends(get_db)
-):
-    """Get popular topics based on feed count and follower count."""
-    # Get all active topics
-    topics_query = db.query(Topic).filter(Topic.is_active == True)
+# @router.get("/topics/popular", response_model=dict)
+# def get_popular_topics(
+#     page: int = 1,
+#     limit: int = 20,
+#     user_id: Optional[int] = None,
+#     db: Session = Depends(get_db)
+# ):
+#     """Get popular topics based on feed count and follower count."""
+#     # Get all active topics
+#     topics_query = db.query(Topic).filter(Topic.is_active == True)
     
-    # Get topic statistics
-    topics_with_stats = []
-    for topic in topics_query.all():
-        feed_count = db.query(Feed).filter(
-            Feed.categories.contains([topic.name]),
-            Feed.status == "ready"
-        ).count()
+#     # Get topic statistics
+#     topics_with_stats = []
+#     for topic in topics_query.all():
+#         feed_count = db.query(Feed).filter(
+#             Feed.categories.contains([topic.name]),
+#             Feed.status == "ready"
+#         ).count()
         
-        # Only include topics with feeds
-        if feed_count > 0:
-            # Check if user follows this topic
-            is_following = False
-            if user_id:
-                is_following = db.query(UserTopicFollow).filter(
-                    UserTopicFollow.user_id == user_id,
-                    UserTopicFollow.topic_id == topic.id
-                ).first() is not None
+#         # Only include topics with feeds
+#         if feed_count > 0:
+#             # Check if user follows this topic
+#             is_following = False
+#             if user_id:
+#                 is_following = db.query(UserTopicFollow).filter(
+#                     UserTopicFollow.user_id == user_id,
+#                     UserTopicFollow.topic_id == topic.id
+#                 ).first() is not None
             
-            topics_with_stats.append({
-                "topic": topic,
-                "feed_count": feed_count,
-                "is_following": is_following
-            })
+#             topics_with_stats.append({
+#                 "topic": topic,
+#                 "feed_count": feed_count,
+#                 "is_following": is_following
+#             })
     
-    # Sort by feed count (popularity) and then by follower count
-    topics_with_stats.sort(key=lambda x: (x["feed_count"], x["topic"].follower_count), reverse=True)
+#     # Sort by feed count (popularity) and then by follower count
+#     topics_with_stats.sort(key=lambda x: (x["feed_count"], x["topic"].follower_count), reverse=True)
     
-    # Paginate
-    start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    paginated_topics = topics_with_stats[start_idx:end_idx]
+#     # Paginate
+#     start_idx = (page - 1) * limit
+#     end_idx = start_idx + limit
+#     paginated_topics = topics_with_stats[start_idx:end_idx]
     
-    # Format response
-    items = []
-    for item in paginated_topics:
-        topic = item["topic"]
-        items.append({
-            "id": topic.id,
-            "name": topic.name,
-            "description": topic.description,
-            "feed_count": item["feed_count"],
-            "follower_count": topic.follower_count,
-            "is_following": item["is_following"],
-            "created_at": topic.created_at.isoformat() if topic.created_at else None
-        })
+#     # Format response
+#     items = []
+#     for item in paginated_topics:
+#         topic = item["topic"]
+#         items.append({
+#             "id": topic.id,
+#             "name": topic.name,
+#             "description": topic.description,
+#             "feed_count": item["feed_count"],
+#             "follower_count": topic.follower_count,
+#             "is_following": item["is_following"],
+#             "created_at": topic.created_at.isoformat() if topic.created_at else None
+#         })
     
-    total = len(topics_with_stats)
-    has_more = (page * limit) < total
+#     total = len(topics_with_stats)
+#     has_more = (page * limit) < total
     
-    return {
-        "items": items,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": has_more
-    }
+#     return {
+#         "items": items,
+#         "page": page,
+#         "limit": limit,
+#         "total": total,
+#         "has_more": has_more
+#     }
 
-@router.post("/topics/{topic_name}/follow", response_model=dict)
-def follow_topic(
-    topic_name: str,
-    user_id: int,  # In real implementation, get from auth token
-    db: Session = Depends(get_db)
-):
-    """Follow a topic."""
-    # Find or create topic
-    topic = db.query(Topic).filter(Topic.name == topic_name).first()
-    if not topic:
-        # Create topic if it doesn't exist
-        topic = Topic(name=topic_name, description=f"Topic for {topic_name}")
-        db.add(topic)
-        db.flush()
+# @router.post("/topics/{topic_name}/follow", response_model=dict)
+# def follow_topic(
+#     topic_name: str,
+#     user_id: int,  # In real implementation, get from auth token
+#     db: Session = Depends(get_db)
+# ):
+#     """Follow a topic."""
+#     # Find or create topic
+#     topic = db.query(Topic).filter(Topic.name == topic_name).first()
+#     if not topic:
+#         # Create topic if it doesn't exist
+#         topic = Topic(name=topic_name, description=f"Topic for {topic_name}")
+#         db.add(topic)
+#         db.flush()
     
-    # Check if already following
-    existing_follow = db.query(UserTopicFollow).filter(
-        UserTopicFollow.user_id == user_id,
-        UserTopicFollow.topic_id == topic.id
-    ).first()
+#     # Check if already following
+#     existing_follow = db.query(UserTopicFollow).filter(
+#         UserTopicFollow.user_id == user_id,
+#         UserTopicFollow.topic_id == topic.id
+#     ).first()
     
-    if existing_follow:
-        raise HTTPException(status_code=400, detail="Already following this topic")
+#     if existing_follow:
+#         raise HTTPException(status_code=400, detail="Already following this topic")
     
-    # Create follow relationship
-    follow = UserTopicFollow(user_id=user_id, topic_id=topic.id)
-    db.add(follow)
+#     # Create follow relationship
+#     follow = UserTopicFollow(user_id=user_id, topic_id=topic.id)
+#     db.add(follow)
     
-    # Update follower count
-    topic.follower_count += 1
-    topic.updated_at = datetime.utcnow()
+#     # Update follower count
+#     topic.follower_count += 1
+#     topic.updated_at = datetime.utcnow()
     
-    db.commit()
+#     db.commit()
     
-    return {
-        "message": f"Started following topic: {topic_name}",
-        "topic_id": topic.id,
-        "topic_name": topic.name,
-        "follower_count": topic.follower_count,
-        "is_following": True
-    }
+#     return {
+#         "message": f"Started following topic: {topic_name}",
+#         "topic_id": topic.id,
+#         "topic_name": topic.name,
+#         "follower_count": topic.follower_count,
+#         "is_following": True
+#     }
 
-@router.post("/topics/{topic_name}/unfollow", response_model=dict)
-def unfollow_topic(
-    topic_name: str,
-    user_id: int,  # In real implementation, get from auth token
-    db: Session = Depends(get_db)
-):
-    """Unfollow a topic."""
-    topic = db.query(Topic).filter(Topic.name == topic_name).first()
-    if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
+# @router.post("/topics/{topic_name}/unfollow", response_model=dict)
+# def unfollow_topic(
+#     topic_name: str,
+#     user_id: int,  # In real implementation, get from auth token
+#     db: Session = Depends(get_db)
+# ):
+#     """Unfollow a topic."""
+#     topic = db.query(Topic).filter(Topic.name == topic_name).first()
+#     if not topic:
+#         raise HTTPException(status_code=404, detail="Topic not found")
     
-    # Find follow relationship
-    follow = db.query(UserTopicFollow).filter(
-        UserTopicFollow.user_id == user_id,
-        UserTopicFollow.topic_id == topic.id
-    ).first()
+#     # Find follow relationship
+#     follow = db.query(UserTopicFollow).filter(
+#         UserTopicFollow.user_id == user_id,
+#         UserTopicFollow.topic_id == topic.id
+#     ).first()
     
-    if not follow:
-        raise HTTPException(status_code=400, detail="Not following this topic")
+#     if not follow:
+#         raise HTTPException(status_code=400, detail="Not following this topic")
     
-    # Remove follow relationship
-    db.delete(follow)
+#     # Remove follow relationship
+#     db.delete(follow)
     
-    # Update follower count
-    topic.follower_count = max(0, topic.follower_count - 1)
-    topic.updated_at = datetime.utcnow()
+#     # Update follower count
+#     topic.follower_count = max(0, topic.follower_count - 1)
+#     topic.updated_at = datetime.utcnow()
     
-    db.commit()
+#     db.commit()
     
-    return {
-        "message": f"Stopped following topic: {topic_name}",
-        "topic_id": topic.id,
-        "topic_name": topic.name,
-        "follower_count": topic.follower_count,
-        "is_following": False
-    }
+#     return {
+#         "message": f"Stopped following topic: {topic_name}",
+#         "topic_id": topic.id,
+#         "topic_name": topic.name,
+#         "follower_count": topic.follower_count,
+#         "is_following": False
+#     }
 
-@router.post("/sources/{source_id}/follow", response_model=dict)
-def follow_source(
-    source_id: int,
-    user_id: int,  # In real implementation, get from auth token
-    db: Session = Depends(get_db)
-):
-    """Follow a source."""
-    source = db.query(Source).filter(Source.id == source_id).first()
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
+# @router.post("/sources/{source_id}/follow", response_model=dict)
+# def follow_source(
+#     source_id: int,
+#     user_id: int,  # In real implementation, get from auth token
+#     db: Session = Depends(get_db)
+# ):
+#     """Follow a source."""
+#     source = db.query(Source).filter(Source.id == source_id).first()
+#     if not source:
+#         raise HTTPException(status_code=404, detail="Source not found")
     
-    # Check if already following
-    existing_follow = db.query(UserSourceFollow).filter(
-        UserSourceFollow.user_id == user_id,
-        UserSourceFollow.source_id == source_id
-    ).first()
+#     # Check if already following
+#     existing_follow = db.query(UserSourceFollow).filter(
+#         UserSourceFollow.user_id == user_id,
+#         UserSourceFollow.source_id == source_id
+#     ).first()
     
-    if existing_follow:
-        raise HTTPException(status_code=400, detail="Already following this source")
+#     if existing_follow:
+#         raise HTTPException(status_code=400, detail="Already following this source")
     
-    # Create follow relationship
-    follow = UserSourceFollow(user_id=user_id, source_id=source_id)
-    db.add(follow)
+#     # Create follow relationship
+#     follow = UserSourceFollow(user_id=user_id, source_id=source_id)
+#     db.add(follow)
     
-    # Update follower count
-    source.follower_count += 1
-    source.updated_at = datetime.utcnow()
+#     # Update follower count
+#     source.follower_count += 1
+#     source.updated_at = datetime.utcnow()
     
-    db.commit()
+#     db.commit()
     
-    return {
-        "message": f"Started following source: {source.name}",
-        "source_id": source.id,
-        "source_name": source.name,
-        "follower_count": source.follower_count,
-        "is_following": True
-    }
+#     return {
+#         "message": f"Started following source: {source.name}",
+#         "source_id": source.id,
+#         "source_name": source.name,
+#         "follower_count": source.follower_count,
+#         "is_following": True
+#     }
 
-@router.post("/sources/{source_id}/unfollow", response_model=dict)
-def unfollow_source(
-    source_id: int,
-    user_id: int,  # In real implementation, get from auth token
-    db: Session = Depends(get_db)
-):
-    """Unfollow a source."""
-    source = db.query(Source).filter(Source.id == source_id).first()
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
+# @router.post("/sources/{source_id}/unfollow", response_model=dict)
+# def unfollow_source(
+#     source_id: int,
+#     user_id: int,  # In real implementation, get from auth token
+#     db: Session = Depends(get_db)
+# ):
+#     """Unfollow a source."""
+#     source = db.query(Source).filter(Source.id == source_id).first()
+#     if not source:
+#         raise HTTPException(status_code=404, detail="Source not found")
     
-    # Find follow relationship
-    follow = db.query(UserSourceFollow).filter(
-        UserSourceFollow.user_id == user_id,
-        UserSourceFollow.source_id == source_id
-    ).first()
+#     # Find follow relationship
+#     follow = db.query(UserSourceFollow).filter(
+#         UserSourceFollow.user_id == user_id,
+#         UserSourceFollow.source_id == source_id
+#     ).first()
     
-    if not follow:
-        raise HTTPException(status_code=400, detail="Not following this source")
+#     if not follow:
+#         raise HTTPException(status_code=400, detail="Not following this source")
     
-    # Remove follow relationship
-    db.delete(follow)
+#     # Remove follow relationship
+#     db.delete(follow)
     
-    # Update follower count
-    source.follower_count = max(0, source.follower_count - 1)
-    source.updated_at = datetime.utcnow()
+#     # Update follower count
+#     source.follower_count = max(0, source.follower_count - 1)
+#     source.updated_at = datetime.utcnow()
     
-    db.commit()
+#     db.commit()
     
-    return {
-        "message": f"Stopped following source: {source.name}",
-        "source_id": source.id,
-        "source_name": source.name,
-        "follower_count": source.follower_count,
-        "is_following": False
-    }
+#     return {
+#         "message": f"Stopped following source: {source.name}",
+#         "source_id": source.id,
+#         "source_name": source.name,
+#         "follower_count": source.follower_count,
+#         "is_following": False
+#     }
 
-@router.get("/user/feed", response_model=dict)
-def get_personalized_feed(
-    user_id: int,
-    page: int = 1,
-    limit: int = 20,
-    db: Session = Depends(get_db)
-):
-    """Get personalized feed based on followed topics and sources."""
-    # Get user's followed topics
-    followed_topics = db.query(UserTopicFollow).filter(
-        UserTopicFollow.user_id == user_id
-    ).all()
+# @router.get("/user/feed", response_model=dict)
+# def get_personalized_feed(
+#     user_id: int,
+#     page: int = 1,
+#     limit: int = 20,
+#     db: Session = Depends(get_db)
+# ):
+#     """Get personalized feed based on followed topics and sources."""
+#     # Get user's followed topics
+#     followed_topics = db.query(UserTopicFollow).filter(
+#         UserTopicFollow.user_id == user_id
+#     ).all()
     
-    # Get user's followed sources
-    followed_sources = db.query(UserSourceFollow).filter(
-        UserSourceFollow.user_id == user_id
-    ).all()
+#     # Get user's followed sources
+#     followed_sources = db.query(UserSourceFollow).filter(
+#         UserSourceFollow.user_id == user_id
+#     ).all()
     
-    # Build query for feeds from followed topics and sources
-    feed_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
-        Feed.status == "ready"
-    )
+#     # Build query for feeds from followed topics and sources
+#     feed_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
+#         Feed.status == "ready"
+#     )
     
-    # Add conditions for followed topics
-    topic_conditions = []
-    for topic_follow in followed_topics:
-        topic = topic_follow.topic
-        topic_conditions.append(Feed.categories.contains([topic.name]))
+#     # Add conditions for followed topics
+#     topic_conditions = []
+#     for topic_follow in followed_topics:
+#         topic = topic_follow.topic
+#         topic_conditions.append(Feed.categories.contains([topic.name]))
     
-    # Add conditions for followed sources
-    source_conditions = []
-    for source_follow in followed_sources:
-        source = source_follow.source
-        if source.source_type == "blog":
-            source_conditions.append(Blog.website == source.website)
-        # Add YouTube source conditions if needed
+#     # Add conditions for followed sources
+#     source_conditions = []
+#     for source_follow in followed_sources:
+#         source = source_follow.source
+#         if source.source_type == "blog":
+#             source_conditions.append(Blog.website == source.website)
+#         # Add YouTube source conditions if needed
     
-    # Combine conditions
-    if topic_conditions or source_conditions:
-        combined_conditions = []
-        if topic_conditions:
-            combined_conditions.append(or_(*topic_conditions))
-        if source_conditions:
-            # Join with Blog for website conditions
-            feed_query = feed_query.join(Blog)
-            combined_conditions.append(or_(*source_conditions))
+#     # Combine conditions
+#     if topic_conditions or source_conditions:
+#         combined_conditions = []
+#         if topic_conditions:
+#             combined_conditions.append(or_(*topic_conditions))
+#         if source_conditions:
+#             # Join with Blog for website conditions
+#             feed_query = feed_query.join(Blog)
+#             combined_conditions.append(or_(*source_conditions))
         
-        feed_query = feed_query.filter(or_(*combined_conditions))
+#         feed_query = feed_query.filter(or_(*combined_conditions))
     
-    # Order by creation date (newest first)
-    feed_query = feed_query.order_by(Feed.created_at.desc())
+#     # Order by creation date (newest first)
+#     feed_query = feed_query.order_by(Feed.created_at.desc())
     
-    # Paginate
-    total = feed_query.count()
-    feeds = feed_query.offset((page - 1) * limit).limit(limit).all()
+#     # Paginate
+#     total = feed_query.count()
+#     feeds = feed_query.offset((page - 1) * limit).limit(limit).all()
     
-    # Format response
-    items = []
-    for feed in feeds:
-        if feed.source_type == "youtube":
-            meta = {
-                "title": feed.title,
-                "original_title": feed.title,
-                "author": "YouTube Creator",
-                "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
-                "source_type": "youtube"
-            }
-        else:
-            meta = {
-                "title": feed.title,
-                "original_title": feed.blog.title if feed.blog else "Unknown",
-                "author": getattr(feed.blog, 'author', 'Admin'),
-                "source_url": getattr(feed.blog, 'url', '#'),
-                "source_type": "blog"
-            }
+#     # Format response
+#     items = []
+#     for feed in feeds:
+#         if feed.source_type == "youtube":
+#             meta = {
+#                 "title": feed.title,
+#                 "original_title": feed.title,
+#                 "author": "YouTube Creator",
+#                 "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
+#                 "source_type": "youtube"
+#             }
+#         else:
+#             meta = {
+#                 "title": feed.title,
+#                 "original_title": feed.blog.title if feed.blog else "Unknown",
+#                 "author": getattr(feed.blog, 'author', 'Admin'),
+#                 "source_url": getattr(feed.blog, 'url', '#'),
+#                 "source_type": "blog"
+#             }
         
-        items.append({
-            "id": feed.id,
-            "title": feed.title,
-            "categories": feed.categories,
-            "source_type": feed.source_type,
-            "slides_count": len(feed.slides),
-            "meta": meta,
-            "created_at": feed.created_at.isoformat() if feed.created_at else None,
-            "ai_generated": bool(feed.ai_generated_content)
-        })
+#         items.append({
+#             "id": feed.id,
+#             "title": feed.title,
+#             "categories": feed.categories,
+#             "source_type": feed.source_type,
+#             "slides_count": len(feed.slides),
+#             "meta": meta,
+#             "created_at": feed.created_at.isoformat() if feed.created_at else None,
+#             "ai_generated": bool(feed.ai_generated_content)
+#         })
     
-    has_more = (page * limit) < total
+#     has_more = (page * limit) < total
     
-    return {
-        "items": items,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": has_more,
-        "followed_topics_count": len(followed_topics),
-        "followed_sources_count": len(followed_sources)
-    }
+#     return {
+#         "items": items,
+#         "page": page,
+#         "limit": limit,
+#         "total": total,
+#         "has_more": has_more,
+#         "followed_topics_count": len(followed_topics),
+#         "followed_sources_count": len(followed_sources)
+#     }
 
-# ------------------ Topic and Source Management ------------------
+# # ------------------ Topic and Source Management ------------------
 
-def auto_create_topics_from_feeds(db: Session):
-    """Automatically create topics from feed categories."""
-    # Get all unique categories from feeds
-    all_feeds = db.query(Feed).filter(Feed.categories.isnot(None)).all()
+# def auto_create_topics_from_feeds(db: Session):
+#     """Automatically create topics from feed categories."""
+#     # Get all unique categories from feeds
+#     all_feeds = db.query(Feed).filter(Feed.categories.isnot(None)).all()
     
-    unique_categories = set()
-    for feed in all_feeds:
-        if feed.categories:
-            unique_categories.update(feed.categories)
+#     unique_categories = set()
+#     for feed in all_feeds:
+#         if feed.categories:
+#             unique_categories.update(feed.categories)
     
-    created_count = 0
-    for category_name in unique_categories:
-        # Skip empty or very short category names
-        if not category_name or len(category_name.strip()) < 2:
-            continue
+#     created_count = 0
+#     for category_name in unique_categories:
+#         # Skip empty or very short category names
+#         if not category_name or len(category_name.strip()) < 2:
+#             continue
             
-        category_name = category_name.strip()
+#         category_name = category_name.strip()
         
-        # Check if topic already exists
-        existing_topic = db.query(Topic).filter(Topic.name == category_name).first()
-        if not existing_topic:
-            topic = Topic(
-                name=category_name,
-                description=f"Automatically created topic for {category_name}"
-            )
-            db.add(topic)
-            created_count += 1
+#         # Check if topic already exists
+#         existing_topic = db.query(Topic).filter(Topic.name == category_name).first()
+#         if not existing_topic:
+#             topic = Topic(
+#                 name=category_name,
+#                 description=f"Automatically created topic for {category_name}"
+#             )
+#             db.add(topic)
+#             created_count += 1
     
-    if created_count > 0:
-        db.commit()
-        logger.info(f"Auto-created {created_count} topics from feed categories")
+#     if created_count > 0:
+#         db.commit()
+#         logger.info(f"Auto-created {created_count} topics from feed categories")
     
-    return created_count
+#     return created_count
 
-def auto_create_sources_from_feeds(db: Session):
-    """Automatically create sources from blogs and YouTube feeds."""
-    created_count = 0
+# def auto_create_sources_from_feeds(db: Session):
+#     """Automatically create sources from blogs and YouTube feeds."""
+#     created_count = 0
     
-    # Create sources from blogs
-    blogs = db.query(Blog).filter(Blog.website.isnot(None)).all()
-    for blog in blogs:
-        if blog.website:
-            existing_source = db.query(Source).filter(
-                Source.website == blog.website,
-                Source.source_type == "blog"
-            ).first()
+#     # Create sources from blogs
+#     blogs = db.query(Blog).filter(Blog.website.isnot(None)).all()
+#     for blog in blogs:
+#         if blog.website:
+#             existing_source = db.query(Source).filter(
+#                 Source.website == blog.website,
+#                 Source.source_type == "blog"
+#             ).first()
             
-            if not existing_source:
-                source_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
-                source = Source(
-                    name=source_name,
-                    website=blog.website,
-                    source_type="blog"
-                )
-                db.add(source)
-                created_count += 1
+#             if not existing_source:
+#                 source_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+#                 source = Source(
+#                     name=source_name,
+#                     website=blog.website,
+#                     source_type="blog"
+#                 )
+#                 db.add(source)
+#                 created_count += 1
     
-    # Create sources from YouTube feeds
-    youtube_feeds = db.query(Feed).filter(
-        Feed.source_type == "youtube",
-        Feed.transcript_id.isnot(None)
-    ).all()
+#     # Create sources from YouTube feeds
+#     youtube_feeds = db.query(Feed).filter(
+#         Feed.source_type == "youtube",
+#         Feed.transcript_id.isnot(None)
+#     ).all()
     
-    # You might want to extract channel names from YouTube data
-    # For now, we'll create a generic YouTube source
-    existing_youtube_source = db.query(Source).filter(
-        Source.name == "YouTube",
-        Source.source_type == "youtube"
-    ).first()
+#     # You might want to extract channel names from YouTube data
+#     # For now, we'll create a generic YouTube source
+#     existing_youtube_source = db.query(Source).filter(
+#         Source.name == "YouTube",
+#         Source.source_type == "youtube"
+#     ).first()
     
-    if not existing_youtube_source and youtube_feeds:
-        youtube_source = Source(
-            name="YouTube",
-            website="https://www.youtube.com",
-            source_type="youtube"
-        )
-        db.add(youtube_source)
-        created_count += 1
+#     if not existing_youtube_source and youtube_feeds:
+#         youtube_source = Source(
+#             name="YouTube",
+#             website="https://www.youtube.com",
+#             source_type="youtube"
+#         )
+#         db.add(youtube_source)
+#         created_count += 1
     
-    if created_count > 0:
-        db.commit()
-        logger.info(f"Auto-created {created_count} sources from feeds")
+#     if created_count > 0:
+#         db.commit()
+#         logger.info(f"Auto-created {created_count} sources from feeds")
     
-    return created_count
+#     return created_count
 
-def update_topic_feed_counts(db: Session):
-    """Update feed counts for all topics."""
-    topics = db.query(Topic).filter(Topic.is_active == True).all()
+# def update_topic_feed_counts(db: Session):
+#     """Update feed counts for all topics."""
+#     topics = db.query(Topic).filter(Topic.is_active == True).all()
     
-    for topic in topics:
-        feed_count = db.query(Feed).filter(
-            Feed.categories.contains([topic.name]),
-            Feed.status == "ready"
-        ).count()
+#     for topic in topics:
+#         feed_count = db.query(Feed).filter(
+#             Feed.categories.contains([topic.name]),
+#             Feed.status == "ready"
+#         ).count()
         
-        # We're storing this dynamically in the response, but you could add a field to Topic model
-        # if you want to cache this value
-        logger.debug(f"Topic '{topic.name}' has {feed_count} feeds")
+#         # We're storing this dynamically in the response, but you could add a field to Topic model
+#         # if you want to cache this value
+#         logger.debug(f"Topic '{topic.name}' has {feed_count} feeds")
     
-    return len(topics)
+#     return len(topics)
 
 
-@router.post("/admin/initialize-topics", response_model=dict)
-def initialize_topics_from_feeds(db: Session = Depends(get_db)):
-    """Admin endpoint to initialize topics from existing feeds."""
-    try:
-        created_count = auto_create_topics_from_feeds(db)
-        updated_count = update_topic_feed_counts(db)
+# @router.post("/admin/initialize-topics", response_model=dict)
+# def initialize_topics_from_feeds(db: Session = Depends(get_db)):
+#     """Admin endpoint to initialize topics from existing feeds."""
+#     try:
+#         created_count = auto_create_topics_from_feeds(db)
+#         updated_count = update_topic_feed_counts(db)
         
-        return {
-            "message": "Topics initialized successfully",
-            "topics_created": created_count,
-            "topics_updated": updated_count
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize topics: {str(e)}")
+#         return {
+#             "message": "Topics initialized successfully",
+#             "topics_created": created_count,
+#             "topics_updated": updated_count
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to initialize topics: {str(e)}")
 
-@router.post("/admin/initialize-sources", response_model=dict)
-def initialize_sources_from_feeds(db: Session = Depends(get_db)):
-    """Admin endpoint to initialize sources from existing feeds."""
-    try:
-        created_count = auto_create_sources_from_feeds(db)
+# @router.post("/admin/initialize-sources", response_model=dict)
+# def initialize_sources_from_feeds(db: Session = Depends(get_db)):
+#     """Admin endpoint to initialize sources from existing feeds."""
+#     try:
+#         created_count = auto_create_sources_from_feeds(db)
         
-        return {
-            "message": "Sources initialized successfully",
-            "sources_created": created_count
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize sources: {str(e)}")
+#         return {
+#             "message": "Sources initialized successfully",
+#             "sources_created": created_count
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to initialize sources: {str(e)}")
 
-@router.get("/debug/feeds-with-categories", response_model=dict)
-def debug_feeds_with_categories(db: Session = Depends(get_db)):
-    """Debug endpoint to see what categories exist in feeds."""
-    feeds_with_categories = db.query(Feed).filter(
-        Feed.categories.isnot(None),
-        Feed.status == "ready"
-    ).all()
+# @router.get("/debug/feeds-with-categories", response_model=dict)
+# def debug_feeds_with_categories(db: Session = Depends(get_db)):
+#     """Debug endpoint to see what categories exist in feeds."""
+#     feeds_with_categories = db.query(Feed).filter(
+#         Feed.categories.isnot(None),
+#         Feed.status == "ready"
+#     ).all()
     
-    all_categories = set()
-    feed_data = []
+#     all_categories = set()
+#     feed_data = []
     
-    for feed in feeds_with_categories:
-        if feed.categories:
-            all_categories.update(feed.categories)
-            feed_data.append({
-                "id": feed.id,
-                "title": feed.title,
-                "categories": feed.categories,
-                "source_type": feed.source_type
-            })
+#     for feed in feeds_with_categories:
+#         if feed.categories:
+#             all_categories.update(feed.categories)
+#             feed_data.append({
+#                 "id": feed.id,
+#                 "title": feed.title,
+#                 "categories": feed.categories,
+#                 "source_type": feed.source_type
+#             })
     
-    return {
-        "total_feeds_with_categories": len(feeds_with_categories),
-        "unique_categories": list(all_categories),
-        "feeds": feed_data
-    }
+#     return {
+#         "total_feeds_with_categories": len(feeds_with_categories),
+#         "unique_categories": list(all_categories),
+#         "feeds": feed_data
+#     }
