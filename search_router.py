@@ -1142,94 +1142,165 @@ def get_feeds_by_topic(
     db: Session = Depends(get_db)
 ):
     """Get all feeds with full metadata and slides for a specific topic."""
-    # First, verify the topic exists
-    topic = db.query(Topic).filter(
-        Topic.name == topic_name,
-        Topic.is_active == True
-    ).first()
-    
-    if not topic:
-        raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
-    
-    # Query feeds that have this topic in their categories
-    # Use string matching since JSON contains doesn't work well with array elements
-    feeds_query = db.query(Feed).options(
-        joinedload(Feed.blog),
-        joinedload(Feed.slides)
-    ).filter(
-        Feed.status == "ready"
-    ).order_by(Feed.created_at.desc())
-    
-    # Get all feeds and filter by category manually
-    all_feeds = feeds_query.all()
-    matching_feeds = []
-    
-    for feed in all_feeds:
-        if feed.categories and topic_name in feed.categories:
-            matching_feeds.append(feed)
-    
-    # Manual pagination
-    total = len(matching_feeds)
-    start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    paginated_feeds = matching_feeds[start_idx:end_idx]
-    
-    # Format response with full feed data including slides
-    items = []
-    for feed in paginated_feeds:
-        # Get proper metadata
-        meta = get_feed_metadata(feed, db)
+    try:
+        # First, verify the topic exists
+        topic = db.query(Topic).filter(
+            Topic.name == topic_name,
+            Topic.is_active == True
+        ).first()
         
-        # Get slides sorted by order
-        sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+        if not topic:
+            raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
         
-        items.append({
-            "id": feed.id,
-            "blog_id": feed.blog_id,
-            "transcript_id": feed.transcript_id,
-            "title": feed.title,
-            "categories": feed.categories,
-            "status": feed.status,
-            "source_type": feed.source_type or "blog",
-            "ai_generated_content": feed.ai_generated_content or {},
-            "meta": meta,
-            "slides": [
-                {
-                    "id": slide.id,
-                    "order": slide.order,
-                    "title": slide.title,
-                    "body": slide.body,
-                    "bullets": slide.bullets or [],
-                    "background_color": slide.background_color,
-                    "background_image_prompt": None,
-                    "source_refs": slide.source_refs or [],
-                    "render_markdown": bool(slide.render_markdown),
-                    "created_at": slide.created_at.isoformat() if slide.created_at else None,
-                    "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
-                } for slide in sorted_slides
-            ],
-            "slides_count": len(feed.slides),
-            "created_at": feed.created_at.isoformat() if feed.created_at else None,
-            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
-            "ai_generated": bool(feed.ai_generated_content)
-        })
-    
-    has_more = (page * limit) < total
-    
-    return {
-        "topic": {
-            "id": topic.id,
-            "name": topic.name,
-            "description": topic.description,
-            "follower_count": topic.follower_count
-        },
-        "items": items,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": has_more
-    }
+        # Use a more efficient approach - get all feeds first, then filter in Python
+        # This avoids complex SQL queries with JSON arrays
+        all_feeds = db.query(Feed).options(
+            joinedload(Feed.blog),
+            joinedload(Feed.slides)
+        ).filter(
+            Feed.status == "ready",
+            Feed.categories.isnot(None)
+        ).order_by(Feed.created_at.desc()).all()
+        
+        # Filter feeds that have this topic in their categories
+        matching_feeds = []
+        for feed in all_feeds:
+            if feed.categories and topic_name in feed.categories:
+                matching_feeds.append(feed)
+        
+        # Manual pagination
+        total = len(matching_feeds)
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        paginated_feeds = matching_feeds[start_idx:end_idx]
+        
+        # Format response with full feed data including slides
+        items = []
+        for feed in paginated_feeds:
+            # Get proper metadata
+            meta = get_feed_metadata(feed, db)
+            
+            # Get slides sorted by order
+            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+            
+            items.append({
+                "id": feed.id,
+                "blog_id": feed.blog_id,
+                "transcript_id": feed.transcript_id,
+                "title": feed.title,
+                "categories": feed.categories,
+                "status": feed.status,
+                "source_type": feed.source_type or "blog",
+                "ai_generated_content": feed.ai_generated_content or {},
+                "meta": meta,
+                "slides": [
+                    {
+                        "id": slide.id,
+                        "order": slide.order,
+                        "title": slide.title,
+                        "body": slide.body,
+                        "bullets": slide.bullets or [],
+                        "background_color": slide.background_color,
+                        "background_image_prompt": None,
+                        "source_refs": slide.source_refs or [],
+                        "render_markdown": bool(slide.render_markdown),
+                        "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                        "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                    } for slide in sorted_slides
+                ],
+                "slides_count": len(feed.slides),
+                "created_at": feed.created_at.isoformat() if feed.created_at else None,
+                "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+                "ai_generated": bool(feed.ai_generated_content)
+            })
+        
+        has_more = (page * limit) < total
+        
+        return {
+            "topic": {
+                "id": topic.id,
+                "name": topic.name,
+                "description": topic.description,
+                "follower_count": topic.follower_count
+            },
+            "items": items,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": has_more
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_feeds_by_topic for topic '{topic_name}': {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@router.get("/topic/{topic_name}/feeds/summary", response_model=dict)
+def get_feeds_by_topic_summary(
+    topic_name: str,
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    """Get feed summaries (without slides) for a specific topic - faster for listing."""
+    try:
+        topic = db.query(Topic).filter(
+            Topic.name == topic_name,
+            Topic.is_active == True
+        ).first()
+        
+        if not topic:
+            raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
+        
+        # Get all feeds and filter manually (more reliable than SQL JSON queries)
+        all_feeds = db.query(Feed).options(joinedload(Feed.blog)).filter(
+            Feed.status == "ready",
+            Feed.categories.isnot(None)
+        ).order_by(Feed.created_at.desc()).all()
+        
+        matching_feeds = []
+        for feed in all_feeds:
+            if feed.categories and topic_name in feed.categories:
+                matching_feeds.append(feed)
+        
+        total = len(matching_feeds)
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        feeds = matching_feeds[start_idx:end_idx]
+        
+        items = []
+        for feed in feeds:
+            meta = get_feed_metadata(feed, db)
+            
+            items.append({
+                "id": feed.id,
+                "title": feed.title,
+                "categories": feed.categories,
+                "source_type": feed.source_type,
+                "slides_count": len(feed.slides),
+                "meta": meta,
+                "created_at": feed.created_at.isoformat() if feed.created_at else None,
+                "ai_generated": bool(feed.ai_generated_content)
+            })
+        
+        has_more = (page * limit) < total
+        
+        return {
+            "topic": {
+                "id": topic.id,
+                "name": topic.name,
+                "description": topic.description,
+                "follower_count": topic.follower_count
+            },
+            "items": items,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": has_more
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_feeds_by_topic_summary for topic '{topic_name}': {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @router.get("/source/{source_id}/feeds", response_model=dict)
@@ -1391,71 +1462,6 @@ def get_feeds_by_source(
             "website": source.website,
             "source_type": source.source_type,
             "follower_count": source.follower_count
-        },
-        "items": items,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": has_more
-    }
-
-# Also update the summary endpoint
-@router.get("/topic/{topic_name}/feeds/summary", response_model=dict)
-def get_feeds_by_topic_summary(
-    topic_name: str,
-    page: int = 1,
-    limit: int = 20,
-    db: Session = Depends(get_db)
-):
-    """Get feed summaries (without slides) for a specific topic - faster for listing."""
-    topic = db.query(Topic).filter(
-        Topic.name == topic_name,
-        Topic.is_active == True
-    ).first()
-    
-    if not topic:
-        raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
-    
-    # Get all feeds and filter manually
-    feeds_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
-        Feed.status == "ready"
-    ).order_by(Feed.created_at.desc())
-    
-    all_feeds = feeds_query.all()
-    matching_feeds = []
-    
-    for feed in all_feeds:
-        if feed.categories and topic_name in feed.categories:
-            matching_feeds.append(feed)
-    
-    total = len(matching_feeds)
-    start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    feeds = matching_feeds[start_idx:end_idx]
-    
-    items = []
-    for feed in feeds:
-        meta = get_feed_metadata(feed, db)
-        
-        items.append({
-            "id": feed.id,
-            "title": feed.title,
-            "categories": feed.categories,
-            "source_type": feed.source_type,
-            "slides_count": len(feed.slides),
-            "meta": meta,
-            "created_at": feed.created_at.isoformat() if feed.created_at else None,
-            "ai_generated": bool(feed.ai_generated_content)
-        })
-    
-    has_more = (page * limit) < total
-    
-    return {
-        "topic": {
-            "id": topic.id,
-            "name": topic.name,
-            "description": topic.description,
-            "follower_count": topic.follower_count
         },
         "items": items,
         "page": page,
