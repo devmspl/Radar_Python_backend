@@ -22,6 +22,21 @@ from publish_router import router as publish_router
 from quiz_router import router as quiz_router
 from onboarding_router import router as onboarding_router
 from bookmark_router import bookmark_router as bookmark_router
+import traceback
+import sys
+import logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    logger.critical("Uncaught exception:", exc_info=(exc_type, exc_value, exc_traceback))
+    print("CRITICAL ERROR - Check logs for details")
+
+sys.excepthook = handle_exception
 # Auth router
 auth_router = APIRouter(
     prefix="/auth",
