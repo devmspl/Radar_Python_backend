@@ -716,3 +716,136 @@ def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
         "source_type": feed.source_type,
         "transcript_info": transcript_info
     }
+
+from sqlalchemy import or_, and_
+
+@router.get("/personalized", response_model=Dict[str, Any])
+def get_personalized_feeds(
+    user_id: int = Query(..., description="Logged-in user ID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get personalized published feeds based on user's followed topics and interests.
+    """
+    try:
+        # Get user's followed topics (you'll need to implement this model)
+        # Assuming you have a UserTopicFollow model
+        from models import UserTopicFollow, UserSourceFollow
+        
+        # Get user's followed topics
+        followed_topics = db.query(UserTopicFollow).filter(
+            UserTopicFollow.user_id == user_id
+        ).all()
+        
+        # Get user's followed sources
+        followed_sources = db.query(UserSourceFollow).filter(
+            UserSourceFollow.user_id == user_id
+        ).all()
+        
+        # Start with base query for published feeds
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).filter(PublishedFeed.is_active == True)
+        
+        # If user has followed topics or sources, personalize the feed
+        if followed_topics or followed_sources:
+            # Build conditions for personalization
+            topic_conditions = []
+            source_conditions = []
+            
+            # Add conditions for followed topics
+            for topic_follow in followed_topics:
+                topic_conditions.append(Feed.categories.contains([topic_follow.topic.name]))
+            
+            # Add conditions for followed sources
+            for source_follow in followed_sources:
+                source = source_follow.source
+                if source.source_type == "blog":
+                    source_conditions.append(Blog.website == source.website)
+                elif source.source_type == "youtube":
+                    # For YouTube sources, you might want to filter by channel
+                    source_conditions.append(Feed.source_type == "youtube")
+            
+            # Combine conditions
+            combined_conditions = []
+            if topic_conditions:
+                combined_conditions.append(or_(*topic_conditions))
+            if source_conditions:
+                # Need to join with Blog for website conditions
+                query = query.join(Feed).join(Blog, isouter=True)
+                combined_conditions.append(or_(*source_conditions))
+            
+            if combined_conditions:
+                query = query.filter(or_(*combined_conditions))
+            else:
+                # If no specific conditions, just join normally
+                query = query.join(Feed).join(Blog, isouter=True)
+        else:
+            # If no followed topics/sources, join normally and get all published feeds
+            query = query.join(Feed).join(Blog, isouter=True)
+        
+        # Order by published date (newest first)
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        # Pagination
+        total = query.count()
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format response
+        response_data = []
+        for pf in published_feeds:
+            if not pf.feed:
+                continue
+                
+            feed_title = pf.feed.title
+            blog_title = pf.feed.blog.title if pf.feed.blog else None
+            categories = pf.feed.categories or []
+            
+            # Process slides
+            slides_data = []
+            if pf.feed.slides:
+                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
+                slides_data = [format_slide_response(slide) for slide in sorted_slides]
+            
+            slides_count = len(slides_data)
+            
+            # Get enhanced metadata
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
+            
+            response_data.append({
+                "id": pf.id,
+                "feed_id": pf.feed_id,
+                "admin_id": pf.admin_id,
+                "admin_name": pf.admin_name,
+                "published_at": pf.published_at,
+                "is_active": pf.is_active,
+                "feed_title": feed_title,
+                "blog_title": blog_title,
+                "feed_categories": categories,
+                "slides_count": slides_count,
+                "slides": slides_data if slides_data else None,
+                "meta": meta_data
+            })
+        
+        return {
+            "items": response_data,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total,
+            "personalization_info": {
+                "followed_topics_count": len(followed_topics),
+                "followed_sources_count": len(followed_sources),
+                "is_personalized": len(followed_topics) > 0 or len(followed_sources) > 0
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching personalized feeds for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch personalized feeds"
+        )
