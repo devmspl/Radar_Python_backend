@@ -717,7 +717,7 @@ def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
         "transcript_info": transcript_info
     }
 
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_,String
 
 @router.get("/personalized", response_model=Dict[str, Any])
 def get_personalized_feeds(
@@ -730,69 +730,81 @@ def get_personalized_feeds(
     Get personalized published feeds based on user's followed topics and interests.
     """
     try:
-        # Get user's followed topics (you'll need to implement this model)
-        # Assuming you have a UserTopicFollow model
+        # Get user's followed topics
         from models import UserTopicFollow, UserSourceFollow
         
         # Get user's followed topics
-        followed_topics = db.query(UserTopicFollow).filter(
-            UserTopicFollow.user_id == user_id
-        ).all()
+        followed_topics = db.query(UserTopicFollow).options(
+            joinedload(UserTopicFollow.topic)
+        ).filter(UserTopicFollow.user_id == user_id).all()
         
         # Get user's followed sources
-        followed_sources = db.query(UserSourceFollow).filter(
-            UserSourceFollow.user_id == user_id
-        ).all()
+        followed_sources = db.query(UserSourceFollow).options(
+            joinedload(UserSourceFollow.source)
+        ).filter(UserSourceFollow.user_id == user_id).all()
         
-        # Start with base query for published feeds
+        # Debug logging
+        logger.info(f"User {user_id} follows {len(followed_topics)} topics and {len(followed_sources)} sources")
+        
+        # Log followed topic names
+        topic_names = [ft.topic.name for ft in followed_topics if ft.topic]
+        logger.info(f"Followed topics: {topic_names}")
+        
+        # Start with base query for published feeds with proper JOIN
         query = db.query(PublishedFeed).options(
             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
             joinedload(PublishedFeed.feed).joinedload(Feed.blog)
-        ).filter(PublishedFeed.is_active == True)
+        ).join(Feed, PublishedFeed.feed_id == Feed.id).filter(
+            PublishedFeed.is_active == True
+        )
         
         # If user has followed topics or sources, personalize the feed
         if followed_topics or followed_sources:
             # Build conditions for personalization
-            topic_conditions = []
-            source_conditions = []
+            conditions = []
             
-            # Add conditions for followed topics
+            # Add conditions for followed topics - FIXED: Check if array contains the topic name
             for topic_follow in followed_topics:
-                topic_conditions.append(Feed.categories.contains([topic_follow.topic.name]))
+                if topic_follow.topic:
+                    topic_name = topic_follow.topic.name
+                    # FIX: Use string containment for JSON array
+                    # This checks if the categories array contains the topic name as a string
+                    conditions.append(Feed.categories.cast(String).ilike(f'%"{topic_name}"%'))
+                    logger.info(f"Adding topic condition for: {topic_name}")
             
             # Add conditions for followed sources
             for source_follow in followed_sources:
-                source = source_follow.source
-                if source.source_type == "blog":
-                    source_conditions.append(Blog.website == source.website)
-                elif source.source_type == "youtube":
-                    # For YouTube sources, you might want to filter by channel
-                    source_conditions.append(Feed.source_type == "youtube")
+                if source_follow.source:
+                    source = source_follow.source
+                    if source.source_type == "blog":
+                        # Need to join with Blog for website conditions
+                        query = query.join(Blog, Feed.blog_id == Blog.id)
+                        conditions.append(Blog.website.ilike(f"%{source.website}%"))
+                        logger.info(f"Adding blog source condition for: {source.website}")
+                    elif source.source_type == "youtube":
+                        conditions.append(Feed.source_type == "youtube")
+                        logger.info(f"Adding YouTube source condition")
             
-            # Combine conditions
-            combined_conditions = []
-            if topic_conditions:
-                combined_conditions.append(or_(*topic_conditions))
-            if source_conditions:
-                # Need to join with Blog for website conditions
-                query = query.join(Feed).join(Blog, isouter=True)
-                combined_conditions.append(or_(*source_conditions))
-            
-            if combined_conditions:
-                query = query.filter(or_(*combined_conditions))
+            if conditions:
+                query = query.filter(or_(*conditions))
+                logger.info(f"Applied {len(conditions)} personalization conditions")
             else:
-                # If no specific conditions, just join normally
-                query = query.join(Feed).join(Blog, isouter=True)
-        else:
-            # If no followed topics/sources, join normally and get all published feeds
-            query = query.join(Feed).join(Blog, isouter=True)
+                # If no valid conditions, add a dummy condition to avoid returning all feeds
+                conditions.append(Feed.id == -1)  # This will return no results
+                logger.info("No valid conditions, applying dummy condition")
         
         # Order by published date (newest first)
         query = query.order_by(PublishedFeed.published_at.desc())
         
+        # Log the final query
+        logger.info(f"Final query will fetch published feeds with personalization")
+        
         # Pagination
         total = query.count()
+        logger.info(f"Total matching feeds: {total}")
+        
         published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        logger.info(f"Fetched {len(published_feeds)} feeds for page {page}")
         
         # Format response
         response_data = []
@@ -839,7 +851,9 @@ def get_personalized_feeds(
             "personalization_info": {
                 "followed_topics_count": len(followed_topics),
                 "followed_sources_count": len(followed_sources),
-                "is_personalized": len(followed_topics) > 0 or len(followed_sources) > 0
+                "is_personalized": len(followed_topics) > 0 or len(followed_sources) > 0,
+                "followed_topic_names": topic_names,
+                "followed_source_names": [fs.source.name for fs in followed_sources if fs.source]
             }
         }
         
