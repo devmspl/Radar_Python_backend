@@ -863,3 +863,193 @@ def get_personalized_feeds(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch personalized feeds"
         )
+
+
+from sqlalchemy import or_, and_, String, func, distinct
+from typing import List
+
+# Add these new endpoints to your existing router
+
+@router.get("/categories", response_model=Dict[str, Any])
+def get_published_feed_categories(
+    db: Session = Depends(get_db),
+    active_only: bool = Query(True, description="Only include categories from active published feeds")
+):
+    """
+    Get all unique categories from published feeds with counts.
+    Returns both category names and their frequencies.
+    """
+    try:
+        # Base query for published feeds
+        query = db.query(PublishedFeed).join(Feed, PublishedFeed.feed_id == Feed.id)
+        
+        if active_only:
+            query = query.filter(PublishedFeed.is_active == True)
+        
+        # Get all published feeds with their categories
+        published_feeds = query.options(
+            joinedload(PublishedFeed.feed)
+        ).all()
+        
+        # Extract and count categories
+        category_count = {}
+        all_categories = set()
+        
+        for pf in published_feeds:
+            if pf.feed and pf.feed.categories:
+                for category in pf.feed.categories:
+                    if category:  # Skip empty categories
+                        all_categories.add(category)
+                        category_count[category] = category_count.get(category, 0) + 1
+        
+        # Convert to sorted list of categories with counts
+        sorted_categories = sorted([
+            {
+                "name": category,
+                "count": category_count[category],
+                "id": f"cat_{idx}"  # Generate simple ID for frontend use
+            }
+            for idx, category in enumerate(sorted(all_categories))
+        ], key=lambda x: x["count"], reverse=True)
+        
+        return {
+            "categories": sorted_categories,
+            "total_categories": len(sorted_categories),
+            "total_feeds": len(published_feeds),
+            "active_only": active_only
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching published feed categories: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch categories"
+        )
+
+@router.get("/feeds/by-category", response_model=Dict[str, Any])
+def get_published_feeds_by_category(
+    category: str = Query(..., description="Category name to filter by"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    active_only: bool = Query(True, description="Show only active published feeds"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get published feeds by category name with enhanced metadata.
+    Uses case-insensitive partial matching for category names.
+    """
+    try:
+        # Base query with proper joins
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).join(Feed, PublishedFeed.feed_id == Feed.id)
+        
+        # Filter by active status
+        if active_only:
+            query = query.filter(PublishedFeed.is_active == True)
+        
+        # Filter by category - using JSON array containment with string matching
+        # This handles the case where categories is a JSON array of strings
+        category_filter = Feed.categories.cast(String).ilike(f'%"{category}"%')
+        query = query.filter(category_filter)
+        
+        # Order by most recent first
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        # Get total count for pagination
+        total = query.count()
+        
+        # Pagination
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        response_data = []
+        for pf in published_feeds:
+            if not pf.feed:
+                continue
+                
+            feed_title = pf.feed.title
+            blog_title = pf.feed.blog.title if pf.feed.blog else None
+            categories = pf.feed.categories or []
+            
+            # Process slides
+            slides_data = []
+            if pf.feed.slides:
+                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
+                slides_data = [format_slide_response(slide) for slide in sorted_slides]
+            
+            slides_count = len(slides_data)
+            
+            # Get enhanced metadata
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
+            
+            response_data.append({
+                "id": pf.id,
+                "feed_id": pf.feed_id,
+                "admin_id": pf.admin_id,
+                "admin_name": pf.admin_name,
+                "published_at": pf.published_at,
+                "is_active": pf.is_active,
+                "feed_title": feed_title,
+                "blog_title": blog_title,
+                "feed_categories": categories,
+                "slides_count": slides_count,
+                "slides": slides_data if slides_data else None,
+                "meta": meta_data
+            })
+        
+        return {
+            "items": response_data,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total,
+            "category": category,
+            "active_only": active_only
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching published feeds by category '{category}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch feeds for category '{category}'"
+        )
+
+@router.get("/feeds/by-category-id", response_model=Dict[str, Any])
+def get_published_feeds_by_category_id(
+    category_id: str = Query(..., description="Category ID from the categories list"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    active_only: bool = Query(True, description="Show only active published feeds"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get published feeds by category ID.
+    The category ID should be from the categories list endpoint (format: 'cat_1', 'cat_2', etc.)
+    """
+    try:
+        # First, get all categories to map ID to name
+        categories_response = get_published_feed_categories(db, active_only)
+        categories_map = {cat["id"]: cat["name"] for cat in categories_response["categories"]}
+        
+        # Find category name by ID
+        category_name = categories_map.get(category_id)
+        if not category_name:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Category with ID '{category_id}' not found"
+            )
+        
+        # Now use the existing category name endpoint logic
+        return get_published_feeds_by_category(category_name, page, limit, active_only, db)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching published feeds by category ID '{category_id}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch feeds for category ID '{category_id}'"
+        )
+
+# Also update the schemas.py file to include the response models if needed
