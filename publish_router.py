@@ -1110,3 +1110,157 @@ def get_user_categories_from_onboarding(
             detail="Failed to fetch user categories"
         )
 
+from typing import List, Optional
+from pydantic import BaseModel, Field
+class AddDomainsRequest(BaseModel):
+    user_id: int = Field(..., description="User ID to update domains for")
+    domains: List[str] = Field(..., description="List of domains to add")
+    replace_existing: bool = Field(False, description="Whether to replace existing domains or add to them")
+
+class DomainsResponse(BaseModel):
+    user_id: int
+    domains: List[str]
+    total_domains: int
+    message: str
+
+@router.post("/user/domains", response_model=DomainsResponse)
+def add_user_domains(
+    request: AddDomainsRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Add or update domains of interest for a user in their onboarding data.
+    """
+    try:
+        # Find user's onboarding data
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == request.user_id
+        ).first()
+
+        if not onboarding:
+            # Create new onboarding entry if it doesn't exist
+            onboarding = UserOnboarding(
+                user_id=request.user_id,
+                domains_of_interest=request.domains,
+                is_completed=False
+            )
+            db.add(onboarding)
+            message = "New onboarding created with domains"
+            
+        else:
+            # Update existing domains
+            current_domains = onboarding.domains_of_interest or []
+            
+            if request.replace_existing:
+                # Replace all domains
+                updated_domains = request.domains
+                message = "Domains replaced successfully"
+            else:
+                # Add new domains, remove duplicates
+                updated_domains = list(set(current_domains + request.domains))
+                message = "Domains added successfully"
+            
+            onboarding.domains_of_interest = updated_domains
+            onboarding.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(onboarding)
+
+        return DomainsResponse(
+            user_id=request.user_id,
+            domains=onboarding.domains_of_interest or [],
+            total_domains=len(onboarding.domains_of_interest or []),
+            message=message
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating domains for user {request.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update user domains"
+        )
+
+@router.get("/user/{user_id}/domains", response_model=DomainsResponse)
+def get_user_domains(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get user's current domains of interest.
+    """
+    try:
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+
+        if not onboarding:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User onboarding data not found"
+            )
+
+        return DomainsResponse(
+            user_id=user_id,
+            domains=onboarding.domains_of_interest or [],
+            total_domains=len(onboarding.domains_of_interest or []),
+            message="Domains retrieved successfully"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching domains for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user domains"
+        )
+
+@router.delete("/user/{user_id}/domains")
+def remove_user_domains(
+    user_id: int,
+    domains_to_remove: List[str] = Query(..., description="Domains to remove"),
+    db: Session = Depends(get_db)
+):
+    """
+    Remove specific domains from user's domains of interest.
+    """
+    try:
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+
+        if not onboarding:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User onboarding data not found"
+            )
+
+        current_domains = onboarding.domains_of_interest or []
+        
+        # Remove specified domains
+        updated_domains = [domain for domain in current_domains if domain not in domains_to_remove]
+        
+        onboarding.domains_of_interest = updated_domains
+        onboarding.updated_at = datetime.utcnow()
+        
+        db.commit()
+
+        return {
+            "user_id": user_id,
+            "removed_domains": domains_to_remove,
+            "current_domains": updated_domains,
+            "total_domains": len(updated_domains),
+            "message": f"Successfully removed {len(domains_to_remove)} domains"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error removing domains for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to remove user domains"
+        )
+
