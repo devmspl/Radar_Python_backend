@@ -8,7 +8,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from database import get_db
-from models import PublishedFeed, Feed, User, Blog, Slide, Transcript, UserTopicFollow, UserSourceFollow,UserOnboarding, Source
+from models import PublishedFeed, Category,Feed, User, Blog, Slide, Transcript, UserTopicFollow, UserSourceFollow,UserOnboarding, Source
 from schemas import (
     PublishFeedRequest, 
     PublishedFeedResponse, 
@@ -716,514 +716,168 @@ def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
         "source_type": feed.source_type,
         "transcript_info": transcript_info
     }
+from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
+from sqlalchemy import String  # and Column if needed
 
-from sqlalchemy import or_, and_,String
+class AddCategoriesRequest(BaseModel):
+    user_id: int = Field(..., description="User ID to update categories for")
+    category_ids: List[int] = Field(..., description="List of category IDs to add")
+    replace_existing: bool = Field(False, description="Whether to replace existing categories or add to them")
 
-@router.get("/personalized", response_model=Dict[str, Any])
-def get_personalized_feeds(
-    user_id: int = Query(..., description="Logged-in user ID"),
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+class CategoriesResponse(BaseModel):
+    user_id: int
+    categories: List[Dict[str, Any]]
+    total_categories: int
+    message: str
+class CategoryFilterRequest(BaseModel):
+    category: str = Field(..., description="Category ID or name")
+    filter_type: str = Field(..., description="Filter type: topics, sources, concepts, questions, summary")
+    user_id: Optional[int] = None
+
+@router.post("/user/categories", response_model=CategoriesResponse)
+def add_user_categories(
+    request: AddCategoriesRequest,
     db: Session = Depends(get_db)
 ):
     """
-    Get personalized published feeds based on user's followed topics and interests.
+    Add or update categories of interest for a user using category IDs.
     """
     try:
-        # Get user's followed topics
-        from models import UserTopicFollow, UserSourceFollow
-        
-        # Get user's followed topics
-        followed_topics = db.query(UserTopicFollow).options(
-            joinedload(UserTopicFollow.topic)
-        ).filter(UserTopicFollow.user_id == user_id).all()
-        
-        # Get user's followed sources
-        followed_sources = db.query(UserSourceFollow).options(
-            joinedload(UserSourceFollow.source)
-        ).filter(UserSourceFollow.user_id == user_id).all()
-        
-        # Debug logging
-        logger.info(f"User {user_id} follows {len(followed_topics)} topics and {len(followed_sources)} sources")
-        
-        # Log followed topic names
-        topic_names = [ft.topic.name for ft in followed_topics if ft.topic]
-        logger.info(f"Followed topics: {topic_names}")
-        
-        # Start with base query for published feeds with proper JOIN
-        query = db.query(PublishedFeed).options(
-            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
-        ).join(Feed, PublishedFeed.feed_id == Feed.id).filter(
-            PublishedFeed.is_active == True
-        )
-        
-        # If user has followed topics or sources, personalize the feed
-        if followed_topics or followed_sources:
-            # Build conditions for personalization
-            conditions = []
-            
-            # Add conditions for followed topics - FIXED: Check if array contains the topic name
-            for topic_follow in followed_topics:
-                if topic_follow.topic:
-                    topic_name = topic_follow.topic.name
-                    # FIX: Use string containment for JSON array
-                    # This checks if the categories array contains the topic name as a string
-                    conditions.append(Feed.categories.cast(String).ilike(f'%"{topic_name}"%'))
-                    logger.info(f"Adding topic condition for: {topic_name}")
-            
-            # Add conditions for followed sources
-            for source_follow in followed_sources:
-                if source_follow.source:
-                    source = source_follow.source
-                    if source.source_type == "blog":
-                        # Need to join with Blog for website conditions
-                        query = query.join(Blog, Feed.blog_id == Blog.id)
-                        conditions.append(Blog.website.ilike(f"%{source.website}%"))
-                        logger.info(f"Adding blog source condition for: {source.website}")
-                    elif source.source_type == "youtube":
-                        conditions.append(Feed.source_type == "youtube")
-                        logger.info(f"Adding YouTube source condition")
-            
-            if conditions:
-                query = query.filter(or_(*conditions))
-                logger.info(f"Applied {len(conditions)} personalization conditions")
-            else:
-                # If no valid conditions, add a dummy condition to avoid returning all feeds
-                conditions.append(Feed.id == -1)  # This will return no results
-                logger.info("No valid conditions, applying dummy condition")
-        
-        # Order by published date (newest first)
-        query = query.order_by(PublishedFeed.published_at.desc())
-        
-        # Log the final query
-        logger.info(f"Final query will fetch published feeds with personalization")
-        
-        # Pagination
-        total = query.count()
-        logger.info(f"Total matching feeds: {total}")
-        
-        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
-        logger.info(f"Fetched {len(published_feeds)} feeds for page {page}")
-        
-        # Format response
-        response_data = []
-        for pf in published_feeds:
-            if not pf.feed:
-                continue
-                
-            feed_title = pf.feed.title
-            blog_title = pf.feed.blog.title if pf.feed.blog else None
-            categories = pf.feed.categories or []
-            
-            # Process slides
-            slides_data = []
-            if pf.feed.slides:
-                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
-                slides_data = [format_slide_response(slide) for slide in sorted_slides]
-            
-            slides_count = len(slides_data)
-            
-            # Get enhanced metadata
-            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
-            
-            response_data.append({
-                "id": pf.id,
-                "feed_id": pf.feed_id,
-                "admin_id": pf.admin_id,
-                "admin_name": pf.admin_name,
-                "published_at": pf.published_at,
-                "is_active": pf.is_active,
-                "feed_title": feed_title,
-                "blog_title": blog_title,
-                "feed_categories": categories,
-                "slides_count": slides_count,
-                "slides": slides_data if slides_data else None,
-                "meta": meta_data
-            })
-        
-        return {
-            "items": response_data,
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "has_more": (page * limit) < total,
-            "personalization_info": {
-                "followed_topics_count": len(followed_topics),
-                "followed_sources_count": len(followed_sources),
-                "is_personalized": len(followed_topics) > 0 or len(followed_sources) > 0,
-                "followed_topic_names": topic_names,
-                "followed_source_names": [fs.source.name for fs in followed_sources if fs.source]
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching personalized feeds for user {user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch personalized feeds"
-        )
-
-
-from sqlalchemy import or_, and_, String, func, distinct
-from typing import List
-
-# Add these new endpoints to your existing router
-
-@router.get("/categories", response_model=Dict[str, Any])
-def get_published_feed_categories(
-    db: Session = Depends(get_db),
-    active_only: bool = Query(True, description="Only include categories from active published feeds")
-):
-    """
-    Get all unique categories from published feeds with counts.
-    Returns both category names and their frequencies.
-    """
-    try:
-        # Base query for published feeds
-        query = db.query(PublishedFeed).join(Feed, PublishedFeed.feed_id == Feed.id)
-        
-        if active_only:
-            query = query.filter(PublishedFeed.is_active == True)
-        
-        # Get all published feeds with their categories
-        published_feeds = query.options(
-            joinedload(PublishedFeed.feed)
+        # Validate that all category IDs exist
+        existing_categories = db.query(Category).filter(
+            Category.id.in_(request.category_ids)
         ).all()
         
-        # Extract and count categories
-        category_count = {}
-        all_categories = set()
+        existing_category_ids = {cat.id for cat in existing_categories}
+        invalid_ids = set(request.category_ids) - existing_category_ids
         
-        for pf in published_feeds:
-            if pf.feed and pf.feed.categories:
-                for category in pf.feed.categories:
-                    if category:  # Skip empty categories
-                        all_categories.add(category)
-                        category_count[category] = category_count.get(category, 0) + 1
-        
-        # Convert to sorted list of categories with counts
-        sorted_categories = sorted([
-            {
-                "name": category,
-                "count": category_count[category],
-                "id": f"cat_{idx}"  # Generate simple ID for frontend use
-            }
-            for idx, category in enumerate(sorted(all_categories))
-        ], key=lambda x: x["count"], reverse=True)
-        
-        return {
-            "categories": sorted_categories,
-            "total_categories": len(sorted_categories),
-            "total_feeds": len(published_feeds),
-            "active_only": active_only
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching published feed categories: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch categories"
-        )
-
-@router.get("/feeds/by-category", response_model=Dict[str, Any])
-def get_published_feeds_by_category(
-    category: str = Query(..., description="Category name to filter by"),
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
-    active_only: bool = Query(True, description="Show only active published feeds"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get published feeds by category name with enhanced metadata.
-    Uses case-insensitive partial matching for category names.
-    """
-    try:
-        # Base query with proper joins
-        query = db.query(PublishedFeed).options(
-            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
-        ).join(Feed, PublishedFeed.feed_id == Feed.id)
-        
-        # Filter by active status
-        if active_only:
-            query = query.filter(PublishedFeed.is_active == True)
-        
-        # Filter by category - using JSON array containment with string matching
-        # This handles the case where categories is a JSON array of strings
-        category_filter = Feed.categories.cast(String).ilike(f'%"{category}"%')
-        query = query.filter(category_filter)
-        
-        # Order by most recent first
-        query = query.order_by(PublishedFeed.published_at.desc())
-        
-        # Get total count for pagination
-        total = query.count()
-        
-        # Pagination
-        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
-        
-        response_data = []
-        for pf in published_feeds:
-            if not pf.feed:
-                continue
-                
-            feed_title = pf.feed.title
-            blog_title = pf.feed.blog.title if pf.feed.blog else None
-            categories = pf.feed.categories or []
-            
-            # Process slides
-            slides_data = []
-            if pf.feed.slides:
-                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
-                slides_data = [format_slide_response(slide) for slide in sorted_slides]
-            
-            slides_count = len(slides_data)
-            
-            # Get enhanced metadata
-            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
-            
-            response_data.append({
-                "id": pf.id,
-                "feed_id": pf.feed_id,
-                "admin_id": pf.admin_id,
-                "admin_name": pf.admin_name,
-                "published_at": pf.published_at,
-                "is_active": pf.is_active,
-                "feed_title": feed_title,
-                "blog_title": blog_title,
-                "feed_categories": categories,
-                "slides_count": slides_count,
-                "slides": slides_data if slides_data else None,
-                "meta": meta_data
-            })
-        
-        return {
-            "items": response_data,
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "has_more": (page * limit) < total,
-            "category": category,
-            "active_only": active_only
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching published feeds by category '{category}': {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch feeds for category '{category}'"
-        )
-
-@router.get("/feeds/by-category-id", response_model=Dict[str, Any])
-def get_published_feeds_by_category_id(
-    category_id: str = Query(..., description="Category ID from the categories list"),
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
-    active_only: bool = Query(True, description="Show only active published feeds"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get published feeds by category ID.
-    The category ID should be from the categories list endpoint (format: 'cat_1', 'cat_2', etc.)
-    """
-    try:
-        # First, get all categories to map ID to name
-        categories_response = get_published_feed_categories(db, active_only)
-        categories_map = {cat["id"]: cat["name"] for cat in categories_response["categories"]}
-        
-        # Find category name by ID
-        category_name = categories_map.get(category_id)
-        if not category_name:
+        if invalid_ids:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Category with ID '{category_id}' not found"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid category IDs: {invalid_ids}"
             )
-        
-        # Now use the existing category name endpoint logic
-        return get_published_feeds_by_category(category_name, page, limit, active_only, db)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching published feeds by category ID '{category_id}': {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch feeds for category ID '{category_id}'"
-        )
 
-# from sqlalchemy import or_, and_, String, func, distinct, text
-# from typing import List
-
-# Add these new endpoints to your router
-
-@router.get("/user-categories", response_model=Dict[str, Any])
-def get_user_categories_from_onboarding(
-    user_id: int = Query(..., description="User ID to get onboarding categories"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get categories from user's onboarding domains of interest.
-    """
-    try:
-        # Get user's onboarding data
-        onboarding = db.query(UserOnboarding).filter(
-            UserOnboarding.user_id == user_id
-        ).first()
-        
-        if not onboarding:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User onboarding data not found"
-            )
-        
-        domains_of_interest = onboarding.domains_of_interest or []
-        
-        # Get published feeds count for each domain
-        categories_with_counts = []
-        for domain in domains_of_interest:
-            # Count published feeds that have this domain in their categories
-            count_query = db.query(PublishedFeed).join(Feed, PublishedFeed.feed_id == Feed.id).filter(
-                PublishedFeed.is_active == True,
-                Feed.categories.cast(String).ilike(f'%"{domain}"%')
-            ).count()
-            
-            categories_with_counts.append({
-                "name": domain,
-                "count": count_query,
-                "id": f"cat_{len(categories_with_counts)}"
-            })
-        
-        return {
-            "categories": categories_with_counts,
-            "total_categories": len(categories_with_counts),
-            "user_id": user_id,
-            "source": "onboarding_domains"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching user categories from onboarding: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch user categories"
-        )
-
-from typing import List, Optional
-from pydantic import BaseModel, Field
-class AddDomainsRequest(BaseModel):
-    user_id: int = Field(..., description="User ID to update domains for")
-    domains: List[str] = Field(..., description="List of domains to add")
-    replace_existing: bool = Field(False, description="Whether to replace existing domains or add to them")
-
-class DomainsResponse(BaseModel):
-    user_id: int
-    domains: List[str]
-    total_domains: int
-    message: str
-
-@router.post("/user/domains", response_model=DomainsResponse)
-def add_user_domains(
-    request: AddDomainsRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    Add or update domains of interest for a user in their onboarding data.
-    """
-    try:
         # Find user's onboarding data
         onboarding = db.query(UserOnboarding).filter(
             UserOnboarding.user_id == request.user_id
         ).first()
 
         if not onboarding:
-            # Create new onboarding entry if it doesn't exist
+            # Create new onboarding entry
             onboarding = UserOnboarding(
                 user_id=request.user_id,
-                domains_of_interest=request.domains,
+                domains_of_interest=existing_category_ids,  # Store category IDs
                 is_completed=False
             )
             db.add(onboarding)
-            message = "New onboarding created with domains"
+            message = "New onboarding created with categories"
             
         else:
-            # Update existing domains
-            current_domains = onboarding.domains_of_interest or []
+            # Update existing categories
+            current_category_ids = set(onboarding.domains_of_interest or [])
             
             if request.replace_existing:
-                # Replace all domains
-                updated_domains = request.domains
-                message = "Domains replaced successfully"
+                # Replace all categories
+                updated_category_ids = list(existing_category_ids)
+                message = "Categories replaced successfully"
             else:
-                # Add new domains, remove duplicates
-                updated_domains = list(set(current_domains + request.domains))
-                message = "Domains added successfully"
+                # Add new categories
+                updated_category_ids = list(current_category_ids.union(existing_category_ids))
+                message = "Categories added successfully"
             
-            onboarding.domains_of_interest = updated_domains
+            onboarding.domains_of_interest = updated_category_ids
             onboarding.updated_at = datetime.utcnow()
 
         db.commit()
         db.refresh(onboarding)
 
-        return DomainsResponse(
+        # Get category details for response
+        user_categories = db.query(Category).filter(
+            Category.id.in_(onboarding.domains_of_interest or [])
+        ).all()
+
+        return CategoriesResponse(
             user_id=request.user_id,
-            domains=onboarding.domains_of_interest or [],
-            total_domains=len(onboarding.domains_of_interest or []),
+            categories=[
+                {
+                    "id": cat.id,
+                    "name": cat.name,
+                    "description": cat.description,
+                    "is_active": cat.is_active
+                }
+                for cat in user_categories
+            ],
+            total_categories=len(user_categories),
             message=message
-        )
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error updating domains for user {request.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update user domains"
-        )
-
-@router.get("/user/{user_id}/domains", response_model=DomainsResponse)
-def get_user_domains(
-    user_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Get user's current domains of interest.
-    """
-    try:
-        onboarding = db.query(UserOnboarding).filter(
-            UserOnboarding.user_id == user_id
-        ).first()
-
-        if not onboarding:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User onboarding data not found"
-            )
-
-        return DomainsResponse(
-            user_id=user_id,
-            domains=onboarding.domains_of_interest or [],
-            total_domains=len(onboarding.domains_of_interest or []),
-            message="Domains retrieved successfully"
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching domains for user {user_id}: {e}")
+        db.rollback()
+        logger.error(f"Error updating categories for user {request.user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch user domains"
+            detail="Failed to update user categories"
         )
 
-@router.delete("/user/{user_id}/domains")
-def remove_user_domains(
+@router.get("/user/{user_id}/categories", response_model=CategoriesResponse)
+def get_user_categories(
     user_id: int,
-    domains_to_remove: List[str] = Query(..., description="Domains to remove"),
     db: Session = Depends(get_db)
 ):
     """
-    Remove specific domains from user's domains of interest.
+    Get user's current categories of interest with full category details.
+    """
+    try:
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+
+        if not onboarding or not onboarding.domains_of_interest:
+            return CategoriesResponse(
+                user_id=user_id,
+                categories=[],
+                total_categories=0,
+                message="No categories found for user"
+            )
+
+        # Get full category details
+        user_categories = db.query(Category).filter(
+            Category.id.in_(onboarding.domains_of_interest)
+        ).all()
+
+        return CategoriesResponse(
+            user_id=user_id,
+            categories=[
+                {
+                    "id": cat.id,
+                    "name": cat.name,
+                    "description": cat.description,
+                    "is_active": cat.is_active
+                }
+                for cat in user_categories
+            ],
+            total_categories=len(user_categories),
+            message="Categories retrieved successfully"
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching categories for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user categories"
+        )
+
+@router.delete("/user/{user_id}/categories")
+def remove_user_categories(
+    user_id: int,
+    category_ids: List[int] = Query(..., description="Category IDs to remove"),
+    db: Session = Depends(get_db)
+):
+    """
+    Remove specific categories from user's interests by category ID.
     """
     try:
         onboarding = db.query(UserOnboarding).filter(
@@ -1236,31 +890,250 @@ def remove_user_domains(
                 detail="User onboarding data not found"
             )
 
-        current_domains = onboarding.domains_of_interest or []
+        current_category_ids = set(onboarding.domains_of_interest or [])
         
-        # Remove specified domains
-        updated_domains = [domain for domain in current_domains if domain not in domains_to_remove]
+        # Remove specified category IDs
+        updated_category_ids = list(current_category_ids - set(category_ids))
         
-        onboarding.domains_of_interest = updated_domains
+        onboarding.domains_of_interest = updated_category_ids
         onboarding.updated_at = datetime.utcnow()
         
         db.commit()
 
         return {
             "user_id": user_id,
-            "removed_domains": domains_to_remove,
-            "current_domains": updated_domains,
-            "total_domains": len(updated_domains),
-            "message": f"Successfully removed {len(domains_to_remove)} domains"
+            "removed_category_ids": category_ids,
+            "current_category_ids": updated_category_ids,
+            "total_categories": len(updated_category_ids),
+            "message": f"Successfully removed {len(category_ids)} categories"
         }
 
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Error removing domains for user {user_id}: {e}")
+        logger.error(f"Error removing categories for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to remove user domains"
+            detail="Failed to remove user categories"
         )
 
+@router.get("/categories/available")
+def get_available_categories(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    search: str = Query(None, description="Search categories by name"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all available categories with their feed counts.
+    """
+    try:
+        query = db.query(Category).filter(Category.is_active == True)
+        
+        if search:
+            query = query.filter(Category.name.ilike(f'%{search}%'))
+        
+        # Get total count
+        total = query.count()
+        
+        # Pagination
+        categories = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Get feed counts for each category
+        categories_with_counts = []
+        for category in categories:
+            # Count published feeds that have this category
+            feed_count = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.categories.cast(String).ilike(f'%"{category.name}"%')
+            ).count()
+            
+            categories_with_counts.append({
+                "id": category.id,
+                "name": category.name,
+                "description": category.description,
+                "feed_count": feed_count,
+                "is_active": category.is_active,
+                "created_at": category.created_at
+            })
+        
+        return {
+            "categories": categories_with_counts,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching available categories: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch available categories"
+        )
+
+@router.get("/feeds/by-category/{category_id}")
+def get_feeds_by_category_id(
+    category_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get published feeds by category ID instead of category name.
+    """
+    try:
+        # First get the category name from ID
+        category = db.query(Category).filter(Category.id == category_id).first()
+        
+        if not category:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Category with ID {category_id} not found"
+            )
+
+        # Get feeds that have this category
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).join(Feed, PublishedFeed.feed_id == Feed.id).filter(
+            PublishedFeed.is_active == True,
+            Feed.categories.cast(String).ilike(f'%"{category.name}"%')
+        ).order_by(PublishedFeed.published_at.desc())
+
+        total = query.count()
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+
+        response_data = []
+        for pf in published_feeds:
+            if not pf.feed:
+                continue
+                
+            feed_data = format_published_feed_response(pf, db)
+            if feed_data:
+                response_data.append(feed_data)
+
+        return {
+            "items": response_data,
+            "category": {
+                "id": category.id,
+                "name": category.name,
+                "description": category.description
+            },
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching feeds for category ID {category_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch feeds for category ID {category_id}"
+        )
+
+@router.post("/feeds/category-filter-by-id", response_model=Dict[str, Any])
+def filter_feeds_within_category_by_id(
+    request: CategoryFilterRequest,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    db: Session = Depends(get_db)
+):
+    """
+    Filter feeds within a specific category (by ID) by topics, sources, concepts, questions, or summary.
+    """
+    try:
+        # Get category name from ID
+        category = db.query(Category).filter(Category.id == int(request.category)).first()
+        
+        if not category:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Category with ID {request.category} not found"
+            )
+
+        # Use the existing enhanced filter but with category name
+        enhanced_request = CategoryFilterRequest(
+            category=category.name,
+            filter_type=request.filter_type,
+            user_id=request.user_id
+        )
+        
+        return filter_feeds_within_category_enhanced(enhanced_request, page, limit, db)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error filtering category ID {request.category} by {request.filter_type}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to filter category ID {request.category} by {request.filter_type}"
+        )
+
+@router.get("/user/{user_id}/suggested-categories")
+def get_suggested_categories(
+    user_id: int,
+    limit: int = Query(10, description="Number of suggestions to return"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get suggested categories based on user's current interests and popular categories.
+    """
+    try:
+        # Get user's current category IDs
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+        
+        current_category_ids = set(onboarding.domains_of_interest or []) if onboarding else set()
+
+        # Get all active categories with feed counts
+        all_categories = db.query(Category).filter(
+            Category.is_active == True
+        ).all()
+
+        # Remove user's current categories from suggestions
+        suggested_categories = [cat for cat in all_categories if cat.id not in current_category_ids]
+        
+        # Get category popularity (count of feeds per category)
+        category_popularity = {}
+        for category in suggested_categories:
+            feed_count = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.categories.cast(String).ilike(f'%"{category.name}"%')
+            ).count()
+            category_popularity[category.id] = feed_count
+
+        # Sort by popularity and limit
+        suggested_categories_sorted = sorted(
+            suggested_categories, 
+            key=lambda x: category_popularity.get(x.id, 0), 
+            reverse=True
+        )[:limit]
+
+        return {
+            "user_id": user_id,
+            "suggested_categories": [
+                {
+                    "id": cat.id,
+                    "name": cat.name,
+                    "description": cat.description,
+                    "popularity": category_popularity.get(cat.id, 0),
+                    "feed_count": category_popularity.get(cat.id, 0)
+                }
+                for cat in suggested_categories_sorted
+            ],
+            "total_suggestions": len(suggested_categories_sorted),
+            "current_categories_count": len(current_category_ids)
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting suggested categories for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get suggested categories"
+        )
