@@ -8,7 +8,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from database import get_db
-from models import PublishedFeed, Feed, User, Blog, Slide, Transcript
+from models import PublishedFeed, Feed, User, Blog, Slide, Transcript, UserTopicFollow, UserSourceFollow,UserOnboarding, Source
 from schemas import (
     PublishFeedRequest, 
     PublishedFeedResponse, 
@@ -1052,4 +1052,61 @@ def get_published_feeds_by_category_id(
             detail=f"Failed to fetch feeds for category ID '{category_id}'"
         )
 
-# Also update the schemas.py file to include the response models if needed
+# from sqlalchemy import or_, and_, String, func, distinct, text
+# from typing import List
+
+# Add these new endpoints to your router
+
+@router.get("/user-categories", response_model=Dict[str, Any])
+def get_user_categories_from_onboarding(
+    user_id: int = Query(..., description="User ID to get onboarding categories"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get categories from user's onboarding domains of interest.
+    """
+    try:
+        # Get user's onboarding data
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+        
+        if not onboarding:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User onboarding data not found"
+            )
+        
+        domains_of_interest = onboarding.domains_of_interest or []
+        
+        # Get published feeds count for each domain
+        categories_with_counts = []
+        for domain in domains_of_interest:
+            # Count published feeds that have this domain in their categories
+            count_query = db.query(PublishedFeed).join(Feed, PublishedFeed.feed_id == Feed.id).filter(
+                PublishedFeed.is_active == True,
+                Feed.categories.cast(String).ilike(f'%"{domain}"%')
+            ).count()
+            
+            categories_with_counts.append({
+                "name": domain,
+                "count": count_query,
+                "id": f"cat_{len(categories_with_counts)}"
+            })
+        
+        return {
+            "categories": categories_with_counts,
+            "total_categories": len(categories_with_counts),
+            "user_id": user_id,
+            "source": "onboarding_domains"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user categories from onboarding: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user categories"
+        )
+
