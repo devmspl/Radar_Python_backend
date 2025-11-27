@@ -572,3 +572,23 @@ class BookmarkCreateResponse(BaseModel):
     bookmark_id: int
     feed_id: int
     user_id: int
+
+class CategoryResponse(BaseModel):
+    name: str
+    count: int
+    id: str
+
+class CategoriesListResponse(BaseModel):
+    categories: List[CategoryResponse]
+    total_categories: int
+    total_feeds: int
+    active_only: bool
+
+class PublishedFeedsByCategoryResponse(BaseModel):
+    items: List[PublishedFeedResponse]  # Reusing existing PublishedFeedResponse
+    page: int
+    limit: int
+    total: int
+    has_more: bool
+    category: str
+    active_only: bool
