@@ -573,11 +573,6 @@ class BookmarkCreateResponse(BaseModel):
     feed_id: int
     user_id: int
 
-class CategoryResponse(BaseModel):
-    name: str
-    count: int
-    id: str
-
 class CategoriesListResponse(BaseModel):
     categories: List[CategoryResponse]
     total_categories: int
