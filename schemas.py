@@ -2,7 +2,7 @@ from pydantic import BaseModel, EmailStr, Field, validator,field_validator
 from typing import Optional, List, Dict,Any
 from datetime import datetime
 from enum import Enum
-
+from typing import Union
 # Enums for job status and content type
 class JobStatus(str, Enum):
     QUEUED = "queued"
@@ -446,7 +446,7 @@ class BatchScrapeResponse(BaseModel):
     job_responses: List[ScrapeJobResponse]
 
 class OnboardingBase(BaseModel):
-    domains_of_interest: Optional[List[str]] = None
+    domains_of_interest: Optional[List[Union[int, str]]] = None
     skills_tools: Optional[List[str]] = None
     interested_roles: Optional[List[str]] = None
     social_links: Optional[Dict[str, str]] = None
