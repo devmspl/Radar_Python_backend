@@ -721,7 +721,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import String  # and Column if needed
 
 class AddCategoriesRequest(BaseModel):
-    user_id: int = Field(..., description="User ID to update categories for")
     category_ids: List[int] = Field(..., description="List of category IDs to add")
     replace_existing: bool = Field(False, description="Whether to replace existing categories or add to them")
 
@@ -735,57 +734,53 @@ class CategoryFilterRequest(BaseModel):
     filter_type: str = Field(..., description="Filter type: topics, sources, concepts, questions, summary")
     user_id: Optional[int] = None
 
-@router.post("/user/categories", response_model=CategoriesResponse)
+@router.post("/user/{user_id}/categories", response_model=CategoriesResponse)
 def add_user_categories(
+    user_id: int,
     request: AddCategoriesRequest,
     db: Session = Depends(get_db)
 ):
     """
     Add or update categories of interest for a user using category IDs.
+    Path parameter `user_id` determines the user.
     """
     try:
         # Validate that all category IDs exist
         existing_categories = db.query(Category).filter(
             Category.id.in_(request.category_ids)
         ).all()
-        
-        existing_category_ids = {cat.id for cat in existing_categories}
-        invalid_ids = set(request.category_ids) - existing_category_ids
-        
+
+        existing_category_ids = [cat.id for cat in existing_categories]
+        invalid_ids = set(request.category_ids) - set(existing_category_ids)
+
         if invalid_ids:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail=f"Invalid category IDs: {invalid_ids}"
             )
 
-        # Find user's onboarding data
+        # Find or create user's onboarding data
         onboarding = db.query(UserOnboarding).filter(
-            UserOnboarding.user_id == request.user_id
+            UserOnboarding.user_id == user_id
         ).first()
 
         if not onboarding:
-            # Create new onboarding entry
             onboarding = UserOnboarding(
-                user_id=request.user_id,
-                domains_of_interest=existing_category_ids,  # Store category IDs
+                user_id=user_id,
+                domains_of_interest=existing_category_ids,
                 is_completed=False
             )
             db.add(onboarding)
             message = "New onboarding created with categories"
-            
         else:
-            # Update existing categories
             current_category_ids = set(onboarding.domains_of_interest or [])
-            
             if request.replace_existing:
-                # Replace all categories
-                updated_category_ids = list(existing_category_ids)
+                updated_category_ids = existing_category_ids
                 message = "Categories replaced successfully"
             else:
-                # Add new categories
                 updated_category_ids = list(current_category_ids.union(existing_category_ids))
                 message = "Categories added successfully"
-            
+
             onboarding.domains_of_interest = updated_category_ids
             onboarding.updated_at = datetime.utcnow()
 
@@ -798,7 +793,7 @@ def add_user_categories(
         ).all()
 
         return CategoriesResponse(
-            user_id=request.user_id,
+            user_id=user_id,
             categories=[
                 {
                     "id": cat.id,
@@ -812,15 +807,14 @@ def add_user_categories(
             message=message
         )
 
-    except HTTPException:
-        raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Error updating categories for user {request.user_id}: {e}")
+        logger.error(f"Error updating categories for user {user_id}: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Failed to update user categories"
         )
+
 
 @router.get("/user/{user_id}/categories", response_model=CategoriesResponse)
 def get_user_categories(
