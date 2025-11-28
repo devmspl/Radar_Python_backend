@@ -1,17 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 import json
-
+import logging
 from database import get_db
 import models, schemas
 from dependencies import get_current_user
 from datetime import datetime
+from models import Role, SkillTool, UserOnboarding, UserRole, UserSkillTool
 router = APIRouter(
     prefix="/onboarding",
     tags=["Onboarding"]
 )
-
+logger = logging.getLogger(__name__)
 # Your questionnaire data
 QUESTIONNAIRE_DATA = {
     "id": "complete_onboarding",
@@ -658,3 +659,381 @@ async def update_onboarding_data(
     db.refresh(onboarding_data)
     
     return onboarding_data
+
+from models import Role, SkillTool,UserRole, UserSkillTool, User
+from sqlalchemy.orm import Session, joinedload  # Add joinedload here
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+# ========== PYDANTIC SCHEMAS ==========
+
+class RoleResponse(BaseModel):
+    id: int
+    title: str
+    category: str
+    description: Optional[str] = None
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
+
+class SkillToolResponse(BaseModel):
+    id: int
+    name: str
+    category: str
+    description: Optional[str] = None
+    popularity: int = 0
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
+
+class UserRoleCreate(BaseModel):
+    role_id: int
+    seniority_level: str = "mid_level"
+    is_current: bool = False
+    is_target: bool = False
+
+class UserSkillToolCreate(BaseModel):
+    skill_tool_id: int
+    proficiency_level: str = "intermediate"
+    years_of_experience: Optional[int] = None
+
+class BulkRolesRequest(BaseModel):
+    user_id: int
+    roles: List[UserRoleCreate]
+    replace_existing: bool = False
+
+class BulkSkillsToolsRequest(BaseModel):
+    user_id: int
+    skills_tools: List[UserSkillToolCreate]
+    replace_existing: bool = False
+
+# ========== ROLES ENDPOINTS ==========
+
+@router.get("/roles", response_model=List[RoleResponse])
+def get_roles(
+    category: Optional[str] = Query(None, description="Filter by category"),
+    search: Optional[str] = Query(None, description="Search by title"),
+    active_only: bool = Query(True, description="Show only active roles"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Get all available roles with filtering."""
+    try:
+        query = db.query(Role)
+        
+        if active_only:
+            query = query.filter(Role.is_active == True)
+        
+        if category:
+            query = query.filter(Role.category == category)
+        
+        if search:
+            query = query.filter(Role.title.ilike(f'%{search}%'))
+        
+        query = query.order_by(Role.popularity.desc(), Role.title)
+        
+        roles = query.offset((page - 1) * limit).limit(limit).all()
+        
+        return roles
+        
+    except Exception as e:
+        logger.error(f"Error fetching roles: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch roles"
+        )
+
+# @router.get("/roles/categories")
+# def get_role_categories(db: Session = Depends(get_db)):
+#     """Get all available role categories."""
+#     try:
+#         categories = db.query(Role.category).filter(
+#             Role.is_active == True
+#         ).distinct().all()
+        
+#         return {
+#             "categories": [cat[0] for cat in categories if cat[0]]
+#         }
+        
+#     except Exception as e:
+#         logger.error(f"Error fetching role categories: {e}")
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail="Failed to fetch role categories"
+#         )
+
+# ========== SKILLS & TOOLS ENDPOINTS ==========
+
+@router.get("/skills-tools", response_model=List[SkillToolResponse])
+def get_skills_tools(
+    category: Optional[str] = Query(None, description="Filter by category"),
+    search: Optional[str] = Query(None, description="Search by name"),
+    active_only: bool = Query(True, description="Show only active skills/tools"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Get all available skills and tools with filtering."""
+    try:
+        query = db.query(SkillTool)
+        
+        if active_only:
+            query = query.filter(SkillTool.is_active == True)
+        
+        if category:
+            query = query.filter(SkillTool.category == category)
+        
+        if search:
+            query = query.filter(SkillTool.name.ilike(f'%{search}%'))
+        
+        query = query.order_by(SkillTool.popularity.desc(), SkillTool.name)
+        
+        skills_tools = query.offset((page - 1) * limit).limit(limit).all()
+        
+        return skills_tools
+        
+    except Exception as e:
+        logger.error(f"Error fetching skills/tools: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch skills/tools"
+        )
+
+# @router.get("/skills-tools/categories")
+# def get_skill_tool_categories(db: Session = Depends(get_db)):
+#     """Get all available skill/tool categories."""
+#     try:
+#         categories = db.query(SkillTool.category).filter(
+#             SkillTool.is_active == True
+#         ).distinct().all()
+        
+#         return {
+#             "categories": [cat[0] for cat in categories if cat[0]]
+#         }
+        
+#     except Exception as e:
+#         logger.error(f"Error fetching skill/tool categories: {e}")
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail="Failed to fetch skill/tool categories"
+#         )
+
+# ========== USER ONBOARDING MANAGEMENT ==========
+
+@router.post("/user/roles", response_model=Dict[str, Any])
+def add_user_roles(
+    request: BulkRolesRequest,
+    db: Session = Depends(get_db)
+):
+    """Add roles for a user during onboarding."""
+    try:
+        user = db.query(User).filter(User.id == request.user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if request.replace_existing:
+            # Remove existing roles
+            db.query(UserRole).filter(UserRole.user_id == request.user_id).delete()
+        
+        added_roles = []
+        for role_data in request.roles:
+            # Verify role exists
+            role = db.query(Role).filter(
+                Role.id == role_data.role_id,
+                Role.is_active == True
+            ).first()
+            
+            if not role:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Role with ID {role_data.role_id} not found"
+                )
+            
+            user_role = UserRole(
+                user_id=request.user_id,
+                role_id=role_data.role_id,
+                seniority_level=role_data.seniority_level,
+                is_current=role_data.is_current,
+                is_target=role_data.is_target
+            )
+            db.add(user_role)
+            added_roles.append({
+                "role_id": role.id,
+                "title": role.title,
+                "seniority_level": role_data.seniority_level
+            })
+        
+        db.commit()
+        
+        return {
+            "message": "Roles added successfully",
+            "user_id": request.user_id,
+            "added_roles": added_roles,
+            "total_roles": len(added_roles)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error adding user roles: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to add user roles"
+        )
+
+@router.post("/user/skills-tools", response_model=Dict[str, Any])
+def add_user_skills_tools(
+    request: BulkSkillsToolsRequest,
+    db: Session = Depends(get_db)
+):
+    """Add skills and tools for a user during onboarding."""
+    try:
+        user = db.query(User).filter(User.id == request.user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if request.replace_existing:
+            # Remove existing skills/tools
+            db.query(UserSkillTool).filter(UserSkillTool.user_id == request.user_id).delete()
+        
+        added_skills = []
+        for skill_data in request.skills_tools:
+            # Verify skill/tool exists
+            skill_tool = db.query(SkillTool).filter(
+                SkillTool.id == skill_data.skill_tool_id,
+                SkillTool.is_active == True
+            ).first()
+            
+            if not skill_tool:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Skill/Tool with ID {skill_data.skill_tool_id} not found"
+                )
+            
+            user_skill_tool = UserSkillTool(
+                user_id=request.user_id,
+                skill_tool_id=skill_data.skill_tool_id,
+                proficiency_level=skill_data.proficiency_level,
+                years_of_experience=skill_data.years_of_experience
+            )
+            db.add(user_skill_tool)
+            added_skills.append({
+                "skill_tool_id": skill_tool.id,
+                "name": skill_tool.name,
+                "proficiency_level": skill_data.proficiency_level
+            })
+        
+        db.commit()
+        
+        return {
+            "message": "Skills/Tools added successfully",
+            "user_id": request.user_id,
+            "added_skills": added_skills,
+            "total_skills": len(added_skills)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error adding user skills/tools: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to add user skills/tools"
+        )
+
+@router.get("/user/{user_id}/roles")
+def get_user_roles(user_id: int, db: Session = Depends(get_db)):
+    """Get all roles for a user."""
+    try:
+        user_roles = db.query(UserRole).options(
+            joinedload(UserRole.role)
+        ).filter(UserRole.user_id == user_id).all()
+        
+        return {
+            "user_id": user_id,
+            "roles": [
+                {
+                    "id": ur.id,
+                    "role_id": ur.role_id,
+                    "title": ur.role.title,
+                    "category": ur.role.category,
+                    "seniority_level": ur.seniority_level,
+                    "is_current": ur.is_current,
+                    "is_target": ur.is_target
+                }
+                for ur in user_roles
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching user roles: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user roles"
+        )
+
+@router.get("/user/{user_id}/skills-tools")
+def get_user_skills_tools(user_id: int, db: Session = Depends(get_db)):
+    """Get all skills and tools for a user."""
+    try:
+        user_skills = db.query(UserSkillTool).options(
+            joinedload(UserSkillTool.skill_tool)
+        ).filter(UserSkillTool.user_id == user_id).all()
+        
+        return {
+            "user_id": user_id,
+            "skills_tools": [
+                {
+                    "id": ust.id,
+                    "skill_tool_id": ust.skill_tool_id,
+                    "name": ust.skill_tool.name,
+                    "category": ust.skill_tool.category,
+                    "proficiency_level": ust.proficiency_level,
+                    "years_of_experience": ust.years_of_experience
+                }
+                for ust in user_skills
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching user skills/tools: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user skills/tools"
+        )
+
+@router.get("/user/{user_id}/onboarding-status")
+def get_user_onboarding_status(user_id: int, db: Session = Depends(get_db)):
+    """Get user's onboarding completion status."""
+    try:
+        onboarding = db.query(UserOnboarding).filter(
+            UserOnboarding.user_id == user_id
+        ).first()
+        
+        user_roles_count = db.query(UserRole).filter(
+            UserRole.user_id == user_id
+        ).count()
+        
+        user_skills_count = db.query(UserSkillTool).filter(
+            UserSkillTool.user_id == user_id
+        ).count()
+        
+        return {
+            "user_id": user_id,
+            "onboarding_completed": onboarding.is_completed if onboarding else False,
+            "completed_at": onboarding.completed_at if onboarding else None,
+            "roles_count": user_roles_count,
+            "skills_count": user_skills_count,
+            "has_domains": bool(onboarding.domains_of_interest) if onboarding else False
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching onboarding status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch onboarding status"
+        )

@@ -45,6 +45,9 @@ class User(Base):
     # Add this relationship
     bookmarks = relationship("Bookmark", back_populates="user")
 
+     # Add these relationships
+    skill_tools = relationship("UserSkillTool", back_populates="user")
+    roles = relationship("UserRole", back_populates="user")
 class UserOnboarding(Base):
     __tablename__ = "user_onboarding"
     
@@ -399,3 +402,59 @@ class Bookmark(Base):
     
     # Unique constraint to prevent duplicate bookmarks
     __table_args__ = (UniqueConstraint('user_id', 'feed_id', name='unique_user_feed_bookmark'),)
+
+    # Add to existing models
+
+class SkillTool(Base):
+    __tablename__ = "skill_tools"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    category = Column(String, index=True, nullable=False)  # e.g., "Programming", "Design", "Analytics"
+    description = Column(Text, nullable=True)
+    popularity = Column(Integer, default=0)  # Track how often it's selected
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Role(Base):
+    __tablename__ = "roles"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, unique=True, index=True, nullable=False)
+    category = Column(String, index=True, nullable=False)  # e.g., "Engineering", "Design", "Product"
+    description = Column(Text, nullable=True)
+    seniority_levels = Column(JSON, nullable=True)  # ["Junior", "Mid", "Senior", "Lead"]
+    popularity = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class UserSkillTool(Base):
+    __tablename__ = "user_skill_tools"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    skill_tool_id = Column(Integer, ForeignKey("skill_tools.id"), nullable=False)
+    proficiency_level = Column(String, default="intermediate")  # beginner, intermediate, advanced, expert
+    years_of_experience = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User")
+    skill_tool = relationship("SkillTool")
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role_id = Column(Integer, ForeignKey("roles.id"), nullable=False)
+    seniority_level = Column(String, nullable=True)  # e.g., "Junior", "Senior", "Lead"
+    is_current = Column(Boolean, default=False)
+    is_target = Column(Boolean, default=False)  # Target role for career growth
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User")
+    role = relationship("Role")
