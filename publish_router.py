@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
+# publish_router.py
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import List, Optional, Dict, Any
@@ -8,16 +9,13 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from database import get_db
-from models import PublishedFeed, Category,Feed, User, Blog, Slide, Transcript, UserTopicFollow, UserSourceFollow,UserOnboarding, Source
+from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source
 from schemas import (
     PublishFeedRequest, 
-    PublishedFeedResponse, 
-    PublishedFeedDetailResponse,
     PublishStatusResponse, 
     DeletePublishResponse,
     BulkPublishRequest,
     SlideResponse,
-    FeedDetailResponse,
     UnpublishFeedRequest
 )
 
@@ -42,98 +40,6 @@ else:
 
 # ------------------ Helper Functions ------------------
 
-def get_current_admin(db: Session, authorization: str = Header(...)) -> User:
-    """
-    Extract admin user from authorization header.
-    In a real app, you'd use proper JWT authentication.
-    This is a simplified version.
-    """
-    try:
-        # Extract user ID from header (simplified - use proper auth in production)
-        # Format: "Bearer {user_id}" or just "{user_id}"
-        if authorization.startswith("Bearer "):
-            user_id = authorization.replace("Bearer ", "").strip()
-        else:
-            user_id = authorization.strip()
-        
-        user_id = int(user_id)
-        
-        admin = db.query(User).filter(
-            User.id == user_id, 
-            User.is_admin == True
-        ).first()
-        
-        if not admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User is not authorized as admin"
-            )
-        
-        return admin
-    except (ValueError, Exception):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header"
-        )
-
-def validate_feed_for_publishing(db: Session, feed_id: int) -> Feed:
-    """Validate if a feed can be published and return the feed object."""
-    feed = db.query(Feed).options(
-        joinedload(Feed.slides),
-        joinedload(Feed.blog)
-    ).filter(Feed.id == feed_id).first()
-    
-    if not feed:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Feed with ID {feed_id} not found"
-        )
-    
-    if feed.status != "ready":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Feed with ID {feed_id} is not ready for publishing. Status: {feed.status}"
-        )
-    
-    if not feed.slides or len(feed.slides) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Feed with ID {feed_id} has no slides"
-        )
-    
-    return feed
-
-def format_slide_response(slide: Slide) -> SlideResponse:
-    """Convert Slide model to SlideResponse schema."""
-    return SlideResponse(
-        id=slide.id,
-        order=slide.order,
-        title=slide.title,
-        body=slide.body,
-        bullets=slide.bullets or [],
-        background_color=slide.background_color,
-        source_refs=slide.source_refs or [],
-        render_markdown=bool(slide.render_markdown),
-        created_at=slide.created_at,
-        updated_at=slide.updated_at
-    )
-
-def format_feed_response(feed: Feed) -> FeedDetailResponse:
-    """Convert Feed model to FeedDetailResponse schema."""
-    slides = sorted(feed.slides, key=lambda x: x.order) if feed.slides else []
-    
-    return FeedDetailResponse(
-        id=feed.id,
-        title=feed.title,
-        categories=feed.categories or [],
-        status=feed.status,
-        ai_generated_content=feed.ai_generated_content,
-        image_generation_enabled=feed.image_generation_enabled,
-        created_at=feed.created_at,
-        updated_at=feed.updated_at,
-        slides=[format_slide_response(slide) for slide in slides]
-    )
-
 def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
     """Get comprehensive channel information from YouTube API."""
     if not youtube_service or not video_id:
@@ -144,14 +50,12 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
         }
     
     try:
-        # First, get video details to extract channel ID
         video_response = youtube_service.videos().list(
             part="snippet",
             id=video_id
         ).execute()
         
         if not video_response.get('items'):
-            logger.warning(f"No video found for ID: {video_id}")
             return {
                 "channel_name": "YouTube Creator",
                 "channel_id": None,
@@ -169,7 +73,6 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
                 "thumbnails": {}
             }
         
-        # Get detailed channel information
         channel_response = youtube_service.channels().list(
             part="snippet,statistics",
             id=channel_id
@@ -197,17 +100,10 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
             "thumbnails": {}
         }
         
-    except HttpError as e:
-        logger.error(f"YouTube API error for video {video_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error fetching YouTube channel info for {video_id}: {e}")
         return {
             "channel_name": "YouTube Creator",
-            "channel_id": None,
-            "thumbnails": {}
-        }
-    except Exception as e:
-        logger.error(f"Unexpected error fetching YouTube channel info for {video_id}: {e}")
-        return {
-            "channel_name": "YouTube Creator", 
             "channel_id": None,
             "thumbnails": {}
         }
@@ -215,49 +111,28 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
 def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, Any]:
     """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
     if feed.source_type == "youtube":
-        # Get the transcript to access YouTube-specific data
         transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
         
         if transcript:
-            # Extract video ID from transcript data
-            video_id = getattr(transcript, 'video_id', None)
-            if not video_id:
-                # Try to extract from transcript_id or other fields
-                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
-            
-            # Get original title from transcript
+            video_id = getattr(transcript, 'video_id', None) or getattr(transcript, 'youtube_video_id', feed.transcript_id)
             original_title = transcript.title if transcript else feed.title
-            
-            # Get channel information from YouTube API
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
-            
-            # Construct proper YouTube URL
-            source_url = f"https://www.youtube.com/watch?v={video_id}"
             
             return {
                 "title": feed.title,
                 "original_title": original_title,
                 "author": channel_name,
-                "source_url": source_url,
+                "source_url": f"https://www.youtube.com/watch?v={video_id}",
                 "source_type": "youtube",
                 "channel_name": channel_name,
                 "channel_id": channel_info.get("channel_id"),
                 "video_id": video_id,
-                # "channel_info": channel_info,  # Include full channel info for frontend
-                # Enhanced fields
                 "website_name": "YouTube",
                 "favicon": "https://www.youtube.com/favicon.ico",
                 "channel_logo": channel_info.get("thumbnails", {}).get('default', {}).get('url') if channel_info.get("thumbnails") else None,
-                "channel_description": channel_info.get("description", ""),
-                "channel_custom_url": channel_info.get("custom_url", ""),
-                "subscriber_count": channel_info.get("subscriber_count"),
-                "video_count": channel_info.get("video_count"),
-                "view_count": channel_info.get("view_count"),
-                "published_at": channel_info.get("published_at")
             }
         else:
-            # Fallback if transcript not found
             video_id = feed.transcript_id
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
@@ -269,19 +144,8 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "source_url": f"https://www.youtube.com/watch?v={video_id}",
                 "source_type": "youtube",
                 "channel_name": channel_name,
-                "channel_id": channel_info.get("channel_id"),
-                "video_id": video_id,
-                "channel_info": channel_info,
-                # Enhanced fields
                 "website_name": "YouTube",
                 "favicon": "https://www.youtube.com/favicon.ico",
-                "channel_logo": channel_info.get("thumbnails", {}).get('default', {}).get('url') if channel_info.get("thumbnails") else None,
-                "channel_description": channel_info.get("description", ""),
-                "channel_custom_url": channel_info.get("custom_url", ""),
-                "subscriber_count": channel_info.get("subscriber_count"),
-                "video_count": channel_info.get("video_count"),
-                "view_count": channel_info.get("view_count"),
-                "published_at": channel_info.get("published_at")
             }
     
     else:  # blog source type
@@ -298,21 +162,10 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "source_type": "blog",
                 "website_name": website_name,
                 "website": blog.website,
-                # Enhanced fields
                 "favicon": f"https://{website_name}/favicon.ico",
                 "channel_name": website_name,
-                "channel_logo": f"https://{website_name}/favicon.ico",
-                "channel_description": "",
-                "channel_custom_url": "",
-                "subscriber_count": None,
-                "video_count": None,
-                "view_count": None,
-                "published_at": getattr(blog, 'published_at', None),
-                "video_id": None,
-                "channel_id": None
             }
         else:
-            # Fallback if blog not found
             return {
                 "title": feed.title,
                 "original_title": "Unknown",
@@ -321,19 +174,23 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "source_type": "blog",
                 "website_name": "Unknown",
                 "website": "Unknown",
-                # Enhanced fields
-                "favicon": None,
-                "channel_name": "Unknown",
-                "channel_logo": None,
-                "channel_description": "",
-                "channel_custom_url": "",
-                "subscriber_count": None,
-                "video_count": None,
-                "view_count": None,
-                "published_at": None,
-                "video_id": None,
-                "channel_id": None
             }
+
+def format_slide_response(slide: Slide) -> SlideResponse:
+    """Convert Slide model to SlideResponse schema."""
+    return SlideResponse(
+        id=slide.id,
+        order=slide.order,
+        title=slide.title,
+        body=slide.body,
+        bullets=slide.bullets or [],
+        background_color=slide.background_color,
+        source_refs=slide.source_refs or [],
+        render_markdown=bool(slide.render_markdown),
+        created_at=slide.created_at,
+        updated_at=slide.updated_at
+    )
+
 def format_published_feed_response(published_feed: PublishedFeed, db: Session) -> Optional[Dict[str, Any]]:
     """Format published feed response with all necessary data."""
     try:
@@ -351,50 +208,469 @@ def format_published_feed_response(published_feed: PublishedFeed, db: Session) -
         # Get enhanced metadata
         meta_data = get_feed_metadata(db, feed, feed.blog)
         
-        return PublishedFeedResponse(
-            id=published_feed.id,
-            feed_id=published_feed.feed_id,
-            admin_id=published_feed.admin_id,
-            admin_name=published_feed.admin_name,
-            published_at=published_feed.published_at,
-            is_active=published_feed.is_active,
-            feed_title=feed.title,
-            blog_title=feed.blog.title if feed.blog else None,
-            feed_categories=feed.categories or [],
-            slides_count=len(slides_data),
-            slides=slides_data,
-            meta=meta_data
-        ).dict()
+        # Safely get content_type with fallback
+        feed_content_type = getattr(feed, 'content_type', 'BLOG')
+        # Convert to display format
+        if feed_content_type == 'BLOG':
+            feed_content_type = 'Blog'
+        elif feed_content_type == 'WEBINAR':
+            feed_content_type = 'Webinar'
+        elif feed_content_type == 'PODCAST':
+            feed_content_type = 'Podcast'
+        elif feed_content_type == 'VIDEO':
+            feed_content_type = 'Video'
+        
+        return {
+            "id": published_feed.id,
+            "feed_id": published_feed.feed_id,
+            "admin_id": published_feed.admin_id,
+            "admin_name": published_feed.admin_name,
+            "published_at": published_feed.published_at.isoformat(),
+            "is_active": published_feed.is_active,
+            "feed_title": feed.title,
+            "blog_title": feed.blog.title if feed.blog else None,
+            "feed_categories": feed.categories or [],
+            "content_type": feed_content_type,
+            "skills": getattr(feed, 'skills', []) or [],
+            "tools": getattr(feed, 'tools', []) or [],
+            "roles": getattr(feed, 'roles', []) or [],
+            "slides_count": len(slides_data),
+            "slides": slides_data,
+            "meta": meta_data
+        }
         
     except Exception as e:
         logger.error(f"Error formatting published feed {published_feed.id}: {e}")
         return None
-# ------------------ API Endpoints ------------------
+
+def get_source_for_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
+    """Get source information for a feed."""
+    try:
+        if feed.source_type == "blog" and feed.blog:
+            # Find source by website
+            source = db.query(Source).filter(
+                Source.website == feed.blog.website,
+                Source.source_type == "blog"
+            ).first()
+            
+            if source:
+                # Count published feeds for this source
+                published_feed_count = db.query(PublishedFeed).join(Feed).join(Blog).filter(
+                    PublishedFeed.is_active == True,
+                    Blog.website == source.website
+                ).count()
+                
+                return {
+                    "id": source.id,
+                    "name": source.name,
+                    "website": source.website,
+                    "source_type": source.source_type,
+                    "published_feed_count": published_feed_count,
+                    "follower_count": source.follower_count,
+                    "is_active": source.is_active
+                }
+        
+        elif feed.source_type == "youtube":
+            # For YouTube, we might have multiple sources or a generic one
+            source = db.query(Source).filter(
+                Source.source_type == "youtube"
+            ).first()
+            
+            if source:
+                # Count published YouTube feeds
+                published_feed_count = db.query(PublishedFeed).join(Feed).filter(
+                    PublishedFeed.is_active == True,
+                    Feed.source_type == "youtube"
+                ).count()
+                
+                return {
+                    "id": source.id,
+                    "name": source.name,
+                    "website": source.website,
+                    "source_type": source.source_type,
+                    "published_feed_count": published_feed_count,
+                    "follower_count": source.follower_count,
+                    "is_active": source.is_active
+                }
+        
+        # Fallback: create a basic source info from feed data
+        if feed.source_type == "blog" and feed.blog:
+            website_name = feed.blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+            return {
+                "id": None,
+                "name": website_name,
+                "website": feed.blog.website,
+                "source_type": "blog",
+                "published_feed_count": 1,  # Approximate
+                "follower_count": 0,
+                "is_active": True
+            }
+        else:
+            return {
+                "id": None,
+                "name": "YouTube",
+                "website": "https://www.youtube.com",
+                "source_type": "youtube",
+                "published_feed_count": 1,  # Approximate
+                "follower_count": 0,
+                "is_active": True
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting source for feed {feed.id}: {e}")
+        return None
+
+# ------------------ NEW ENDPOINTS ------------------
+
+@router.get("/feeds/with-sources", response_model=dict)
+def get_published_feeds_with_sources(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    active_only: bool = Query(True, description="Show only active published feeds"),
+    include_source_info: bool = Query(True, description="Include source information"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all published feeds with detailed source information including:
+    - Source name, website, type
+    - Number of published contents for each source
+    - Follower count
+    """
+    try:
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        )
+        
+        if active_only:
+            query = query.filter(PublishedFeed.is_active == True)
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format response with source information
+        feeds_data = []
+        sources_map = {}  # Track unique sources
+        
+        for pf in published_feeds:
+            if pf.feed:
+                feed_data = format_published_feed_response(pf, db)
+                if feed_data:
+                    # Add source information
+                    if include_source_info:
+                        source_info = get_source_for_feed(db, pf.feed)
+                        feed_data["source"] = source_info
+                        
+                        # Track source statistics
+                        if source_info and source_info.get("id"):
+                            source_id = source_info["id"]
+                            if source_id not in sources_map:
+                                sources_map[source_id] = {
+                                    "source": source_info,
+                                    "feed_count": 0
+                                }
+                            sources_map[source_id]["feed_count"] += 1
+                    
+                    feeds_data.append(feed_data)
+        
+        # Prepare sources summary
+        sources_summary = [
+            {
+                "source": source_data["source"],
+                "published_feeds_count": source_data["feed_count"],
+                "percentage_of_total": round((source_data["feed_count"] / len(feeds_data)) * 100, 2) if feeds_data else 0
+            }
+            for source_data in sources_map.values()
+        ]
+        
+        # Sort sources by feed count (most popular first)
+        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
+        
+        return {
+            "feeds": feeds_data,
+            "sources_summary": sources_summary,
+            "total_feeds": total,
+            "unique_sources": len(sources_map),
+            "page": page,
+            "limit": limit,
+            "has_more": (page * limit) < total
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching published feeds with sources: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch published feeds with sources"
+        )
+
+@router.get("/source/{source_id}/related-content", response_model=dict)
+def get_related_content_by_source_id(
+    source_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    content_type: Optional[str] = Query(None, description="Filter by content type"),
+    exclude_current_feed: Optional[int] = Query(None, description="Exclude a specific feed ID"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get related published content by source ID.
+    This returns all published feeds from the same source.
+    """
+    try:
+        # Get the source
+        source = db.query(Source).filter(Source.id == source_id).first()
+        if not source:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Source with ID {source_id} not found"
+            )
+        
+        # Build query for PUBLISHED feeds from this source
+        if source.source_type == "blog":
+            query = db.query(PublishedFeed).options(
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+                joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+            ).join(Feed).join(Blog).filter(
+                PublishedFeed.is_active == True,
+                Blog.website == source.website
+            )
+        else:
+            query = db.query(PublishedFeed).options(
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides)
+            ).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.source_type == "youtube"
+            )
+        
+        # Apply content type filter
+        if content_type:
+            content_type_upper = content_type.upper()
+            valid_content_types = ['BLOG', 'WEBINAR', 'PODCAST', 'VIDEO']
+            if content_type_upper in valid_content_types:
+                query = query.filter(Feed.content_type == content_type_upper)
+        
+        # Exclude specific feed if provided
+        if exclude_current_feed:
+            query = query.filter(PublishedFeed.feed_id != exclude_current_feed)
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format response
+        feeds_data = []
+        for pf in published_feeds:
+            feed_data = format_published_feed_response(pf, db)
+            if feed_data:
+                feeds_data.append(feed_data)
+        
+        # Get source statistics
+        source_stats = {
+            "total_published_feeds": total,
+            "content_type_breakdown": get_content_type_breakdown(db, source)
+        }
+        
+        return {
+            "source": {
+                "id": source.id,
+                "name": source.name,
+                "website": source.website,
+                "source_type": source.source_type,
+                "follower_count": source.follower_count,
+                "is_active": source.is_active
+            },
+            "related_content": feeds_data,
+            "source_statistics": source_stats,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": (page * limit) < total
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching related content for source {source_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch related content for source {source_id}"
+        )
+
+def get_content_type_breakdown(db: Session, source: Source) -> Dict[str, int]:
+    """Get content type breakdown for a source."""
+    try:
+        if source.source_type == "blog":
+            query = db.query(Feed.content_type, db.func.count(Feed.id)).join(Blog).filter(
+                Blog.website == source.website
+            ).group_by(Feed.content_type)
+        else:
+            query = db.query(Feed.content_type, db.func.count(Feed.id)).filter(
+                Feed.source_type == "youtube"
+            ).group_by(Feed.content_type)
+        
+        results = query.all()
+        
+        breakdown = {}
+        for content_type, count in results:
+            # Convert to display format
+            if content_type == 'BLOG':
+                display_type = 'Blog'
+            elif content_type == 'WEBINAR':
+                display_type = 'Webinar'
+            elif content_type == 'PODCAST':
+                display_type = 'Podcast'
+            elif content_type == 'VIDEO':
+                display_type = 'Video'
+            else:
+                display_type = content_type or 'Unknown'
+            
+            breakdown[display_type] = count
+        
+        return breakdown
+        
+    except Exception as e:
+        logger.error(f"Error getting content type breakdown for source {source.id}: {e}")
+        return {}
+
+# ------------------ EXISTING ENDPOINTS (Updated) ------------------
+
+@router.get("/feeds", response_model=List[dict])
+def get_published_feeds(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    active_only: bool = Query(True, description="Show only active published feeds"),
+    include_source: bool = Query(False, description="Include source information"),
+    db: Session = Depends(get_db)
+):
+    """Get all published feeds with optional source information."""
+    try:
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        )
+        
+        if active_only:
+            query = query.filter(PublishedFeed.is_active == True)
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        response_data = []
+        for pf in published_feeds:
+            feed_data = format_published_feed_response(pf, db)
+            if feed_data:
+                # Add source information if requested
+                if include_source:
+                    source_info = get_source_for_feed(db, pf.feed)
+                    feed_data["source"] = source_info
+                
+                response_data.append(feed_data)
+        
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Error fetching published feeds: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch published feeds"
+        )
+
+@router.get("/source/{source_id}/feeds", response_model=dict)
+def get_published_feeds_by_source_id(
+    source_id: int,
+    page: int = 1,
+    limit: int = 20,
+    content_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get only PUBLISHED feeds by source ID."""
+    try:
+        source = db.query(Source).filter(Source.id == source_id).first()
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        
+        # Build query for PUBLISHED feeds only
+        if source.source_type == "blog":
+            query = db.query(PublishedFeed).options(
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+                joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+            ).join(Feed).join(Blog).filter(
+                PublishedFeed.is_active == True,
+                Blog.website == source.website
+            )
+        else:
+            query = db.query(PublishedFeed).options(
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides)
+            ).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.source_type == "youtube"
+            )
+        
+        # Apply content type filter
+        if content_type:
+            content_type_upper = content_type.upper()
+            valid_content_types = ['BLOG', 'WEBINAR', 'PODCAST', 'VIDEO']
+            if content_type_upper in valid_content_types:
+                query = query.filter(Feed.content_type == content_type_upper)
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format response
+        feeds_data = []
+        for pf in published_feeds:
+            feed_data = format_published_feed_response(pf, db)
+            if feed_data:
+                feeds_data.append(feed_data)
+        
+        return {
+            "source": {
+                "id": source.id,
+                "name": source.name,
+                "website": source.website,
+                "source_type": source.source_type,
+                "published_feed_count": total
+            },
+            "feeds": feeds_data,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": (page * limit) < total
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching published feeds for source {source_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch published feeds for source")
+
 
 @router.post("/feed", response_model=PublishStatusResponse)
 def publish_feed(
     request: PublishFeedRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Publish a feed by feed_id and admin_id (provided in request body).
-    No Authorization header required.
-    """
+    """Publish a feed by feed_id and admin_id."""
     try:
-        # Validate admin from request.admin_id
         admin = db.query(User).filter(
             User.id == request.admin_id,
             User.is_admin == True
         ).first()
 
         if not admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User is not authorized as admin"
-            )
+            raise HTTPException(status_code=403, detail="User is not authorized as admin")
         
-        # Validate the feed exists and is ready for publishing
-        feed = validate_feed_for_publishing(db, request.feed_id)
+        # Validate the feed exists
+        feed = db.query(Feed).filter(Feed.id == request.feed_id).first()
+        if not feed:
+            raise HTTPException(status_code=404, detail="Feed not found")
+        
+        if feed.status != "ready":
+            raise HTTPException(status_code=400, detail="Feed is not ready for publishing")
         
         # Check if feed is already published
         existing_published = db.query(PublishedFeed).filter(
@@ -403,10 +679,7 @@ def publish_feed(
         ).first()
         
         if existing_published:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Feed with ID {request.feed_id} is already published"
-            )
+            raise HTTPException(status_code=400, detail="Feed is already published")
         
         # Create published feed entry
         published_feed = PublishedFeed(
@@ -419,9 +692,8 @@ def publish_feed(
         
         db.add(published_feed)
         db.commit()
-        db.refresh(published_feed)
         
-        logger.info(f"Feed {request.feed_id} published by admin {admin.full_name} (ID: {admin.id})")
+        logger.info(f"Feed {request.feed_id} published by admin {admin.full_name}")
         
         return PublishStatusResponse(
             message="Feed published successfully",
@@ -437,10 +709,8 @@ def publish_feed(
     except Exception as e:
         db.rollback()
         logger.error(f"Error publishing feed {request.feed_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to publish feed"
-        )
+        raise HTTPException(status_code=500, detail="Failed to publish feed")
+
 
 @router.post("/feeds/bulk", response_model=dict)
 def bulk_publish_feeds(
@@ -539,7 +809,7 @@ def bulk_publish_feeds(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process bulk publish request"
         )
-
+from schemas import PublishedFeedResponse
 @router.get("/feeds", response_model=List[PublishedFeedResponse])
 def get_published_feeds(
     page: int = Query(1, ge=1, description="Page number"),

@@ -20,6 +20,13 @@ class ContentType(str, enum.Enum):
     PLAYLIST = "playlist"
     VIDEO = "video"
 
+class FilterType(str, enum.Enum):
+    WEBINAR = "Webinar"
+    BLOG = "Blog"
+    PODCAST = "Podcast"
+    VIDEO = "Video"
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = {"extend_existing": True}
@@ -232,6 +239,12 @@ class Feed(Base):
     blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=True)
     title = Column(String(500), nullable=True)
     categories = Column(JSONEncodedList, default=list)
+    # ADD THESE NEW FIELDS:
+    content_type = Column(Enum(FilterType), default=FilterType.BLOG)  # Webinar, Blog, Podcast, Video
+    skills = Column(JSONEncodedList, default=list)      # List of related skills
+    tools = Column(JSONEncodedList, default=list)       # List of related tools  
+    roles = Column(JSONEncodedList, default=list)       # List of related roles
+    # EXISTING FIELDS:
     status = Column(String(50), default="processing")
     ai_generated_content = Column(JSON, nullable=True)
     image_generation_enabled = Column(Boolean, default=True)
@@ -239,12 +252,12 @@ class Feed(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     blog = relationship("Blog", back_populates="feeds")
     slides = relationship("Slide", back_populates="feed", cascade="all, delete-orphan")
-    transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)  # Link to YouTube transcripts
-    source_type = Column(String, default='blog')  # 'blog' or 'youtube'
-    published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False,overlaps="published_feed")
+    transcript_id = Column(String, ForeignKey('transcripts.transcript_id'), nullable=True)
+    source_type = Column(String, default='blog')
+    published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False, overlaps="published_feed")
     quizzes = relationship("Quiz", back_populates="feed")
-    # Add this relationship
     bookmarks = relationship("Bookmark", back_populates="feed")
+
 
 class Slide(Base):
     __tablename__ = "slides"

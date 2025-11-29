@@ -7,43 +7,33 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from database import get_db
-from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob
+from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source,PublishedFeed
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
 from sqlalchemy import or_, String
+from enum import Enum
+
 router = APIRouter(prefix="/get", tags=["Feeds"])
-from models import Topic,Source
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Add YouTube API client initialization
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-youtube_service = None
-
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
-if YOUTUBE_API_KEY:
-    try:
-        youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-        logger.info("YouTube API client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize YouTube API client: {e}")
-        youtube_service = None
-else:
-    logger.warning("YOUTUBE_API_KEY not found in environment variables")
-
+class ContentType(str, Enum):
+    WEBINAR = "Webinar"
+    BLOG = "Blog"
+    PODCAST = "Podcast"
+    VIDEO = "Video"
 
 # ------------------ AI Categorization Function ------------------
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def categorize_content_with_openai(content: str, admin_categories: list) -> list:
-    """Categorize content using OpenAI - no fallbacks, raises error on failure."""
+def categorize_content_with_openai(content: str, admin_categories: list) -> tuple:
+    """Categorize content using OpenAI and extract skills, tools, roles."""
     try:
         truncated_content = content[:4000] + "..." if len(content) > 4000 else content
         
@@ -52,27 +42,46 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> list
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a content categorization assistant. Analyze the content and categorize it into the provided categories. Return only the category names that best match the content as a comma-separated list. Choose at most 3 most relevant categories. Do NOT return 'Uncategorized'."
+                    "content": """You are a content analysis assistant. Analyze the content and:
+                    1. Categorize it into the provided categories
+                    2. Extract relevant skills mentioned
+                    3. Extract tools/technologies mentioned  
+                    4. Extract relevant job roles
+                    5. Determine content type (Blog, Video, Podcast, Webinar)
+                    
+                    Return JSON with this structure:
+                    {
+                        "categories": ["category1", "category2"],
+                        "skills": ["skill1", "skill2"],
+                        "tools": ["tool1", "tool2"],
+                        "roles": ["role1", "role2"],
+                        "content_type": "Blog/Video/Podcast/Webinar"
+                    }"""
                 },
                 {
                     "role": "user",
-                    "content": f"Available categories: {', '.join(admin_categories)}.\n\nContent:\n{truncated_content}\n\nReturn only the category names as a comma-separated list."
+                    "content": f"Available categories: {', '.join(admin_categories)}.\n\nContent:\n{truncated_content}\n\nReturn JSON with categories, skills, tools, roles, and content_type."
                 }
             ],
             temperature=0.1,
-            max_tokens=100
+            max_tokens=500,
+            response_format={ "type": "json_object" }
         )
         
-        text = response.choices[0].message.content.strip()
-        text_items = [x.strip().lower() for x in re.split(r'[,;|]', text) if x.strip()]
+        analysis = json.loads(response.choices[0].message.content.strip())
         
+        # Validate categories
+        categories = analysis.get("categories", [])
         matched_categories = []
-        for item in text_items:
+        for item in categories:
             for category in admin_categories:
-                if (item == category.lower() or item in category.lower() or category.lower() in item):
+                if (item.lower() == category.lower() or 
+                    item.lower() in category.lower() or 
+                    category.lower() in item.lower()):
                     matched_categories.append(category)
                     break
         
+        # Remove duplicates and limit
         seen = set()
         unique_categories = []
         for cat in matched_categories:
@@ -81,10 +90,26 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> list
                 unique_categories.append(cat)
         
         if not unique_categories:
-            raise HTTPException(status_code=500, detail="OpenAI failed to categorize content into any available categories")
+            raise HTTPException(status_code=500, detail="OpenAI failed to categorize content")
         
-        return unique_categories[:3]
-    
+        # Extract other metadata
+        skills = list(set(analysis.get("skills", [])))[:10]
+        tools = list(set(analysis.get("tools", [])))[:10]
+        roles = list(set(analysis.get("roles", [])))[:10]
+        
+        # Determine content type
+        content_type_str = analysis.get("content_type", "Blog")
+        content_type = ContentType.BLOG  # default
+        
+        if "video" in content_type_str.lower() or "youtube" in content_type_str.lower():
+            content_type = ContentType.VIDEO
+        elif "podcast" in content_type_str.lower():
+            content_type = ContentType.PODCAST
+        elif "webinar" in content_type_str.lower():
+            content_type = ContentType.WEBINAR
+        
+        return unique_categories[:3], skills, tools, roles, content_type
+        
     except Exception as e:
         logger.error(f"OpenAI categorization error: {e}")
         raise HTTPException(status_code=500, detail=f"OpenAI categorization failed: {str(e)}")
@@ -93,7 +118,7 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> list
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_feed_content_with_ai(title: str, content: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
-    """Generate engaging feed content using AI - no fallbacks, raises error on failure."""
+    """Generate engaging feed content using AI."""
     try:
         truncated_content = content[:6000] + "..." if len(content) > 6000 else content
         
@@ -106,16 +131,9 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
                 "summary": "2-3 paragraph comprehensive summary of the main content",
                 "key_points": ["Point 1", "Point 2", "Point 3", "Point 4", "Point 5"],
                 "conclusion": "1-2 paragraph concluding thoughts or key takeaways"
-            }
+            }""",
             
-            Requirements:
-            - Title should be compelling and different from the original title
-            - Summary should capture the main ideas comprehensively in 2-3 paragraphs
-            - Key points should be 5-7 distinct bullet points highlighting most important aspects
-            - Conclusion should provide clear takeaways
-            - Maintain the original meaning and key insights""",
-            
-            "transcript": """You are a video content summarization expert. Create an engaging, structured feed from video transcript content. Focus on the main ideas, key takeaways, and actionable insights.
+            "transcript": """You are a video content summarization expert. Create an engaging, structured feed from video transcript content.
             
             Return JSON with the following structure:
             {
@@ -123,14 +141,7 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
                 "summary": "2-3 paragraph summary of the video's main content and message",
                 "key_points": ["Key insight 1", "Key insight 2", "Key insight 3", "Key insight 4", "Key insight 5"],
                 "conclusion": "1-2 paragraph conclusion with main takeaways and actionable advice"
-            }
-            
-            Requirements:
-            - Title should be compelling and reflect the video's core message (don't start with "Summary:")
-            - Summary should capture the video's main narrative and purpose in 2-3 paragraphs
-            - Key points should highlight the most valuable, distinct insights from the video (5-7 points)
-            - Conclusion should provide clear takeaways and practical applications
-            - Focus on actionable insights and main arguments, not transcript repetition"""
+            }"""
         }
         
         user_prompt = f"""
@@ -142,7 +153,6 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
         {truncated_content}
         
         Please generate engaging, structured feed content in the specified JSON format.
-        Focus on creating unique, valuable content that summarizes and enhances the original.
         """
         
         response = client.chat.completions.create(
@@ -165,71 +175,31 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
         content = response.choices[0].message.content
         ai_content = json.loads(content)
         
-        # Validate and ensure all required fields are present and meaningful
+        # Validate required fields
         required_fields = ["title", "summary", "key_points", "conclusion"]
         for field in required_fields:
             if field not in ai_content:
                 raise HTTPException(status_code=500, detail=f"OpenAI response missing required field: {field}")
-            
-            # Validate content quality
-            if field == "title" and ("summary:" in ai_content[field].lower() or ai_content[field].lower().startswith("summary")):
-                raise HTTPException(status_code=500, detail="OpenAI generated poor quality title starting with 'Summary:'")
-            
-            if field == "key_points":
-                if not isinstance(ai_content[field], list):
-                    raise HTTPException(status_code=500, detail="OpenAI response key_points is not a list")
-                if len(ai_content[field]) < 3:
-                    raise HTTPException(status_code=500, detail="OpenAI generated insufficient key points")
-                # Remove duplicate or low-quality key points
-                unique_points = []
-                for point in ai_content[field]:
-                    point_str = str(point).strip()
-                    if (len(point_str) > 20 and 
-                        point_str not in unique_points and 
-                        not point_str.lower().startswith("key insight from")):
-                        unique_points.append(point_str)
-                ai_content[field] = unique_points[:7]
-                
-            if field == "summary" and len(ai_content[field].split()) < 50:
-                raise HTTPException(status_code=500, detail="OpenAI generated insufficient summary content")
         
-        logger.info(f"Successfully generated AI content for {content_type}: {ai_content['title']}")
         return ai_content
         
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in AI response: {e}")
-        logger.info(f"Raw AI response: {content}")
-        raise HTTPException(status_code=500, detail=f"OpenAI returned invalid JSON: {str(e)}")
-    
     except Exception as e:
         logger.error(f"OpenAI feed generation error: {e}")
         raise HTTPException(status_code=500, detail=f"OpenAI feed generation failed: {str(e)}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_slide_with_ai(slide_type: str, context: str, categories: List[str], content_type: str = "blog", previous_slides: List[Dict] = None) -> Dict[str, Any]:
-    """Generate a specific slide type using AI - no fallbacks, raises error on failure."""
+    """Generate a specific slide type using AI."""
     try:
-        # Enhanced system prompt to ensure proper JSON response
         system_prompt = {
             "role": "system", 
             "content": f"""You are a presentation design expert. Create engaging, concise slides.
-            You MUST return ONLY valid JSON with the following structure:
+            Return ONLY valid JSON with this structure:
             {{
                 "title": "Engaging slide title",
                 "body": "Substantive body content that summarizes key points",
                 "bullets": ["Bullet point 1", "Bullet point 2", "Bullet point 3"]
-            }}
-            
-            CRITICAL REQUIREMENTS:
-            - Return ONLY valid JSON, no other text
-            - Create unique, engaging titles (NOT generic like "Title - Video")
-            - Provide substantive body content (at least 50 words)
-            - Use bullets array for key points
-            - Avoid repeating content across slides
-            
-            Slide type: {slide_type}
-            Content type: {content_type}
-            """
+            }}"""
         }
         
         messages = [
@@ -249,57 +219,35 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
             messages=messages,
             temperature=0.7,
             max_tokens=1200,
-            response_format={ "type": "json_object" }  # Force JSON response
+            response_format={ "type": "json_object" }
         )
         
         content = response.choices[0].message.content
+        slide_data = json.loads(content)
         
-        # Log the raw response for debugging
-        # logger.info(f"Raw OpenAI response for {slide_type}: {content[:200]}...")
-        
-        try:
-            slide_data = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error. Raw response: {content}")
-            raise HTTPException(status_code=500, detail=f"OpenAI returned invalid JSON for {slide_type}: {str(e)}")
-        
-        # Validate and ensure we have proper content
+        # Validate content quality
         title = slide_data.get("title", "").strip()
         body = slide_data.get("body", "").strip()
         bullets = slide_data.get("bullets", [])
         
-        # Validate content quality
-        if not title or title.lower() in ["slide title", "title - video", "title - blog", "untitled"]:
-            logger.error(f"Poor quality title generated: '{title}'")
-            raise HTTPException(status_code=500, detail=f"OpenAI generated poor quality title: '{title}'")
+        if not title or len(body) < 50:
+            raise HTTPException(status_code=500, detail="OpenAI generated insufficient slide content")
         
-        if not body or len(body) < 50:
-            logger.error(f"Insufficient body content: '{body}'")
-            raise HTTPException(status_code=500, detail=f"OpenAI generated insufficient body content for slide: {title}")
-        
-        # Ensure bullets is a list
-        if not isinstance(bullets, list):
-            bullets = []
-        
-        # logger.info(f"Successfully generated slide: {title}")
         return {
             "title": title,
             "body": body,
             "bullets": bullets,
-            "background_color": "#FFFFFF",  # Will be overridden with feed's unique color
+            "background_color": "#FFFFFF",
             "source_refs": [],
             "render_markdown": True
         }
         
-    except HTTPException:
-        # Re-raise HTTPExceptions
-        raise
     except Exception as e:
         logger.error(f"OpenAI slide generation error for {slide_type}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"OpenAI slide generation failed for {slide_type}: {str(e)}")
 
 def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict[str, Any], categories: List[str], content_type: str = "blog") -> List[Dict]:
-    """Generate random number of presentation slides (1-10) using AI with same color for all slides in a feed."""
+    """Generate presentation slides using AI."""
     import random
     import hashlib
     
@@ -308,21 +256,19 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
     key_points_count = len(ai_generated_content.get("key_points", []))
     summary_length = len(ai_generated_content.get("summary", ""))
     
-    # Calculate content richness score
     richness_score = min(
-        (content_length / 1000) +  # Content length factor
-        (key_points_count * 0.5) +  # Number of key points
-        (summary_length / 500),     # Summary completeness
-        10.0  # Cap at 10
+        (content_length / 1000) +
+        (key_points_count * 0.5) +
+        (summary_length / 500),
+        10.0
     )
     
-    # Randomize slide count based on richness, but ensure at least 1 slide
     base_slides = max(1, min(10, int(richness_score) + random.randint(-1, 2)))
-    slide_count = max(1, min(10, base_slides))  # Ensure between 1-10
+    slide_count = max(1, min(10, base_slides))
     
-    logger.info(f"Generating {slide_count} slides for '{title}' (richness: {richness_score:.2f})")
+    logger.info(f"Generating {slide_count} slides for '{title}'")
     
-    # Generate a UNIQUE background color for THIS SPECIFIC FEED (same for all slides in this feed)
+    # Generate background color for this feed
     background_color = generate_feed_background_color(title, content_type, categories)
     
     slides = []
@@ -335,7 +281,6 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         title_slide["background_color"] = background_color
         slides.append(title_slide)
         
-        # If only 1 slide needed, return just title
         if slide_count == 1:
             return slides
         
@@ -346,16 +291,13 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         summary_slide["background_color"] = background_color
         slides.append(summary_slide)
         
-        # If only 2 slides needed, return title + summary
         if slide_count == 2:
             return slides
         
         # 3. Key point slides
         key_points = ai_generated_content.get("key_points", [])
-        remaining_slides = slide_count - 2  # Already used title and summary
-        
-        # Determine how many key point slides to create
-        key_point_slides_count = min(remaining_slides, len(key_points), 5)  # Max 5 key point slides
+        remaining_slides = slide_count - 2
+        key_point_slides_count = min(remaining_slides, len(key_points), 5)
         
         for i in range(key_point_slides_count):
             if i < len(key_points):
@@ -366,7 +308,7 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
                 key_slide["background_color"] = background_color
                 slides.append(key_slide)
         
-        # 4. Conclusion slide if we have space
+        # 4. Conclusion slide if space
         if len(slides) < slide_count and ai_generated_content.get("conclusion"):
             conclusion_context = f"Create a conclusion slide for: {title}\nConclusion: {ai_generated_content.get('conclusion', '')}\nKey Points Covered: {', '.join(key_points[:3])}\nType: {content_type}"
             conclusion_slide = generate_slide_with_ai("conclusion", conclusion_context, categories, content_type, slides)
@@ -374,7 +316,7 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
             conclusion_slide["background_color"] = background_color
             slides.append(conclusion_slide)
         
-        # 5. Fill remaining slots with additional insights
+        # 5. Fill remaining slots
         while len(slides) < slide_count:
             insight_context = f"Create an additional insights slide for: {title}\nAvailable Content: Summary - {ai_generated_content.get('summary', '')[:200]}...\nRemaining Key Points: {', '.join(key_points[len(slides)-2:]) if len(slides)-2 < len(key_points) else 'Various important aspects'}\nType: {content_type}"
             insight_slide = generate_slide_with_ai("additional_insights", insight_context, categories, content_type, slides)
@@ -390,63 +332,43 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         raise
 
 def generate_feed_background_color(title: str, content_type: str, categories: List[str]) -> str:
-    """Generate background color from a predefined set of distinct colors."""
+    """Generate background color from predefined distinct colors."""
     import hashlib
     
-    # Predefined set of visually distinct colors
     distinct_colors = [
-        "#1e3a8a",  # Dark blue
-        "#166534",  # Dark green  
-        "#581c87",  # Dark purple
-        "#991b1b",  # Dark red
-        "#9a3412",  # Dark orange
-        "#115e59",  # Dark teal
-        "#831843",  # Dark pink
-        "#854d0e",  # Dark yellow
-        "#3730a3",  # Dark indigo
-        "#064e3b",  # Dark emerald
-        "#1d4ed8",  # Medium blue
-        "#15803d",  # Medium green
-        "#7c3aed",  # Medium purple
-        "#dc2626",  # Medium red
-        "#ea580c",  # Medium orange
-        "#0f766e",  # Medium teal
-        "#be185d",  # Medium pink
-        "#ca8a04",  # Medium yellow
-        "#4f46e5",  # Medium indigo
-        "#047857",  # Medium emerald
+        "#1e3a8a", "#166534", "#581c87", "#991b1b", "#9a3412",
+        "#115e59", "#831843", "#854d0e", "#3730a3", "#064e3b",
+        "#1d4ed8", "#15803d", "#7c3aed", "#dc2626", "#ea580c",
+        "#0f766e", "#be185d", "#ca8a04", "#4f46e5", "#047857",
     ]
     
-    # Create a unique seed
     seed_string = f"{title}_{content_type}_{'_'.join(sorted(categories))}"
     hash_object = hashlib.md5(seed_string.encode())
     hash_int = int(hash_object.hexdigest()[:8], 16)
     
-    # Select color from the predefined list
     color_index = hash_int % len(distinct_colors)
     color_hex = distinct_colors[color_index]
     
-    logger.info(f"Generated predefined distinct color: {color_hex} for '{title}' (index: {color_index})")
+    logger.info(f"Generated predefined distinct color: {color_hex} for '{title}'")
     return color_hex
 
 # ------------------ Core Feed Creation Functions ------------------
 
 def create_feed_from_blog(db: Session, blog: Blog):
-    """Generate feed and slides from a blog using AI - no fallbacks, raises error on failure."""
+    """Generate feed and slides from a blog using AI."""
     try:
         # Check if feed already exists for this blog
         existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
         if existing_feed:
-            # Delete existing slides to regenerate
             db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
             db.flush()
         
-        # Create new feed - NO FALLBACKS, will raise error if OpenAI fails
+        # Create new feed with enhanced metadata
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
             raise HTTPException(status_code=500, detail="No active categories found in database")
             
-        categories = categorize_content_with_openai(blog.content, admin_categories)
+        categories, skills, tools, roles, content_type = categorize_content_with_openai(blog.content, admin_categories)
         ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
         slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
         
@@ -455,6 +377,10 @@ def create_feed_from_blog(db: Session, blog: Blog):
             blog_id=blog.id, 
             title=feed_title,
             categories=categories, 
+            skills=skills,
+            tools=tools,
+            roles=roles,
+            content_type=content_type,
             status="ready",
             ai_generated_content=ai_generated_content,
             image_generation_enabled=False,
@@ -482,11 +408,10 @@ def create_feed_from_blog(db: Session, blog: Blog):
         
         db.commit()
         db.refresh(feed)
-        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id} with {len(slides_data)} slides")
+        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
         return feed
         
     except HTTPException:
-        # Re-raise HTTPExceptions
         raise
     except Exception as e:
         db.rollback()
@@ -494,30 +419,32 @@ def create_feed_from_blog(db: Session, blog: Blog):
         raise HTTPException(status_code=500, detail=f"Failed to create feed for blog: {str(e)}")
 
 def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: bool = False):
-    """Generate feed and slides from a YouTube transcript using AI - no fallbacks, raises error on failure."""
+    """Generate feed and slides from a YouTube transcript using AI."""
     try:
-        # Check if feed already exists for this transcript
         existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
         
         if existing_feed and not overwrite:
             logger.info(f"Feed already exists for transcript {transcript.transcript_id}, skipping")
             return existing_feed
             
-        # NO FALLBACKS - will raise error if OpenAI fails
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
             raise HTTPException(status_code=500, detail="No active categories found in database")
             
-        categories = categorize_content_with_openai(transcript.transcript_text, admin_categories)
+        categories, skills, tools, roles, content_type = categorize_content_with_openai(transcript.transcript_text, admin_categories)
         ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
         slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
         
         feed_title = ai_generated_content.get("title", transcript.title)
         
         if existing_feed and overwrite:
-            # UPDATE existing feed instead of deleting
+            # UPDATE existing feed
             existing_feed.title = feed_title
             existing_feed.categories = categories
+            existing_feed.skills = skills
+            existing_feed.tools = tools
+            existing_feed.roles = roles
+            existing_feed.content_type = content_type
             existing_feed.status = "ready"
             existing_feed.ai_generated_content = ai_generated_content
             existing_feed.updated_at = datetime.utcnow()
@@ -544,14 +471,18 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             
             db.commit()
             db.refresh(existing_feed)
-            logger.info(f"Successfully UPDATED AI-generated feed {existing_feed.id} for transcript {transcript.transcript_id} with {len(slides_data)} slides")
+            logger.info(f"Successfully UPDATED AI-generated feed {existing_feed.id} for transcript {transcript.transcript_id}")
             return existing_feed
         else:
             # CREATE new feed
             feed = Feed(
                 transcript_id=transcript.transcript_id,
                 title=feed_title,
-                categories=categories, 
+                categories=categories,
+                skills=skills,
+                tools=tools,
+                roles=roles,
+                content_type=content_type,
                 status="ready",
                 ai_generated_content=ai_generated_content,
                 image_generation_enabled=False,
@@ -580,320 +511,153 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             
             db.commit()
             db.refresh(feed)
-            logger.info(f"Successfully CREATED AI-generated feed {feed.id} for transcript {transcript.transcript_id} with {len(slides_data)} slides")
+            logger.info(f"Successfully CREATED AI-generated feed {feed.id} for transcript {transcript.transcript_id}")
             return feed
         
     except HTTPException:
-        # Re-raise HTTPExceptions
         raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating/updating AI-generated feed for transcript {transcript.transcript_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create feed for transcript: {str(e)}")
 
+# ------------------ New Endpoints for Feed Router ------------------
 
-def get_youtube_channel_info(video_id: str) -> Dict[str, str]:
-    """Get channel information from YouTube API using video ID."""
-    if not youtube_service or not video_id:
-        return {"channel_name": "YouTube Creator", "channel_id": None}
-    
+@router.get("/sources/with-ids", response_model=List[dict])
+def get_sources_with_ids(
+    page: int = 1,
+    limit: int = 50,
+    active_only: bool = True,
+    db: Session = Depends(get_db)
+):
+    """Get all sources with their IDs and feed counts."""
     try:
-        # First, get video details to extract channel ID
-        video_response = youtube_service.videos().list(
-            part="snippet",
-            id=video_id
-        ).execute()
+        query = db.query(Source)
         
-        if not video_response.get('items'):
-            logger.warning(f"No video found for ID: {video_id}")
-            return {"channel_name": "YouTube Creator", "channel_id": None}
+        if active_only:
+            query = query.filter(Source.is_active == True)
         
-        video_snippet = video_response['items'][0]['snippet']
-        channel_id = video_snippet.get('channelId')
-        channel_title = video_snippet.get('channelTitle', 'YouTube Creator')
+        total = query.count()
+        sources = query.offset((page - 1) * limit).limit(limit).all()
         
-        if channel_id:
-            # Get detailed channel information
-            channel_response = youtube_service.channels().list(
-                part="snippet,statistics",
-                id=channel_id
-            ).execute()
+        sources_with_counts = []
+        for source in sources:
+            # Count ALL feeds for this source (not just published)
+            if source.source_type == "blog":
+                feed_count = db.query(Feed).join(Blog).filter(
+                    Blog.website == source.website
+                ).count()
+            else:  # youtube
+                feed_count = db.query(Feed).filter(
+                    Feed.source_type == "youtube"
+                ).count()
             
-            if channel_response.get('items'):
-                channel_snippet = channel_response['items'][0]['snippet']
-                channel_title = channel_snippet.get('title', channel_title)
-                
-                logger.info(f"Retrieved channel info: {channel_title} for video {video_id}")
-                return {
-                    "channel_name": channel_title,
-                    "channel_id": channel_id,
-                    "description": channel_snippet.get('description', ''),
-                    "custom_url": channel_snippet.get('customUrl', ''),
-                    "published_at": channel_snippet.get('publishedAt', ''),
-                    "thumbnails": channel_snippet.get('thumbnails', {})
-                }
+            sources_with_counts.append({
+                "id": source.id,
+                "name": source.name,
+                "website": source.website,
+                "source_type": source.source_type,
+                "feed_count": feed_count,
+                "follower_count": source.follower_count,
+                "is_active": source.is_active
+            })
+        
+        return sources_with_counts
+        
+    except Exception as e:
+        logger.error(f"Error fetching sources with IDs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch sources")
+
+@router.get("/source/{source_id}/feeds", response_model=dict)
+def get_feeds_by_source_id(
+    source_id: int,
+    page: int = 1,
+    limit: int = 20,
+    content_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get all feeds (both published and unpublished) by source ID."""
+    try:
+        source = db.query(Source).filter(Source.id == source_id).first()
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        
+        # Build query based on source type
+        if source.source_type == "blog":
+            query = db.query(Feed).options(
+                joinedload(Feed.slides),
+                joinedload(Feed.blog)
+            ).join(Blog).filter(
+                Blog.website == source.website
+            )
+        else:
+            query = db.query(Feed).options(
+                joinedload(Feed.slides)
+            ).filter(
+                Feed.source_type == "youtube"
+            )
+        
+        # Apply content type filter with safe handling
+        if content_type:
+            try:
+                # Convert string to FilterType enum
+                content_type_enum = FilterType(content_type)
+                query = query.filter(Feed.content_type == content_type_enum)
+            except ValueError:
+                # If invalid content_type provided, ignore the filter
+                logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        query = query.order_by(Feed.created_at.desc())
+        
+        total = query.count()
+        feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format response with safe attribute access
+        feeds_data = []
+        for feed in feeds:
+            # Check if published
+            is_published = db.query(PublishedFeed).filter(
+                PublishedFeed.feed_id == feed.id,
+                PublishedFeed.is_active == True
+            ).first() is not None
+            
+            # Safely get content_type
+            feed_content_type = feed.content_type.value if feed.content_type else FilterType.BLOG.value
+            
+            feeds_data.append({
+                "id": feed.id,
+                "title": feed.title,
+                "categories": feed.categories or [],
+                "content_type": feed_content_type,
+                "skills": getattr(feed, 'skills', []) or [],
+                "tools": getattr(feed, 'tools', []) or [],
+                "roles": getattr(feed, 'roles', []) or [],
+                "status": feed.status,
+                "is_published": is_published,
+                "slides_count": len(feed.slides) if feed.slides else 0,
+                "created_at": feed.created_at.isoformat() if feed.created_at else None,
+                "source_type": feed.source_type
+            })
         
         return {
-            "channel_name": channel_title,
-            "channel_id": channel_id
+            "source": {
+                "id": source.id,
+                "name": source.name,
+                "website": source.website,
+                "source_type": source.source_type
+            },
+            "feeds": feeds_data,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": (page * limit) < total
         }
         
-    except HttpError as e:
-        logger.error(f"YouTube API error for video {video_id}: {e}")
-        return {"channel_name": "YouTube Creator", "channel_id": None}
     except Exception as e:
-        logger.error(f"Unexpected error fetching YouTube channel info for {video_id}: {e}")
-        return {"channel_name": "YouTube Creator", "channel_id": None}
+        logger.error(f"Error fetching feeds for source {source_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch feeds for source")
 
-def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
-    """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
-    if feed.source_type == "youtube":
-        # Get the transcript to access YouTube-specific data
-        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
-        
-        if transcript:
-            # Extract video ID from transcript data
-            video_id = getattr(transcript, 'video_id', None)
-            if not video_id:
-                # Try to extract from transcript_id or other fields
-                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
-            
-            # Get original title from transcript
-            original_title = transcript.title if transcript else feed.title
-            
-            # Get channel information from YouTube API
-            channel_info = get_youtube_channel_info(video_id)
-            channel_name = channel_info.get("channel_name", "YouTube Creator")
-            
-            # Construct proper YouTube URL
-            source_url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            return {
-                "title": feed.title,
-                "original_title": original_title,
-                "author": channel_name,
-                "source_url": source_url,
-                "source_type": "youtube",
-                "channel_name": channel_name,
-                "channel_id": channel_info.get("channel_id"),
-                "video_id": video_id,
-                "channel_info": channel_info  # Include full channel info for frontend
-            }
-        else:
-            # Fallback if transcript not found
-            video_id = feed.transcript_id
-            channel_info = get_youtube_channel_info(video_id)
-            channel_name = channel_info.get("channel_name", "YouTube Creator")
-            
-            return {
-                "title": feed.title,
-                "original_title": feed.title,
-                "author": channel_name,
-                "source_url": f"https://www.youtube.com/watch?v={video_id}",
-                "source_type": "youtube",
-                "channel_name": channel_name,
-                "channel_id": channel_info.get("channel_id"),
-                "video_id": video_id,
-                "channel_info": channel_info
-            }
-    
-    else:  # blog source type
-        blog = feed.blog
-        if blog:
-            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
-            author = getattr(blog, 'author', 'Admin') or 'Admin'
-            
-            return {
-                "title": feed.title,
-                "original_title": blog.title,
-                "author": author,
-                "source_url": blog.url,
-                "source_type": "blog",
-                "website_name": website_name,
-                "website": blog.website
-            }
-        else:
-            # Fallback if blog not found
-            return {
-                "title": feed.title,
-                "original_title": "Unknown",
-                "author": "Admin",
-                "source_url": "#",
-                "source_type": "blog",
-                "website_name": "Unknown",
-                "website": "Unknown"
-            }
-# ... (rest of the code remains the same for API endpoints)
-# ------------------ Background Processing Functions ------------------
-
-# ------------------ Background Processing Functions ------------------
-
-def process_blog_feeds_creation(db: Session, blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True):
-    """Background task to process blog feed creation - no fallbacks."""
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        created_count = 0
-        skipped_count = 0
-        error_count = 0
-        error_messages = []
-        
-        for blog in blogs:
-            try:
-                existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
-                if existing_feed and not overwrite:
-                    skipped_count += 1
-                    continue
-                
-                if existing_feed and overwrite:
-                    # Delete existing slides to regenerate
-                    db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
-                    db.flush()
-                
-                # Only AI generation is available now - no fallbacks
-                feed = create_feed_from_blog(db, blog)
-                
-                if feed:
-                    created_count += 1
-                    
-            except HTTPException as e:
-                error_count += 1
-                error_messages.append(f"Blog {blog.id}: {e.detail}")
-                logger.error(f"OpenAI error processing blog {blog.id}: {e.detail}")
-                continue
-            except Exception as e:
-                error_count += 1
-                error_messages.append(f"Blog {blog.id}: {str(e)}")
-                logger.error(f"Error processing blog {blog.id}: {e}")
-                continue
-        
-        logger.info(f"Completed blog feed creation for {website}: {created_count} created, {skipped_count} skipped, {error_count} errors")
-        
-        # Log errors for debugging
-        if error_messages:
-            logger.warning(f"Errors encountered for {website}: {error_messages}")
-            
-    finally:
-        db.close()
-
-def process_transcript_feeds_creation(db: Session, transcripts: List[Transcript], job_id: str, overwrite: bool = False, use_ai: bool = True):
-    """Background task to process transcript feed creation - no fallbacks."""
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        created_count = 0
-        skipped_count = 0
-        error_count = 0
-        error_messages = []
-        
-        for transcript in transcripts:
-            try:
-                existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
-                if existing_feed and not overwrite:
-                    skipped_count += 1
-                    continue
-                
-                # Only AI generation is available now - no fallbacks
-                feed = create_feed_from_transcript(db, transcript, overwrite)
-                
-                if feed:
-                    created_count += 1
-                    
-            except HTTPException as e:
-                error_count += 1
-                error_messages.append(f"Transcript {transcript.transcript_id}: {e.detail}")
-                logger.error(f"OpenAI error processing transcript {transcript.transcript_id}: {e.detail}")
-                continue
-            except Exception as e:
-                error_count += 1
-                error_messages.append(f"Transcript {transcript.transcript_id}: {str(e)}")
-                logger.error(f"Error processing transcript {transcript.transcript_id}: {e}")
-                continue
-        
-        logger.info(f"Completed transcript feed creation for job {job_id}: {created_count} created, {skipped_count} skipped, {error_count} errors")
-        
-        # Log errors for debugging
-        if error_messages:
-            logger.warning(f"Errors encountered for job {job_id}: {error_messages}")
-            
-    finally:
-        db.close()
-
-
-
-# In your feed_router.py
-
-def auto_generate_blog_feeds(db: Session, blog_ids: List[int]):
-    """Automatically generate feeds for newly scraped blogs."""
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        created_count = 0
-        error_count = 0
-        
-        for blog_id in blog_ids:
-            try:
-                blog = db.query(Blog).filter(Blog.id == blog_id).first()
-                if not blog or not blog.generate_feed:
-                    continue
-                
-                # Check if feed already exists
-                existing_feed = db.query(Feed).filter(Feed.blog_id == blog_id).first()
-                if existing_feed:
-                    blog.feed_generated = True
-                    continue
-                
-                # Generate feed
-                feed = create_feed_from_blog(db, blog)
-                if feed:
-                    # Mark as generated
-                    blog.feed_generated = True
-                    created_count += 1
-                    print(f"✅ Auto-generated feed for blog: {blog.title}")
-                    
-            except Exception as e:
-                error_count += 1
-                print(f"❌ Auto-feed generation failed for blog {blog_id}: {e}")
-                continue
-        
-        db.commit()
-        print(f"📊 Auto-generated {created_count} blog feeds, {error_count} errors")
-        
-    finally:
-        db.close()
-
-def auto_generate_transcript_feed(db: Session, transcript_id: int):
-    """Automatically generate feed for newly scraped transcript."""
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        transcript = db.query(Transcript).filter(Transcript.id == transcript_id).first()
-        if not transcript or not transcript.generate_feed:
-            return
-        
-        # Check if feed already exists
-        existing_feed = db.query(Feed).filter(
-            Feed.transcript_id == transcript.transcript_id
-        ).first()
-        if existing_feed:
-            transcript.feed_generated = True
-            return
-        
-        # Generate feed
-        feed = create_feed_from_transcript(db, transcript)
-        if feed:
-            # Mark as generated
-            transcript.feed_generated = True
-            db.commit()
-            print(f"✅ Auto-generated feed for transcript: {transcript.title}")
-        
-    except Exception as e:
-        print(f"❌ Auto-feed generation failed for transcript {transcript_id}: {e}")
-    finally:
-        db.close()
-
-    
-# ------------------ API Endpoints ------------------
+# ------------------ Existing Feed Router Endpoints ------------------
 
 @router.get("/all", response_model=dict)
 def get_all_feeds(
@@ -904,10 +668,11 @@ def get_all_feeds(
     status: Optional[str] = None,
     source_type: Optional[str] = None,
     is_published: Optional[bool] = None,
+    content_type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get all feeds summary with filtering options including is_published."""
-    query = db.query(Feed).options(joinedload(Feed.blog), joinedload(Feed.published_feed))
+    """Get all feeds (both published and unpublished) with filtering."""
+    query = db.query(Feed).options(joinedload(Feed.blog))
     
     if category:
         query = query.filter(Feed.categories.contains([category]))
@@ -915,40 +680,50 @@ def get_all_feeds(
         query = query.filter(Feed.status == status)
     if source_type:
         query = query.filter(Feed.source_type == source_type)
+    if content_type:
+        try:
+            content_type_enum = FilterType(content_type)
+            query = query.filter(Feed.content_type == content_type_enum)
+        except ValueError:
+            logger.warning(f"Invalid content_type provided: {content_type}")
     if is_published is not None:
         if is_published:
-            query = query.filter(Feed.published_feed != None)
+            published_feed_ids = db.query(PublishedFeed.feed_id).filter(PublishedFeed.is_active == True)
+            query = query.filter(Feed.id.in_(published_feed_ids))
         else:
-            query = query.filter(Feed.published_feed == None)
+            published_feed_ids = db.query(PublishedFeed.feed_id).filter(PublishedFeed.is_active == True)
+            query = query.filter(~Feed.id.in_(published_feed_ids))
     
     query = query.order_by(Feed.created_at.desc())
     total = query.count()
     feeds = query.offset((page - 1) * limit).limit(limit).all()
 
     items = []
-    for f in feeds:
-        # Determine is_published status
-        is_published_status = f.published_feed is not None
+    for feed in feeds:
+        is_published_status = db.query(PublishedFeed).filter(
+            PublishedFeed.feed_id == feed.id,
+            PublishedFeed.is_active == True
+        ).first() is not None
         
-        # Get proper metadata
-        meta = get_feed_metadata(f, db)
-
+        feed_content_type = feed.content_type.value if feed.content_type else FilterType.BLOG.value
+        
         items.append({
-            "id": f.id,
-            "blog_id": f.blog_id,
-            "transcript_id": f.transcript_id,
-            "title": f.title,
-            "categories": f.categories,
-            "status": f.status,
-            "source_type": f.source_type or "blog",
+            "id": feed.id,
+            "blog_id": feed.blog_id,
+            "transcript_id": feed.transcript_id,
+            "title": feed.title,
+            "categories": feed.categories,
+            "content_type": feed_content_type,
+            "skills": getattr(feed, 'skills', []) or [],
+            "tools": getattr(feed, 'tools', []) or [],
+            "roles": getattr(feed, 'roles', []) or [],
+            "status": feed.status,
+            "source_type": feed.source_type or "blog",
             "is_published": is_published_status,
-            "published_at": f.published_feed.published_at.isoformat() if is_published_status else None,
-            "slides_count": len(f.slides),
-            "meta": meta,
-            "created_at": f.created_at.isoformat() if f.created_at else None,
-            "updated_at": f.updated_at.isoformat() if f.updated_at else None,
-            "ai_generated": hasattr(f, 'ai_generated_content') and f.ai_generated_content is not None,
-            "images_generated": False
+            "slides_count": len(feed.slides) if feed.slides else 0,
+            "created_at": feed.created_at.isoformat() if feed.created_at else None,
+            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+            "ai_generated": feed.ai_generated_content is not None,
         })
 
     has_more = (page * limit) < total
@@ -961,13 +736,7 @@ def get_all_feeds(
         "page": page, 
         "limit": limit, 
         "total": total, 
-        "has_more": has_more,
-        "filters": {
-            "category": category, 
-            "status": status, 
-            "source_type": source_type,
-            "is_published": is_published
-        }
+        "has_more": has_more
     }
 @router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
