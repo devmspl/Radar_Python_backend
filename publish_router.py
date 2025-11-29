@@ -7,16 +7,18 @@ import logging
 import os
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from pydantic import BaseModel, Field  # ADD THIS IMPORT
 
 from database import get_db
-from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source
+from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source, UserOnboarding
 from schemas import (
     PublishFeedRequest, 
     PublishStatusResponse, 
     DeletePublishResponse,
     BulkPublishRequest,
     SlideResponse,
-    UnpublishFeedRequest
+    UnpublishFeedRequest,
+    PublishedFeedResponse
 )
 
 # Configure logging
@@ -38,7 +40,51 @@ if YOUTUBE_API_KEY:
 else:
     logger.warning("YOUTUBE_API_KEY not found in environment variables")
 
+# ------------------ Request Models ------------------
+
+class ContentTypeFilterRequest(BaseModel):
+    content_types: List[str] = Field(..., description="List of content types to filter by")
+    page: int = Field(1, ge=1, description="Page number")
+    limit: int = Field(20, ge=1, le=100, description="Items per page")
+    include_source_info: bool = Field(True, description="Include source information")
+
+class AdvancedFilterRequest(BaseModel):
+    content_types: Optional[List[str]] = Field(None, description="Filter by content types")
+    categories: Optional[List[str]] = Field(None, description="Filter by categories")
+    skills: Optional[List[str]] = Field(None, description="Filter by skills")
+    tools: Optional[List[str]] = Field(None, description="Filter by tools")
+    roles: Optional[List[str]] = Field(None, description="Filter by roles")
+    page: int = Field(1, ge=1, description="Page number")
+    limit: int = Field(20, ge=1, le=100, description="Items per page")
+
 # ------------------ Helper Functions ------------------
+
+def validate_feed_for_publishing(db: Session, feed_id: int) -> Feed:
+    """Validate if a feed can be published and return the feed object."""
+    feed = db.query(Feed).options(
+        joinedload(Feed.slides),
+        joinedload(Feed.blog)
+    ).filter(Feed.id == feed_id).first()
+    
+    if not feed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Feed with ID {feed_id} not found"
+        )
+    
+    if feed.status != "ready":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Feed with ID {feed_id} is not ready for publishing. Status: {feed.status}"
+        )
+    
+    if not feed.slides or len(feed.slides) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Feed with ID {feed_id} has no slides"
+        )
+    
+    return feed
 
 def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
     """Get comprehensive channel information from YouTube API."""
@@ -320,7 +366,310 @@ def get_source_for_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
         logger.error(f"Error getting source for feed {feed.id}: {e}")
         return None
 
-# ------------------ NEW ENDPOINTS ------------------
+def get_content_type_breakdown(db: Session, source: Source) -> Dict[str, int]:
+    """Get content type breakdown for a source."""
+    try:
+        if source.source_type == "blog":
+            query = db.query(Feed.content_type, db.func.count(Feed.id)).join(Blog).filter(
+                Blog.website == source.website
+            ).group_by(Feed.content_type)
+        else:
+            query = db.query(Feed.content_type, db.func.count(Feed.id)).filter(
+                Feed.source_type == "youtube"
+            ).group_by(Feed.content_type)
+        
+        results = query.all()
+        
+        breakdown = {}
+        for content_type, count in results:
+            # Convert to display format
+            if content_type == 'BLOG':
+                display_type = 'Blog'
+            elif content_type == 'WEBINAR':
+                display_type = 'Webinar'
+            elif content_type == 'PODCAST':
+                display_type = 'Podcast'
+            elif content_type == 'VIDEO':
+                display_type = 'Video'
+            else:
+                display_type = content_type or 'Unknown'
+            
+            breakdown[display_type] = count
+        
+        return breakdown
+        
+    except Exception as e:
+        logger.error(f"Error getting content type breakdown for source {source.id}: {e}")
+        return {}
+
+# ------------------ CONTENT TYPE FILTER ENDPOINTS ------------------
+
+@router.post("/feeds/filter-by-type", response_model=dict)
+def filter_published_feeds_by_type(
+    request: ContentTypeFilterRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Filter published feeds by content types (Webinar, Blog, Podcast, Video).
+    Returns feeds that match ANY of the specified content types.
+    """
+    try:
+        # Validate content types
+        valid_content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+        filtered_types = []
+        
+        for content_type in request.content_types:
+            content_type_upper = content_type.upper()
+            if content_type_upper in valid_content_types:
+                filtered_types.append(content_type_upper)
+            else:
+                logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        if not filtered_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid content types provided. Valid types: Webinar, Blog, Podcast, Video"
+            )
+        
+        # Build query for PUBLISHED feeds
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).filter(
+            PublishedFeed.is_active == True
+        )
+        
+        # Apply content type filter
+        if filtered_types:
+            query = query.filter(Feed.content_type.in_(filtered_types))
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((request.page - 1) * request.limit).limit(request.limit).all()
+        
+        # Format response
+        feeds_data = []
+        sources_map = {}  # Track unique sources
+        
+        for pf in published_feeds:
+            if pf.feed:
+                feed_data = format_published_feed_response(pf, db)
+                if feed_data:
+                    # Add source information if requested
+                    if request.include_source_info:
+                        source_info = get_source_for_feed(db, pf.feed)
+                        feed_data["source"] = source_info
+                        
+                        # Track source statistics
+                        if source_info and source_info.get("id"):
+                            source_id = source_info["id"]
+                            if source_id not in sources_map:
+                                sources_map[source_id] = {
+                                    "source": source_info,
+                                    "feed_count": 0
+                                }
+                            sources_map[source_id]["feed_count"] += 1
+                    
+                    feeds_data.append(feed_data)
+        
+        # Prepare content type breakdown
+        content_type_breakdown = {}
+        for content_type in filtered_types:
+            count_query = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.content_type == content_type
+            )
+            content_type_breakdown[content_type] = count_query.count()
+        
+        # Prepare sources summary
+        sources_summary = [
+            {
+                "source": source_data["source"],
+                "published_feeds_count": source_data["feed_count"],
+                "percentage_of_total": round((source_data["feed_count"] / len(feeds_data)) * 100, 2) if feeds_data else 0
+            }
+            for source_data in sources_map.values()
+        ]
+        
+        # Sort sources by feed count (most popular first)
+        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
+        
+        return {
+            "feeds": feeds_data,
+            "filters": {
+                "content_types": [ct.capitalize() for ct in filtered_types],
+                "applied_filters": len(filtered_types)
+            },
+            "statistics": {
+                "total_matching_feeds": total,
+                "content_type_breakdown": content_type_breakdown,
+                "sources_summary": sources_summary
+            },
+            "page": request.page,
+            "limit": request.limit,
+            "has_more": (request.page * request.limit) < total
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error filtering published feeds by type: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to filter published feeds by type"
+        )
+
+@router.get("/feeds/types/available")
+def get_available_content_types(db: Session = Depends(get_db)):
+    """
+    Get available content types with counts of published feeds for each type.
+    """
+    try:
+        content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+        type_breakdown = {}
+        
+        for content_type in content_types:
+            count = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.content_type == content_type
+            ).count()
+            
+            type_breakdown[content_type.capitalize()] = count
+        
+        # Get total published feeds
+        total_feeds = db.query(PublishedFeed).filter(
+            PublishedFeed.is_active == True
+        ).count()
+        
+        return {
+            "available_content_types": [
+                {
+                    "type": content_type.capitalize(),
+                    "count": count,
+                    "percentage": round((count / total_feeds) * 100, 2) if total_feeds > 0 else 0
+                }
+                for content_type, count in type_breakdown.items()
+            ],
+            "total_published_feeds": total_feeds
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting available content types: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get available content types"
+        )
+
+# Alternative GET endpoint for simpler filtering
+@router.get("/feeds/filter-by-type-get", response_model=dict)
+def filter_published_feeds_by_type_get(
+    content_types: List[str] = Query(..., description="Content types to filter by (Webinar, Blog, Podcast, Video)"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    include_source_info: bool = Query(True, description="Include source information"),
+    db: Session = Depends(get_db)
+):
+    """
+    Filter published feeds by content types (GET version).
+    """
+    request = ContentTypeFilterRequest(
+        content_types=content_types,
+        page=page,
+        limit=limit,
+        include_source_info=include_source_info
+    )
+    return filter_published_feeds_by_type(request, db)
+
+@router.post("/feeds/advanced-filter", response_model=dict)
+def advanced_filter_published_feeds(
+    request: AdvancedFilterRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Advanced filtering for published feeds with multiple criteria.
+    """
+    try:
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).filter(
+            PublishedFeed.is_active == True
+        )
+        
+        # Apply content type filter
+        if request.content_types:
+            valid_content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+            filtered_types = [ct.upper() for ct in request.content_types if ct.upper() in valid_content_types]
+            if filtered_types:
+                query = query.filter(Feed.content_type.in_(filtered_types))
+        
+        # Apply category filter
+        if request.categories:
+            from sqlalchemy import or_
+            category_conditions = []
+            for category in request.categories:
+                category_conditions.append(Feed.categories.contains([category]))
+            if category_conditions:
+                query = query.filter(or_(*category_conditions))
+        
+        # Apply skills filter
+        if request.skills:
+            skills_conditions = []
+            for skill in request.skills:
+                skills_conditions.append(Feed.skills.contains([skill]))
+            if skills_conditions:
+                query = query.filter(or_(*skills_conditions))
+        
+        # Apply tools filter
+        if request.tools:
+            tools_conditions = []
+            for tool in request.tools:
+                tools_conditions.append(Feed.tools.contains([tool]))
+            if tools_conditions:
+                query = query.filter(or_(*tools_conditions))
+        
+        # Apply roles filter
+        if request.roles:
+            roles_conditions = []
+            for role in request.roles:
+                roles_conditions.append(Feed.roles.contains([role]))
+            if roles_conditions:
+                query = query.filter(or_(*roles_conditions))
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((request.page - 1) * request.limit).limit(request.limit).all()
+        
+        # Format response
+        feeds_data = []
+        for pf in published_feeds:
+            feed_data = format_published_feed_response(pf, db)
+            if feed_data:
+                feeds_data.append(feed_data)
+        
+        return {
+            "feeds": feeds_data,
+            "filters_applied": {
+                "content_types": request.content_types or [],
+                "categories": request.categories or [],
+                "skills": request.skills or [],
+                "tools": request.tools or [],
+                "roles": request.roles or []
+            },
+            "total": total,
+            "page": request.page,
+            "limit": request.limit,
+            "has_more": (request.page * request.limit) < total
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in advanced filtering: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to apply advanced filters"
+        )
 
 @router.get("/feeds/with-sources", response_model=dict)
 def get_published_feeds_with_sources(
@@ -499,76 +848,72 @@ def get_related_content_by_source_id(
             detail=f"Failed to fetch related content for source {source_id}"
         )
 
-def get_content_type_breakdown(db: Session, source: Source) -> Dict[str, int]:
-    """Get content type breakdown for a source."""
-    try:
-        if source.source_type == "blog":
-            query = db.query(Feed.content_type, db.func.count(Feed.id)).join(Blog).filter(
-                Blog.website == source.website
-            ).group_by(Feed.content_type)
-        else:
-            query = db.query(Feed.content_type, db.func.count(Feed.id)).filter(
-                Feed.source_type == "youtube"
-            ).group_by(Feed.content_type)
-        
-        results = query.all()
-        
-        breakdown = {}
-        for content_type, count in results:
-            # Convert to display format
-            if content_type == 'BLOG':
-                display_type = 'Blog'
-            elif content_type == 'WEBINAR':
-                display_type = 'Webinar'
-            elif content_type == 'PODCAST':
-                display_type = 'Podcast'
-            elif content_type == 'VIDEO':
-                display_type = 'Video'
-            else:
-                display_type = content_type or 'Unknown'
-            
-            breakdown[display_type] = count
-        
-        return breakdown
-        
-    except Exception as e:
-        logger.error(f"Error getting content type breakdown for source {source.id}: {e}")
-        return {}
+# ------------------ EXISTING ENDPOINTS (Fixed) ------------------
 
-# ------------------ EXISTING ENDPOINTS (Updated) ------------------
-
-@router.get("/feeds", response_model=List[dict])
+@router.get("/feeds", response_model=List[PublishedFeedResponse])
 def get_published_feeds(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     active_only: bool = Query(True, description="Show only active published feeds"),
-    include_source: bool = Query(False, description="Include source information"),
     db: Session = Depends(get_db)
 ):
-    """Get all published feeds with optional source information."""
+    """
+    Get all published feeds with slides included and enhanced metadata.
+    """
     try:
+        # Query with proper joins to load all related data
         query = db.query(PublishedFeed).options(
             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
             joinedload(PublishedFeed.feed).joinedload(Feed.blog)
         )
         
+        # Filter by active status
         if active_only:
             query = query.filter(PublishedFeed.is_active == True)
         
+        # Order by most recent first
         query = query.order_by(PublishedFeed.published_at.desc())
         
+        # Pagination
         published_feeds = query.offset((page - 1) * limit).limit(limit).all()
         
         response_data = []
         for pf in published_feeds:
-            feed_data = format_published_feed_response(pf, db)
-            if feed_data:
-                # Add source information if requested
-                if include_source:
-                    source_info = get_source_for_feed(db, pf.feed)
-                    feed_data["source"] = source_info
+            # Safely get feed data
+            if not pf.feed:
+                continue  # Skip if no feed associated
                 
-                response_data.append(feed_data)
+            feed_title = pf.feed.title
+            blog_title = pf.feed.blog.title if pf.feed.blog else None
+            categories = pf.feed.categories or []
+            
+            # Process slides
+            slides_data = []
+            if pf.feed.slides:
+                # Sort slides by order and format them
+                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
+                slides_data = [format_slide_response(slide) for slide in sorted_slides]
+            
+            # Count slides
+            slides_count = len(slides_data)
+            
+            # Get enhanced metadata with channel info, logos, and website data
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
+            
+            response_data.append(PublishedFeedResponse(
+                id=pf.id,
+                feed_id=pf.feed_id,
+                admin_id=pf.admin_id,
+                admin_name=pf.admin_name,
+                published_at=pf.published_at,
+                is_active=pf.is_active,
+                feed_title=feed_title,
+                blog_title=blog_title,
+                feed_categories=categories,
+                slides_count=slides_count,
+                slides=slides_data if slides_data else None,
+                meta=meta_data
+            ))
         
         return response_data
         
@@ -648,6 +993,7 @@ def get_published_feeds_by_source_id(
         logger.error(f"Error fetching published feeds for source {source_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch published feeds for source")
 
+# ------------------ PUBLISHING ENDPOINTS ------------------
 
 @router.post("/feed", response_model=PublishStatusResponse)
 def publish_feed(
@@ -710,7 +1056,6 @@ def publish_feed(
         db.rollback()
         logger.error(f"Error publishing feed {request.feed_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to publish feed")
-
 
 @router.post("/feeds/bulk", response_model=dict)
 def bulk_publish_feeds(
@@ -808,80 +1153,6 @@ def bulk_publish_feeds(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process bulk publish request"
-        )
-from schemas import PublishedFeedResponse
-@router.get("/feeds", response_model=List[PublishedFeedResponse])
-def get_published_feeds(
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
-    active_only: bool = Query(True, description="Show only active published feeds"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get all published feeds with slides included and enhanced metadata.
-    """
-    try:
-        # Query with proper joins to load all related data
-        query = db.query(PublishedFeed).options(
-            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
-        )
-        
-        # Filter by active status
-        if active_only:
-            query = query.filter(PublishedFeed.is_active == True)
-        
-        # Order by most recent first
-        query = query.order_by(PublishedFeed.published_at.desc())
-        
-        # Pagination
-        published_feeds = query.offset((page - 1) * limit).limit(limit).all()
-        
-        response_data = []
-        for pf in published_feeds:
-            # Safely get feed data
-            if not pf.feed:
-                continue  # Skip if no feed associated
-                
-            feed_title = pf.feed.title
-            blog_title = pf.feed.blog.title if pf.feed.blog else None
-            categories = pf.feed.categories or []
-            
-            # Process slides
-            slides_data = []
-            if pf.feed.slides:
-                # Sort slides by order and format them
-                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
-                slides_data = [format_slide_response(slide) for slide in sorted_slides]
-            
-            # Count slides
-            slides_count = len(slides_data)
-            
-            # Get enhanced metadata with channel info, logos, and website data
-            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
-            
-            response_data.append(PublishedFeedResponse(
-                id=pf.id,
-                feed_id=pf.feed_id,
-                admin_id=pf.admin_id,
-                admin_name=pf.admin_name,
-                published_at=pf.published_at,
-                is_active=pf.is_active,
-                feed_title=feed_title,
-                blog_title=blog_title,
-                feed_categories=categories,
-                slides_count=slides_count,
-                slides=slides_data if slides_data else None,
-                meta=meta_data
-            ))
-        
-        return response_data
-        
-    except Exception as e:
-        logger.error(f"Error fetching published feeds: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch published feeds"
         )
 
 @router.get("/feed/{published_feed_id}/slides/with-metadata", response_model=Dict[str, Any])
@@ -995,6 +1266,8 @@ def unpublish_feed(
             detail="Failed to unpublish feed"
         )
 
+# ------------------ ADDITIONAL UTILITY ENDPOINTS ------------------
+
 @router.get("/debug/feed/{feed_id}/transcript-info")
 def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
     """Debug endpoint to see transcript information for a feed."""
@@ -1020,6 +1293,197 @@ def debug_feed_transcript_info(feed_id: int, db: Session = Depends(get_db)):
         "source_type": feed.source_type,
         "transcript_info": transcript_info
     }
+
+
+# Add this to your publish_router.py after the existing endpoints
+
+from typing import List
+from pydantic import BaseModel,Field
+
+class ContentTypeFilterRequest(BaseModel):
+    content_types: List[str] = Field(..., description="List of content types to filter by")
+    page: int = Field(1, ge=1, description="Page number")
+    limit: int = Field(20, ge=1, le=100, description="Items per page")
+    include_source_info: bool = Field(True, description="Include source information")
+
+@router.post("/feeds/filter-by-type", response_model=dict)
+def filter_published_feeds_by_type(
+    request: ContentTypeFilterRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Filter published feeds by content types (Webinar, Blog, Podcast, Video).
+    Returns feeds that match ANY of the specified content types.
+    """
+    try:
+        # Validate content types
+        valid_content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+        filtered_types = []
+        
+        for content_type in request.content_types:
+            content_type_upper = content_type.upper()
+            if content_type_upper in valid_content_types:
+                filtered_types.append(content_type_upper)
+            else:
+                logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        if not filtered_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid content types provided. Valid types: Webinar, Blog, Podcast, Video"
+            )
+        
+        # Build query for PUBLISHED feeds
+        query = db.query(PublishedFeed).options(
+            joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+        ).filter(
+            PublishedFeed.is_active == True
+        )
+        
+        # Apply content type filter
+        if filtered_types:
+            query = query.filter(Feed.content_type.in_(filtered_types))
+        
+        query = query.order_by(PublishedFeed.published_at.desc())
+        
+        total = query.count()
+        published_feeds = query.offset((request.page - 1) * request.limit).limit(request.limit).all()
+        
+        # Format response
+        feeds_data = []
+        sources_map = {}  # Track unique sources
+        
+        for pf in published_feeds:
+            if pf.feed:
+                feed_data = format_published_feed_response(pf, db)
+                if feed_data:
+                    # Add source information if requested
+                    if request.include_source_info:
+                        source_info = get_source_for_feed(db, pf.feed)
+                        feed_data["source"] = source_info
+                        
+                        # Track source statistics
+                        if source_info and source_info.get("id"):
+                            source_id = source_info["id"]
+                            if source_id not in sources_map:
+                                sources_map[source_id] = {
+                                    "source": source_info,
+                                    "feed_count": 0
+                                }
+                            sources_map[source_id]["feed_count"] += 1
+                    
+                    feeds_data.append(feed_data)
+        
+        # Prepare content type breakdown
+        content_type_breakdown = {}
+        for content_type in filtered_types:
+            count_query = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.content_type == content_type
+            )
+            content_type_breakdown[content_type] = count_query.count()
+        
+        # Prepare sources summary
+        sources_summary = [
+            {
+                "source": source_data["source"],
+                "published_feeds_count": source_data["feed_count"],
+                "percentage_of_total": round((source_data["feed_count"] / len(feeds_data)) * 100, 2) if feeds_data else 0
+            }
+            for source_data in sources_map.values()
+        ]
+        
+        # Sort sources by feed count (most popular first)
+        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
+        
+        return {
+            "feeds": feeds_data,
+            "filters": {
+                "content_types": [ct.capitalize() for ct in filtered_types],
+                "applied_filters": len(filtered_types)
+            },
+            "statistics": {
+                "total_matching_feeds": total,
+                "content_type_breakdown": content_type_breakdown,
+                "sources_summary": sources_summary
+            },
+            "page": request.page,
+            "limit": request.limit,
+            "has_more": (request.page * request.limit) < total
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error filtering published feeds by type: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to filter published feeds by type"
+        )
+
+@router.get("/feeds/types/available")
+def get_available_content_types(db: Session = Depends(get_db)):
+    """
+    Get available content types with counts of published feeds for each type.
+    """
+    try:
+        content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+        type_breakdown = {}
+        
+        for content_type in content_types:
+            count = db.query(PublishedFeed).join(Feed).filter(
+                PublishedFeed.is_active == True,
+                Feed.content_type == content_type
+            ).count()
+            
+            type_breakdown[content_type.capitalize()] = count
+        
+        # Get total published feeds
+        total_feeds = db.query(PublishedFeed).filter(
+            PublishedFeed.is_active == True
+        ).count()
+        
+        return {
+            "available_content_types": [
+                {
+                    "type": content_type.capitalize(),
+                    "count": count,
+                    "percentage": round((count / total_feeds) * 100, 2) if total_feeds > 0 else 0
+                }
+                for content_type, count in type_breakdown.items()
+            ],
+            "total_published_feeds": total_feeds
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting available content types: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get available content types"
+        )
+
+# Alternative GET endpoint for simpler filtering
+@router.get("/feeds/filter-by-type", response_model=dict)
+def filter_published_feeds_by_type_get(
+    content_types: List[str] = Query(..., description="Content types to filter by (Webinar, Blog, Podcast, Video)"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    include_source_info: bool = Query(True, description="Include source information"),
+    db: Session = Depends(get_db)
+):
+    """
+    Filter published feeds by content types (GET version).
+    """
+    request = ContentTypeFilterRequest(
+        content_types=content_types,
+        page=page,
+        limit=limit,
+        include_source_info=include_source_info
+    )
+    return filter_published_feeds_by_type(request, db)
+
+
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from sqlalchemy import String  # and Column if needed
@@ -1276,10 +1740,11 @@ def get_feeds_by_category_id(
     category_id: int,
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    include_source_info: bool = Query(True, description="Include source information"),
     db: Session = Depends(get_db)
 ):
     """
-    Get published feeds by category ID.
+    Get published feeds by category ID with optional source information.
     """
     try:
         # First get the category name from ID
@@ -1303,6 +1768,7 @@ def get_feeds_by_category_id(
         
         # Filter feeds that have the target category in their categories list
         matching_feeds = []
+        sources_map = {}  # Track unique sources for statistics
         
         for pf in all_feeds:
             if not pf.feed or not pf.feed.categories:
@@ -1313,6 +1779,21 @@ def get_feeds_by_category_id(
                 category.name in pf.feed.categories):
                 feed_data = format_published_feed_response(pf, db)
                 if feed_data:
+                    # Add source information if requested
+                    if include_source_info:
+                        source_info = get_source_for_feed(db, pf.feed)
+                        feed_data["source"] = source_info
+                        
+                        # Track source statistics
+                        if source_info and source_info.get("id"):
+                            source_id = source_info["id"]
+                            if source_id not in sources_map:
+                                sources_map[source_id] = {
+                                    "source": source_info,
+                                    "feed_count": 0
+                                }
+                            sources_map[source_id]["feed_count"] += 1
+                    
                     matching_feeds.append(feed_data)
         
         # Apply pagination
@@ -1321,18 +1802,47 @@ def get_feeds_by_category_id(
         end_idx = start_idx + limit
         paginated_feeds = matching_feeds[start_idx:end_idx]
 
-        return {
+        # Prepare sources summary
+        sources_summary = [
+            {
+                "source": source_data["source"],
+                "published_feeds_count": source_data["feed_count"],
+                "percentage_of_total": round((source_data["feed_count"] / total) * 100, 2) if total > 0 else 0
+            }
+            for source_data in sources_map.values()
+        ]
+        
+        # Sort sources by feed count (most popular first)
+        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
+
+        # Get content type breakdown for this category
+        content_type_breakdown = {}
+        for feed in matching_feeds:
+            content_type = feed.get("content_type", "Unknown")
+            if content_type not in content_type_breakdown:
+                content_type_breakdown[content_type] = 0
+            content_type_breakdown[content_type] += 1
+
+        response_data = {
             "items": paginated_feeds,
             "category": {
                 "id": category.id,
                 "name": category.name,
                 "description": category.description
             },
+            "statistics": {
+                "total_feeds": total,
+                "unique_sources": len(sources_map),
+                "content_type_breakdown": content_type_breakdown,
+                "sources_summary": sources_summary
+            },
             "page": page,
             "limit": limit,
             "total": total,
             "has_more": end_idx < total
         }
+
+        return response_data
 
     except HTTPException:
         raise
