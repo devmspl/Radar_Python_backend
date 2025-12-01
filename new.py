@@ -8,11 +8,11 @@ import os
 import sys
 import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Any
 import openai
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 import time
 import logging
@@ -21,10 +21,8 @@ import logging
 sys.path.append(str(Path(__file__).parent.parent))
 
 from models import Feed, Blog, Transcript, Slide, FilterType
-# Import from config instead of database
 from config import settings
-from database import SessionLocal, engine  # Use existing database setup
-
+from database import SessionLocal,engine
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -45,14 +43,15 @@ if not OPENAI_API_KEY:
     logger.error("❌ OPENAI_API_KEY not found in .env file")
     sys.exit(1)
 
-# Initialize OpenAI client for v1.0+
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
+# Database setup
+Database_URL = settings.DATABASE_URL
 class FeedTagGenerator:
     """Generate tags for feeds using OpenAI API."""
     
     def __init__(self):
-        self.client = client
+        self.api_key = OPENAI_API_KEY
         self.model = "gpt-3.5-turbo"  # You can use "gpt-4" for better results
         self.default_content_type = FilterType.BLOG
         
@@ -155,8 +154,7 @@ class FeedTagGenerator:
         """
         
         try:
-            # OpenAI v1.0+ API call
-            response = self.client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": "You are a professional content analyst specializing in educational and professional development materials."},
@@ -294,8 +292,7 @@ class FeedTagGenerator:
                 new = set(tags["roles"])
                 feed.roles = list(existing.union(new))
             
-            # Use timezone-aware datetime
-            feed.updated_at = datetime.now(timezone.utc)
+            feed.updated_at = datetime.utcnow()
             return True
             
         except Exception as e:
@@ -304,12 +301,10 @@ class FeedTagGenerator:
 
 def get_feeds_needing_tags(db: Session, limit: int = None, specific_ids: List[int] = None) -> List[Feed]:
     """Get feeds that need tag generation."""
-    # First try to load relationships, if they don't work, we'll fall back
-    try:
-        query = db.query(Feed)
-    except Exception as e:
-        logger.warning(f"Could not set up query with relationships: {e}. Using basic query.")
-        query = db.query(Feed)
+    query = db.query(Feed).options(
+        # joinedload(Feed.slides),
+        # joinedload(Feed.blog)
+    )
     
     if specific_ids:
         query = query.filter(Feed.id.in_(specific_ids))
@@ -335,11 +330,10 @@ def main():
     print("=" * 60)
     
     # Configuration
-    BATCH_SIZE = 5  # Reduced batch size for debugging
-    DELAY_BETWEEN_BATCHES = 3  # Increased delay for API limits
-    LIMIT = 20  # Start with a small limit for testing
+    BATCH_SIZE = 10  # Process feeds in batches to avoid rate limits
+    DELAY_BETWEEN_BATCHES = 2  # Seconds to wait between batches
+    LIMIT = None  # Set to None for all feeds, or specify a number
     SPECIFIC_FEED_IDS = None  # Set to [1, 2, 3] to process specific feeds only
-    USE_AI = False  # Set to False to use fallback tags only (since AI is failing)
     
     db = SessionLocal()
     tag_generator = FeedTagGenerator()
@@ -372,7 +366,7 @@ def main():
             
             for feed in batch:
                 try:
-                    print(f"\n📝 Feed #{feed.id}: {feed.title[:50] if feed.title else 'No Title'}...")
+                    print(f"\n📝 Feed #{feed.id}: {feed.title[:50]}...")
                     
                     # Skip if feed has comprehensive tags already
                     current_tags = {
@@ -386,27 +380,11 @@ def main():
                         continue
                     
                     # Analyze feed content
-                    print(f"   🔍 Analyzing feed content...")
                     feed_content = tag_generator.analyze_feed_content(feed, db)
                     
-                    if not feed_content["content"]:
-                        print(f"   ⚠️ No content found for analysis. Using default tags.")
-                        tags = tag_generator._get_fallback_tags(
-                            feed_content["title"], 
-                            ""
-                        )
-                    else:
-                        if USE_AI:
-                            # Generate tags with AI
-                            print(f"   🤖 Generating tags with AI...")
-                            tags = tag_generator.generate_tags_with_ai(feed_content)
-                        else:
-                            # Use fallback tags (no AI)
-                            print(f"   📊 Using keyword-based tags...")
-                            tags = tag_generator._get_fallback_tags(
-                                feed_content["title"], 
-                                feed_content["content"]
-                            )
+                    # Generate tags with AI
+                    print(f"   🤖 Generating tags with AI...")
+                    tags = tag_generator.generate_tags_with_ai(feed_content)
                     
                     # Update feed
                     print(f"   📝 Applying tags...")
@@ -426,8 +404,6 @@ def main():
                 except Exception as e:
                     batch_failed += 1
                     print(f"   ❌ Error processing feed {feed.id}: {str(e)[:100]}")
-                    import traceback
-                    traceback.print_exc()
                     db.rollback()
                     continue
             
@@ -453,33 +429,25 @@ def main():
         
         # Show content type distribution
         print("\n📈 Content Type Distribution:")
-        try:
-            content_types = db.query(Feed.content_type, func.count(Feed.id)).group_by(Feed.content_type).all()
-            for content_type, count in content_types:
-                print(f"   {content_type.value if content_type else 'None'}: {count}")
-        except Exception as e:
-            print(f"   Could not retrieve content type distribution: {e}")
+        content_types = db.query(Feed.content_type, db.func.count(Feed.id)).group_by(Feed.content_type).all()
+        for content_type, count in content_types:
+            print(f"   {content_type.value if content_type else 'None'}: {count}")
         
         # Show sample of updated feeds
         print("\n🎯 Sample of Updated Feeds:")
-        try:
-            sample_feeds = db.query(Feed).filter(
-                Feed.skills != None,
-                Feed.tools != None
-            ).order_by(Feed.updated_at.desc()).limit(5).all()
-            
-            for i, feed in enumerate(sample_feeds, 1):
-                print(f"{i}. Feed #{feed.id}: {feed.title[:50] if feed.title else 'No Title'}...")
-                print(f"   Type: {feed.content_type.value if feed.content_type else 'None'}")
-                print(f"   Skills: {', '.join(feed.skills[:3] if feed.skills else [])}")
-                print(f"   Tools: {', '.join(feed.tools[:3] if feed.tools else [])}")
-        except Exception as e:
-            print(f"   Could not retrieve sample feeds: {e}")
+        sample_feeds = db.query(Feed).filter(
+            Feed.skills != None,
+            Feed.tools != None
+        ).order_by(Feed.updated_at.desc()).limit(5).all()
+        
+        for i, feed in enumerate(sample_feeds, 1):
+            print(f"{i}. Feed #{feed.id}: {feed.title[:50]}...")
+            print(f"   Type: {feed.content_type.value if feed.content_type else 'None'}")
+            print(f"   Skills: {', '.join(feed.skills[:3] if feed.skills else [])}")
+            print(f"   Tools: {', '.join(feed.tools[:3] if feed.tools else [])}")
         
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
         db.close()
@@ -499,12 +467,7 @@ def verify_tags():
         feeds_with_skills = db.query(Feed).filter(Feed.skills != None, Feed.skills != []).count()
         feeds_with_tools = db.query(Feed).filter(Feed.tools != None, Feed.tools != []).count()
         feeds_with_roles = db.query(Feed).filter(Feed.roles != None, Feed.roles != []).count()
-        
-        # Check for content type other than BLOG (default)
-        feeds_with_content_type = db.query(Feed).filter(
-            Feed.content_type != None, 
-            Feed.content_type != FilterType.BLOG
-        ).count()
+        feeds_with_content_type = db.query(Feed).filter(Feed.content_type != None, Feed.content_type != FilterType.BLOG).count()
         
         print(f"Total feeds in database: {total_feeds}")
         print(f"Feeds with skills tags: {feeds_with_skills} ({feeds_with_skills/total_feeds*100:.1f}%)")
@@ -528,86 +491,8 @@ def verify_tags():
             ).limit(5).all()
             
             for i, feed in enumerate(missing_feeds, 1):
-                print(f"{i}. Feed #{feed.id}: {feed.title[:50] if feed.title else 'No Title'}...")
+                print(f"{i}. Feed #{feed.id}: {feed.title[:50]}...")
         
-    except Exception as e:
-        print(f"Error during verification: {e}")
-    finally:
-        db.close()
-
-def simple_migration():
-    """A simpler version of migration that doesn't use AI, just adds basic tags."""
-    print("\n" + "=" * 60)
-    print("🔄 SIMPLE TAG MIGRATION (No AI)")
-    print("=" * 60)
-    
-    db = SessionLocal()
-    
-    try:
-        # Get all feeds
-        feeds = db.query(Feed).all()
-        print(f"Found {len(feeds)} total feeds")
-        
-        updated_count = 0
-        
-        for feed in feeds:
-            try:
-                # Check current state
-                needs_update = (
-                    feed.skills is None or 
-                    feed.tools is None or 
-                    feed.roles is None or
-                    (feed.skills == []) or
-                    (feed.tools == []) or
-                    (feed.roles == [])
-                )
-                
-                if needs_update:
-                    # Determine content type based on title
-                    title_lower = (feed.title or "").lower()
-                    
-                    if any(word in title_lower for word in ["webinar", "workshop", "seminar", "training"]):
-                        content_type = FilterType.WEBINAR
-                        skills = ["Presentation", "Communication", "Public Speaking"]
-                        tools = ["Zoom", "Google Meet", "Presentation Software"]
-                        roles = ["Speaker", "Trainer", "Educator"]
-                    elif any(word in title_lower for word in ["podcast", "audio", "interview", "show"]):
-                        content_type = FilterType.PODCAST
-                        skills = ["Audio Editing", "Interviewing", "Storytelling"]
-                        tools = ["Audacity", "Podcast Hosting", "Microphones"]
-                        roles = ["Podcaster", "Host", "Producer"]
-                    elif any(word in title_lower for word in ["video", "youtube", "tutorial", "recording"]):
-                        content_type = FilterType.VIDEO
-                        skills = ["Video Editing", "Script Writing", "Camerawork"]
-                        tools = ["Premiere Pro", "YouTube Studio", "Camera"]
-                        roles = ["Video Creator", "Editor", "Content Creator"]
-                    else:
-                        content_type = FilterType.BLOG
-                        skills = ["Writing", "Research", "Content Creation"]
-                        tools = ["WordPress", "Google Docs", "Browser"]
-                        roles = ["Writer", "Researcher", "Learner"]
-                    
-                    # Update feed
-                    feed.content_type = content_type
-                    feed.skills = skills
-                    feed.tools = tools
-                    feed.roles = roles
-                    feed.updated_at = datetime.now(timezone.utc)
-                    
-                    updated_count += 1
-                    print(f"✅ Updated feed {feed.id}: {content_type.value}")
-            
-            except Exception as e:
-                print(f"❌ Error updating feed {feed.id}: {e}")
-                continue
-        
-        db.commit()
-        print(f"\n📊 Simple migration complete!")
-        print(f"Updated {updated_count} feeds out of {len(feeds)}")
-        
-    except Exception as e:
-        db.rollback()
-        print(f"\n❌ Simple migration failed: {e}")
     finally:
         db.close()
 
@@ -616,33 +501,11 @@ if __name__ == "__main__":
     print("Make sure your .env file has OPENAI_API_KEY and database is accessible")
     print("-" * 60)
     
-    # Ask user which method to use
-    print("\nSelect migration method:")
-    print("1. AI-Powered Migration (Uses OpenAI API v1.0+)")
-    print("2. Simple Migration (No AI, uses keyword matching)")
-    print("3. Keyword-based Migration (No API calls)")
+    # Run the main migration
+    main()
     
-    choice = input("\nEnter choice (1-3): ").strip()
-    
-    if choice == "1":
-        # Run the AI-powered migration
-        main()
-        verify_tags()
-    elif choice == "2":
-        simple_migration()
-        verify_tags()
-    elif choice == "3":
-        # Run keyword-based migration (modified main with USE_AI=False)
-        import sys
-        original_argv = sys.argv
-        sys.argv = [sys.argv[0]]  # Clear any extra args
-        main()  # This will use the default USE_AI=False
-        sys.argv = original_argv
-        verify_tags()
-    else:
-        print("❌ Invalid choice. Using keyword-based migration.")
-        main()
-        verify_tags()
+    # Verify the results
+    verify_tags()
     
     print("\n✅ Script completed!")
     print("\n💡 Next steps:")
