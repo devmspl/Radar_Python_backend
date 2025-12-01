@@ -8,7 +8,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from typing import Dict, List, Any
 import openai
 from sqlalchemy.orm import Session
@@ -295,7 +295,7 @@ class FeedTagGenerator:
                 feed.roles = list(existing.union(new))
             
             # Use timezone-aware datetime
-            feed.updated_at = datetime.now(UTC)
+            feed.updated_at = datetime.now(timezone.utc)
             return True
             
         except Exception as e:
@@ -592,7 +592,7 @@ def simple_migration():
                     feed.skills = skills
                     feed.tools = tools
                     feed.roles = roles
-                    feed.updated_at = datetime.now(UTC)
+                    feed.updated_at = datetime.now(timezone.utc)
                     
                     updated_count += 1
                     print(f"✅ Updated feed {feed.id}: {content_type.value}")
