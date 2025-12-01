@@ -1771,22 +1771,7 @@ def get_feeds_by_category_id(
                     detail=f"Invalid content_type: {content_type}. Valid types: Webinar, Blog, Podcast, Video"
                 )
         
-        # Debug info
-        debug_info = {}
-        if debug:
-            debug_info["category"] = {
-                "id": category.id,
-                "name": category.name,
-                "description": category.description
-            }
-            debug_info["filters"] = {
-                "content_type": content_type,
-                "skills": skills,
-                "tools": tools,
-                "roles": roles
-            }
-        
-        # Get all active published feeds (more efficient query)
+        # Get all active published feeds
         query = db.query(PublishedFeed).options(
             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
             joinedload(PublishedFeed.feed).joinedload(Feed.blog)
@@ -1795,18 +1780,6 @@ def get_feeds_by_category_id(
         ).order_by(PublishedFeed.published_at.desc())
 
         all_feeds = query.all()
-        
-        if debug:
-            debug_info["total_published_feeds"] = len(all_feeds)
-            debug_info["sample_feed_categories"] = []
-            for pf in all_feeds[:3]:  # Sample first 3
-                if pf.feed and pf.feed.categories:
-                    debug_info["sample_feed_categories"].append({
-                        "feed_id": pf.feed.id,
-                        "title": pf.feed.title,
-                        "categories": pf.feed.categories,
-                        "content_type": pf.feed.content_type.value if pf.feed.content_type else None
-                    })
         
         # Filter feeds that have the target category in their categories list
         matching_feeds = []
@@ -1819,10 +1792,8 @@ def get_feeds_by_category_id(
             feed = pf.feed
             
             # Check if category name is in the categories list
-            # Handle both list of strings and potential JSON issues
             feed_categories = feed.categories or []
             if not isinstance(feed_categories, list):
-                # Try to convert if it's stored as string
                 try:
                     import json
                     if isinstance(feed_categories, str):
@@ -1842,10 +1813,34 @@ def get_feeds_by_category_id(
             if not category_match:
                 continue
             
-            # Apply content type filter if specified
+            # Apply content type filter if specified - UPDATED LOGIC
             if content_type:
                 feed_content_type = feed.content_type
-                if not feed_content_type or feed_content_type.value != content_type_upper:
+                if not feed_content_type:
+                    continue  # No content type, skip
+                
+                # Get the string value of the content type
+                feed_content_type_str = None
+                
+                # Handle different ways content_type might be stored
+                if hasattr(feed_content_type, 'value'):
+                    feed_content_type_str = feed_content_type.value
+                elif isinstance(feed_content_type, str):
+                    feed_content_type_str = feed_content_type
+                else:
+                    feed_content_type_str = str(feed_content_type)
+                
+                if not feed_content_type_str:
+                    continue
+                
+                # Normalize for comparison - both to uppercase
+                feed_content_type_normalized = feed_content_type_str.upper()
+                requested_content_type_normalized = content_type.upper()
+                
+                if debug:
+                    print(f"DEBUG: Feed {feed.id} - Feed CT: '{feed_content_type_str}' (normalized: '{feed_content_type_normalized}'), Requested: '{content_type}' (normalized: '{requested_content_type_normalized}'), Match: {feed_content_type_normalized == requested_content_type_normalized}")
+                
+                if feed_content_type_normalized != requested_content_type_normalized:
                     continue
             
             # Apply skills filter if specified
@@ -1924,11 +1919,6 @@ def get_feeds_by_category_id(
                         sources_map[source_id]["feed_count"] += 1
                 
                 matching_feeds.append(feed_data)
-        
-        # Debug: Show what feeds were found
-        if debug:
-            debug_info["matching_feeds_count"] = len(matching_feeds)
-            debug_info["matching_feed_ids"] = [pf.feed_id for pf in all_feeds if pf.feed and pf.feed.id in [f.get("feed_id") for f in matching_feeds]]
         
         # Apply pagination
         total = len(matching_feeds)
@@ -2022,6 +2012,22 @@ def get_feeds_by_category_id(
         
         # Add debug info if requested
         if debug:
+            # Collect debug info
+            debug_info = {
+                "category": category.name,
+                "content_type_filter": content_type,
+                "all_feeds_count": len(all_feeds),
+                "matching_feeds_count": total,
+                "feeds_checked": [
+                    {
+                        "feed_id": pf.feed.id if pf.feed else None,
+                        "title": pf.feed.title if pf.feed else None,
+                        "categories": pf.feed.categories if pf.feed else None,
+                        "content_type": pf.feed.content_type.value if pf.feed and pf.feed.content_type else None
+                    }
+                    for pf in all_feeds[:10]  # First 10 only for debug
+                ]
+            }
             response_data["debug"] = debug_info
 
         return response_data
@@ -2035,127 +2041,7 @@ def get_feeds_by_category_id(
             detail=f"Failed to fetch feeds for category ID {category_id}"
         )
 
-# @router.get("/feeds/category-debug/{category_id}")
-# def debug_category_feeds(
-#     category_id: int,
-#     content_type: Optional[str] = Query(None, description="Filter by content type"),
-#     db: Session = Depends(get_db)
-# ):
-#     """
-#     Debug endpoint to see what's happening with category filtering.
-#     """
-#     try:
-#         # Get category
-#         category = db.query(Category).filter(Category.id == category_id).first()
-#         if not category:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail=f"Category with ID {category_id} not found"
-#             )
-        
-#         # Get all published feeds
-#         published_feeds = db.query(PublishedFeed).options(
-#             joinedload(PublishedFeed.feed)
-#         ).filter(
-#             PublishedFeed.is_active == True
-#         ).all()
-        
-#         # Get all feeds (including unpublished)
-#         all_feeds = db.query(Feed).all()
-        
-#         # Check feeds with the category
-#         feeds_with_category = []
-#         for feed in all_feeds:
-#             feed_categories = feed.categories or []
-#             if not isinstance(feed_categories, list):
-#                 try:
-#                     import json
-#                     if isinstance(feed_categories, str):
-#                         feed_categories = json.loads(feed_categories)
-#                     else:
-#                         feed_categories = []
-#                 except:
-#                     feed_categories = []
-            
-#             # Check for match
-#             category_match = False
-#             for cat in feed_categories:
-#                 if isinstance(cat, str) and cat.lower() == category.name.lower():
-#                     category_match = True
-#                     break
-            
-#             if category_match:
-#                 # Check if published
-#                 is_published = any(pf.feed_id == feed.id for pf in published_feeds)
-#                 feeds_with_category.append({
-#                     "feed_id": feed.id,
-#                     "title": feed.title,
-#                     "content_type": feed.content_type.value if feed.content_type else None,
-#                     "categories": feed_categories,
-#                     "is_published": is_published,
-#                     "published_feed_id": next((pf.id for pf in published_feeds if pf.feed_id == feed.id), None)
-#                 })
-        
-#         # Check published feeds with the category
-#         published_feeds_with_category = []
-#         for pf in published_feeds:
-#             if pf.feed:
-#                 feed_categories = pf.feed.categories or []
-#                 if not isinstance(feed_categories, list):
-#                     try:
-#                         import json
-#                         if isinstance(feed_categories, str):
-#                             feed_categories = json.loads(feed_categories)
-#                         else:
-#                             feed_categories = []
-#                     except:
-#                         feed_categories = []
-                
-#                 category_match = False
-#                 for cat in feed_categories:
-#                     if isinstance(cat, str) and cat.lower() == category.name.lower():
-#                         category_match = True
-#                         break
-                
-#                 if category_match:
-#                     published_feeds_with_category.append({
-#                         "published_feed_id": pf.id,
-#                         "feed_id": pf.feed_id,
-#                         "feed_title": pf.feed.title,
-#                         "content_type": pf.feed.content_type.value if pf.feed.content_type else None,
-#                         "categories": feed_categories,
-#                         "published_at": pf.published_at
-#                     })
-        
-#         return {
-#             "category": {
-#                 "id": category.id,
-#                 "name": category.name,
-#                 "description": category.description
-#             },
-#             "statistics": {
-#                 "total_feeds": len(all_feeds),
-#                 "total_published_feeds": len(published_feeds),
-#                 "feeds_with_category": len(feeds_with_category),
-#                 "published_feeds_with_category": len(published_feeds_with_category)
-#             },
-#             "feeds_with_category": feeds_with_category[:10],  # First 10 only
-#             "published_feeds_with_category": published_feeds_with_category,
-#             "debug_info": {
-#                 "content_type_filter": content_type,
-#                 "total_matching_published_feeds": len([
-#                     pf for pf in published_feeds_with_category 
-#                     if not content_type or (pf["content_type"] and pf["content_type"].lower() == content_type.lower())
-#                 ])
-#             }
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Error in category debug: {e}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail=f"Failed to debug category: {e}"
-#         )
+
 @router.post("/feeds/category-filter-by-id", response_model=Dict[str, Any])
 def filter_feeds_within_category_by_id(
     request: CategoryFilterRequest,
