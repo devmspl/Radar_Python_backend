@@ -1738,18 +1738,18 @@ def get_available_categories(
 @router.get("/feeds/by-category/{category_id}")
 def get_feeds_by_category_id(
     category_id: int,
-    content_type: Optional[str] = Query(None, description="Filter by content type (Webinar, Blog, Podcast, Video)"),
-    skills: Optional[List[str]] = Query(None, description="Filter by skills"),
-    tools: Optional[List[str]] = Query(None, description="Filter by tools"),
-    roles: Optional[List[str]] = Query(None, description="Filter by roles"),
+    content_type: Optional[str] = Query(None, description="Filter by content types (comma-separated: Webinar,Blog,Podcast,Video)"),
+    skills: Optional[str] = Query(None, description="Filter by skills (comma-separated)"),
+    tools: Optional[str] = Query(None, description="Filter by tools (comma-separated)"),
+    roles: Optional[str] = Query(None, description="Filter by roles (comma-separated)"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     include_source_info: bool = Query(True, description="Include source information"),
-    debug: bool = Query(False, description="Enable debug mode to see filtering details"),
     db: Session = Depends(get_db)
 ):
     """
     Get published feeds by category ID with optional source information and filtering.
+    Supports comma-separated values for filtering.
     """
     try:
         # First get the category name from ID
@@ -1761,15 +1761,30 @@ def get_feeds_by_category_id(
                 detail=f"Category with ID {category_id} not found"
             )
 
-        # Validate content_type if provided
+        # Parse comma-separated strings into lists
+        def parse_comma_separated(value: Optional[str]) -> List[str]:
+            if not value:
+                return []
+            # Split by comma, strip whitespace, filter out empty strings
+            return [item.strip() for item in value.split(',') if item.strip()]
+        
+        content_types_list = parse_comma_separated(content_type)
+        skills_list = parse_comma_separated(skills)
+        tools_list = parse_comma_separated(tools)
+        roles_list = parse_comma_separated(roles)
+        
+        # Validate content_types if provided
         valid_content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
-        if content_type:
-            content_type_upper = content_type.upper()
-            if content_type_upper not in valid_content_types:
+        content_types_upper = []
+        
+        for ct in content_types_list:
+            ct_upper = ct.upper()
+            if ct_upper not in valid_content_types:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid content_type: {content_type}. Valid types: Webinar, Blog, Podcast, Video"
+                    detail=f"Invalid content_type: {ct}. Valid types: Webinar, Blog, Podcast, Video"
                 )
+            content_types_upper.append(ct_upper)
         
         # Get all active published feeds
         query = db.query(PublishedFeed).options(
@@ -1813,16 +1828,13 @@ def get_feeds_by_category_id(
             if not category_match:
                 continue
             
-            # Apply content type filter if specified - UPDATED LOGIC
-            if content_type:
+            # Apply content type filter if specified
+            if content_types_upper:
                 feed_content_type = feed.content_type
                 if not feed_content_type:
-                    continue  # No content type, skip
+                    continue
                 
-                # Get the string value of the content type
                 feed_content_type_str = None
-                
-                # Handle different ways content_type might be stored
                 if hasattr(feed_content_type, 'value'):
                     feed_content_type_str = feed_content_type.value
                 elif isinstance(feed_content_type, str):
@@ -1833,18 +1845,12 @@ def get_feeds_by_category_id(
                 if not feed_content_type_str:
                     continue
                 
-                # Normalize for comparison - both to uppercase
                 feed_content_type_normalized = feed_content_type_str.upper()
-                requested_content_type_normalized = content_type.upper()
-                
-                if debug:
-                    print(f"DEBUG: Feed {feed.id} - Feed CT: '{feed_content_type_str}' (normalized: '{feed_content_type_normalized}'), Requested: '{content_type}' (normalized: '{requested_content_type_normalized}'), Match: {feed_content_type_normalized == requested_content_type_normalized}")
-                
-                if feed_content_type_normalized != requested_content_type_normalized:
+                if feed_content_type_normalized not in content_types_upper:
                     continue
             
             # Apply skills filter if specified
-            if skills:
+            if skills_list:
                 feed_skills = feed.skills or []
                 if not isinstance(feed_skills, list):
                     try:
@@ -1855,15 +1861,14 @@ def get_feeds_by_category_id(
                     except:
                         feed_skills = []
                 
-                # Case-insensitive skills matching
                 feed_skills_lower = [s.lower() for s in feed_skills if isinstance(s, str)]
-                requested_skills_lower = [s.lower() for s in skills if isinstance(s, str)]
+                requested_skills_lower = [s.lower() for s in skills_list if isinstance(s, str)]
                 
                 if not any(skill in feed_skills_lower for skill in requested_skills_lower):
                     continue
             
             # Apply tools filter if specified
-            if tools:
+            if tools_list:
                 feed_tools = feed.tools or []
                 if not isinstance(feed_tools, list):
                     try:
@@ -1874,15 +1879,14 @@ def get_feeds_by_category_id(
                     except:
                         feed_tools = []
                 
-                # Case-insensitive tools matching
                 feed_tools_lower = [t.lower() for t in feed_tools if isinstance(t, str)]
-                requested_tools_lower = [t.lower() for t in tools if isinstance(t, str)]
+                requested_tools_lower = [t.lower() for t in tools_list if isinstance(t, str)]
                 
                 if not any(tool in feed_tools_lower for tool in requested_tools_lower):
                     continue
             
             # Apply roles filter if specified
-            if roles:
+            if roles_list:
                 feed_roles = feed.roles or []
                 if not isinstance(feed_roles, list):
                     try:
@@ -1893,9 +1897,8 @@ def get_feeds_by_category_id(
                     except:
                         feed_roles = []
                 
-                # Case-insensitive roles matching
                 feed_roles_lower = [r.lower() for r in feed_roles if isinstance(r, str)]
-                requested_roles_lower = [r.lower() for r in roles if isinstance(r, str)]
+                requested_roles_lower = [r.lower() for r in roles_list if isinstance(r, str)]
                 
                 if not any(role in feed_roles_lower for role in requested_roles_lower):
                     continue
@@ -1903,12 +1906,10 @@ def get_feeds_by_category_id(
             # Format feed response
             feed_data = format_published_feed_response(pf, db)
             if feed_data:
-                # Add source information if requested
                 if include_source_info:
                     source_info = get_source_for_feed(db, feed)
                     feed_data["source"] = source_info
                     
-                    # Track source statistics
                     if source_info and source_info.get("id"):
                         source_id = source_info["id"]
                         if source_id not in sources_map:
@@ -1939,7 +1940,7 @@ def get_feeds_by_category_id(
         # Sort sources by feed count (most popular first)
         sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
 
-        # Get content type breakdown for this category
+        # Get content type breakdown
         content_type_breakdown = {}
         for feed in matching_feeds:
             content_type_value = feed.get("content_type", "Unknown")
@@ -1973,14 +1974,14 @@ def get_feeds_by_category_id(
         
         # Prepare applied filters
         applied_filters = {}
-        if content_type:
-            applied_filters["content_type"] = content_type
-        if skills:
-            applied_filters["skills"] = skills
-        if tools:
-            applied_filters["tools"] = tools
-        if roles:
-            applied_filters["roles"] = roles
+        if content_types_list:
+            applied_filters["content_types"] = content_types_list
+        if skills_list:
+            applied_filters["skills"] = skills_list
+        if tools_list:
+            applied_filters["tools"] = tools_list
+        if roles_list:
+            applied_filters["roles"] = roles_list
 
         response_data = {
             "items": paginated_feeds,
@@ -2010,26 +2011,6 @@ def get_feeds_by_category_id(
             "has_more": end_idx < total
         }
         
-        # Add debug info if requested
-        if debug:
-            # Collect debug info
-            debug_info = {
-                "category": category.name,
-                "content_type_filter": content_type,
-                "all_feeds_count": len(all_feeds),
-                "matching_feeds_count": total,
-                "feeds_checked": [
-                    {
-                        "feed_id": pf.feed.id if pf.feed else None,
-                        "title": pf.feed.title if pf.feed else None,
-                        "categories": pf.feed.categories if pf.feed else None,
-                        "content_type": pf.feed.content_type.value if pf.feed and pf.feed.content_type else None
-                    }
-                    for pf in all_feeds[:10]  # First 10 only for debug
-                ]
-            }
-            response_data["debug"] = debug_info
-
         return response_data
 
     except HTTPException:
