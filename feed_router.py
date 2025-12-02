@@ -7,11 +7,12 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from database import get_db
-from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source,PublishedFeed
-from openai import OpenAI
+from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType
+from openai import OpenAI, APIError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
 from sqlalchemy import or_, String
+import requests
 from enum import Enum
 
 router = APIRouter(prefix="/get", tags=["Feeds"])
@@ -21,7 +22,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    client = None
+    logger.warning("OpenAI API key not found. AI features will not work.")
 
 class ContentType(str, Enum):
     WEBINAR = "Webinar"
@@ -29,12 +37,156 @@ class ContentType(str, Enum):
     PODCAST = "Podcast"
     VIDEO = "Video"
 
+# ------------------ Helper Functions ------------------
+
+def validate_openai_client():
+    """Validate OpenAI client is available and has quota."""
+    if not client:
+        raise HTTPException(status_code=503, detail="OpenAI service not configured")
+    
+    # Check if API key exists (basic check)
+    if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("sk-") and len(OPENAI_API_KEY) < 10:
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured properly")
+
+
+def check_openai_availability() -> Dict[str, Any]:
+    """Check if OpenAI API is available and has quota."""
+    if not OPENAI_API_KEY:
+        return {"available": False, "reason": "OpenAI API key not configured"}
+    
+    try:
+        # Try a simple, cheap API call to check quota
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "Say 'test'"}],
+            max_tokens=5,
+            timeout=10
+        )
+        return {"available": True, "reason": "OpenAI API is working"}
+    except RateLimitError as e:
+        logger.error(f"OpenAI quota exceeded: {e}")
+        return {"available": False, "reason": f"OpenAI quota exceeded: {str(e)}"}
+    except APIError as e:
+        logger.error(f"OpenAI API error: {e}")
+        return {"available": False, "reason": f"OpenAI API error: {str(e)}"}
+    except Exception as e:
+        logger.error(f"OpenAI check failed: {e}")
+        return {"available": False, "reason": f"OpenAI check failed: {str(e)}"}
+
+
+def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
+    """Get YouTube channel information using YouTube Data API."""
+    if not YOUTUBE_API_KEY:
+        logger.warning("YouTube API key not found. Using fallback channel info.")
+        return {
+            "channel_name": "YouTube Creator",
+            "channel_id": None,
+            "available": False
+        }
+    
+    try:
+        # First, get video details to get channel ID
+        video_url = f"https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            "key": YOUTUBE_API_KEY,
+            "id": video_id,
+            "part": "snippet"
+        }
+        
+        response = requests.get(video_url, params=params, timeout=10)
+        if response.status_code != 200:
+            logger.warning(f"Failed to get video info: {response.status_code}")
+            return {
+                "channel_name": "YouTube Creator",
+                "channel_id": None,
+                "available": False
+            }
+        
+        video_data = response.json()
+        if not video_data.get("items"):
+            return {
+                "channel_name": "YouTube Creator",
+                "channel_id": None,
+                "available": False
+            }
+        
+        snippet = video_data["items"][0]["snippet"]
+        channel_id = snippet.get("channelId")
+        channel_title = snippet.get("channelTitle", "YouTube Creator")
+        
+        # Get channel details
+        if channel_id:
+            channel_url = f"https://www.googleapis.com/youtube/v3/channels"
+            channel_params = {
+                "key": YOUTUBE_API_KEY,
+                "id": channel_id,
+                "part": "snippet,statistics"
+            }
+            
+            channel_response = requests.get(channel_url, params=channel_params, timeout=10)
+            if channel_response.status_code == 200:
+                channel_data = channel_response.json()
+                if channel_data.get("items"):
+                    channel_info = channel_data["items"][0]["snippet"]
+                    stats = channel_data["items"][0].get("statistics", {})
+                    
+                    return {
+                        "channel_name": channel_title,
+                        "channel_id": channel_id,
+                        "description": channel_info.get("description", ""),
+                        "thumbnail": channel_info.get("thumbnails", {}).get("default", {}).get("url", ""),
+                        "subscriber_count": stats.get("subscriberCount", "0"),
+                        "video_count": stats.get("videoCount", "0"),
+                        "available": True
+                    }
+        
+        return {
+            "channel_name": channel_title,
+            "channel_id": channel_id,
+            "available": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching YouTube channel info: {e}")
+        return {
+            "channel_name": "YouTube Creator",
+            "channel_id": None,
+            "available": False
+        }
+
+def handle_openai_error(e: Exception) -> None:
+    """Handle OpenAI errors and raise appropriate HTTPException."""
+    if isinstance(e, RateLimitError):
+        logger.error(f"OpenAI rate limit/quota exceeded: {e}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"OpenAI quota exceeded. Please check your OpenAI billing and quota. Error: {str(e)}"
+        )
+    elif isinstance(e, APIError):
+        logger.error(f"OpenAI API error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenAI API error: {str(e)}"
+        )
+    else:
+        logger.error(f"OpenAI error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"OpenAI processing failed: {str(e)}"
+        )
+
 # ------------------ AI Categorization Function ------------------
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry_error_callback=lambda retry_state: handle_openai_error(retry_state.outcome.exception())
+)
 def categorize_content_with_openai(content: str, admin_categories: list) -> tuple:
     """Categorize content using OpenAI and extract skills, tools, roles."""
     try:
+        validate_openai_client()
+        
         truncated_content = content[:4000] + "..." if len(content) > 4000 else content
         
         response = client.chat.completions.create(
@@ -90,7 +242,8 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
                 unique_categories.append(cat)
         
         if not unique_categories:
-            raise HTTPException(status_code=500, detail="OpenAI failed to categorize content")
+            # Use first available category as fallback
+            unique_categories = [admin_categories[0]] if admin_categories else ["Uncategorized"]
         
         # Extract other metadata
         skills = list(set(analysis.get("skills", [])))[:10]
@@ -110,16 +263,24 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
         
         return unique_categories[:3], skills, tools, roles, content_type
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OpenAI categorization error: {e}")
-        raise HTTPException(status_code=500, detail=f"OpenAI categorization failed: {str(e)}")
+        handle_openai_error(e)
 
 # ------------------ AI Content Generation Functions ------------------
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry_error_callback=lambda retry_state: handle_openai_error(retry_state.outcome.exception())
+)
 def generate_feed_content_with_ai(title: str, content: str, categories: List[str], content_type: str = "blog") -> Dict[str, Any]:
     """Generate engaging feed content using AI."""
     try:
+        validate_openai_client()
+        
         truncated_content = content[:6000] + "..." if len(content) > 6000 else content
         
         system_prompt = {
@@ -183,14 +344,22 @@ def generate_feed_content_with_ai(title: str, content: str, categories: List[str
         
         return ai_content
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OpenAI feed generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"OpenAI feed generation failed: {str(e)}")
+        handle_openai_error(e)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry_error_callback=lambda retry_state: handle_openai_error(retry_state.outcome.exception())
+)
 def generate_slide_with_ai(slide_type: str, context: str, categories: List[str], content_type: str = "blog", previous_slides: List[Dict] = None) -> Dict[str, Any]:
     """Generate a specific slide type using AI."""
     try:
+        validate_openai_client()
+        
         system_prompt = {
             "role": "system", 
             "content": f"""You are a presentation design expert. Create engaging, concise slides.
@@ -231,7 +400,15 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         bullets = slide_data.get("bullets", [])
         
         if not title or len(body) < 50:
-            raise HTTPException(status_code=500, detail="OpenAI generated insufficient slide content")
+            # Generate minimal slide as fallback
+            return {
+                "title": f"{content_type} Insights",
+                "body": "Content processing requires OpenAI API access. Please check your API key and quota.",
+                "bullets": ["AI processing not available"],
+                "background_color": "#FFFFFF",
+                "source_refs": [],
+                "render_markdown": True
+            }
         
         return {
             "title": title,
@@ -244,7 +421,7 @@ def generate_slide_with_ai(slide_type: str, context: str, categories: List[str],
         
     except Exception as e:
         logger.error(f"OpenAI slide generation error for {slide_type}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"OpenAI slide generation failed for {slide_type}: {str(e)}")
+        handle_openai_error(e)
 
 def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict[str, Any], categories: List[str], content_type: str = "blog") -> List[Dict]:
     """Generate presentation slides using AI."""
@@ -327,8 +504,37 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         logger.info(f"Successfully generated {len(slides)} slides for '{title}'")
         return slides[:slide_count]
         
+    except HTTPException as e:
+        # If OpenAI fails, create minimal slides
+        logger.error(f"Error in generate_slides_with_ai for '{title}': {e.detail}")
+        
+        # Create minimal fallback slides
+        fallback_slides = [
+            {
+                "order": 1,
+                "title": title,
+                "body": "Feed generation requires OpenAI API access. Please check your API key and quota.",
+                "bullets": ["AI processing failed"],
+                "background_color": "#FFFFFF",
+                "source_refs": [],
+                "render_markdown": True
+            }
+        ]
+        
+        if slide_count > 1:
+            fallback_slides.append({
+                "order": 2,
+                "title": "Content Unavailable",
+                "body": "The content could not be processed due to API limitations.",
+                "bullets": ["Check OpenAI API configuration"],
+                "background_color": "#FFFFFF",
+                "source_refs": [],
+                "render_markdown": True
+            })
+        
+        return fallback_slides[:slide_count]
     except Exception as e:
-        logger.error(f"Error in generate_slides_with_ai for '{title}': {str(e)}")
+        logger.error(f"Unexpected error in generate_slides_with_ai for '{title}': {str(e)}")
         raise
 
 def generate_feed_background_color(title: str, content_type: str, categories: List[str]) -> str:
@@ -366,13 +572,34 @@ def create_feed_from_blog(db: Session, blog: Blog):
         # Create new feed with enhanced metadata
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
-            raise HTTPException(status_code=500, detail="No active categories found in database")
-            
-        categories, skills, tools, roles, content_type = categorize_content_with_openai(blog.content, admin_categories)
-        ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
-        slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
+            # Use fallback categories
+            admin_categories = ["Uncategorized"]
         
-        feed_title = ai_generated_content.get("title", blog.title)
+        try:
+            categories, skills, tools, roles, content_type = categorize_content_with_openai(blog.content, admin_categories)
+            ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
+            slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
+            
+            feed_title = ai_generated_content.get("title", blog.title)
+            status = "ready"
+        except HTTPException as e:
+            # If OpenAI fails, create minimal feed
+            logger.warning(f"OpenAI failed for blog {blog.id}, creating minimal feed: {e.detail}")
+            categories = ["Uncategorized"]
+            skills = []
+            tools = []
+            roles = []
+            content_type = ContentType.BLOG
+            ai_generated_content = {
+                "title": blog.title,
+                "summary": "Content processing requires OpenAI API access. Please check your API key and quota.",
+                "key_points": ["AI processing not available"],
+                "conclusion": "Unable to generate content summary due to API limitations."
+            }
+            slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
+            feed_title = blog.title
+            status = "partial"
+        
         feed = Feed(
             blog_id=blog.id, 
             title=feed_title,
@@ -381,7 +608,7 @@ def create_feed_from_blog(db: Session, blog: Blog):
             tools=tools,
             roles=roles,
             content_type=content_type,
-            status="ready",
+            status=status,
             ai_generated_content=ai_generated_content,
             image_generation_enabled=False,
             source_type="blog",
@@ -411,8 +638,6 @@ def create_feed_from_blog(db: Session, blog: Blog):
         logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
         return feed
         
-    except HTTPException:
-        raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
@@ -429,13 +654,32 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
-            raise HTTPException(status_code=500, detail="No active categories found in database")
-            
-        categories, skills, tools, roles, content_type = categorize_content_with_openai(transcript.transcript_text, admin_categories)
-        ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
-        slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
+            admin_categories = ["Uncategorized"]
         
-        feed_title = ai_generated_content.get("title", transcript.title)
+        try:
+            categories, skills, tools, roles, content_type = categorize_content_with_openai(transcript.transcript_text, admin_categories)
+            ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
+            slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
+            
+            feed_title = ai_generated_content.get("title", transcript.title)
+            status = "ready"
+        except HTTPException as e:
+            # If OpenAI fails, create minimal feed
+            logger.warning(f"OpenAI failed for transcript {transcript.transcript_id}, creating minimal feed: {e.detail}")
+            categories = ["Uncategorized"]
+            skills = []
+            tools = []
+            roles = []
+            content_type = ContentType.VIDEO
+            ai_generated_content = {
+                "title": transcript.title,
+                "summary": "Content processing requires OpenAI API access. Please check your API key and quota.",
+                "key_points": ["AI processing not available"],
+                "conclusion": "Unable to generate content summary due to API limitations."
+            }
+            slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
+            feed_title = transcript.title
+            status = "partial"
         
         if existing_feed and overwrite:
             # UPDATE existing feed
@@ -445,7 +689,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             existing_feed.tools = tools
             existing_feed.roles = roles
             existing_feed.content_type = content_type
-            existing_feed.status = "ready"
+            existing_feed.status = status
             existing_feed.ai_generated_content = ai_generated_content
             existing_feed.updated_at = datetime.utcnow()
             
@@ -483,7 +727,7 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
                 tools=tools,
                 roles=roles,
                 content_type=content_type,
-                status="ready",
+                status=status,
                 ai_generated_content=ai_generated_content,
                 image_generation_enabled=False,
                 source_type="youtube",
@@ -514,14 +758,216 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             logger.info(f"Successfully CREATED AI-generated feed {feed.id} for transcript {transcript.transcript_id}")
             return feed
         
-    except HTTPException:
-        raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating/updating AI-generated feed for transcript {transcript.transcript_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create feed for transcript: {str(e)}")
 
-# ------------------ New Endpoints for Feed Router ------------------
+def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
+    """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
+    if feed.source_type == "youtube":
+        # Get the transcript to access YouTube-specific data
+        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        
+        if transcript:
+            # Extract video ID from transcript data
+            video_id = getattr(transcript, 'video_id', None)
+            if not video_id:
+                # Try to extract from transcript_id or other fields
+                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
+            
+            # Get original title from transcript
+            original_title = transcript.title if transcript else feed.title
+            
+            # Get channel information from YouTube API
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            # Construct proper YouTube URL
+            source_url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            return {
+                "title": feed.title,
+                "original_title": original_title,
+                "author": channel_name,
+                "source_url": source_url,
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info
+            }
+        else:
+            # Fallback if transcript not found
+            video_id = feed.transcript_id
+            channel_info = get_youtube_channel_info(video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            return {
+                "title": feed.title,
+                "original_title": feed.title,
+                "author": channel_name,
+                "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                "source_type": "youtube",
+                "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info
+            }
+    
+    else:  # blog source type
+        blog = feed.blog
+        if blog:
+            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+            author = getattr(blog, 'author', 'Admin') or 'Admin'
+            
+            return {
+                "title": feed.title,
+                "original_title": blog.title,
+                "author": author,
+                "source_url": blog.url,
+                "source_type": "blog",
+                "website_name": website_name,
+                "website": blog.website
+            }
+        else:
+            # Fallback if blog not found
+            return {
+                "title": feed.title,
+                "original_title": "Unknown",
+                "author": "Admin",
+                "source_url": "#",
+                "source_type": "blog",
+                "website_name": "Unknown",
+                "website": "Unknown"
+            }
+
+def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True):
+    """Background task to process blog feed creation."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        created_count = 0
+        skipped_count = 0
+        error_count = 0
+        openai_error_count = 0
+        error_messages = []
+        openai_errors = []
+        
+        for blog in blogs:
+            try:
+                existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
+                if existing_feed and not overwrite:
+                    skipped_count += 1
+                    continue
+                
+                if existing_feed and overwrite:
+                    # Delete existing slides to regenerate
+                    db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
+                    db.flush()
+                
+                # Create feed with AI
+                feed = create_feed_from_blog(db, blog)
+                
+                if feed:
+                    created_count += 1
+                    if feed.status == "partial":
+                        openai_error_count += 1
+                        openai_errors.append(f"Blog {blog.id}: OpenAI quota/configuration issue")
+                    
+            except HTTPException as e:
+                if "quota" in str(e.detail).lower() or "OpenAI" in str(e.detail):
+                    openai_error_count += 1
+                    openai_errors.append(f"Blog {blog.id}: {e.detail}")
+                else:
+                    error_count += 1
+                    error_messages.append(f"Blog {blog.id}: {e.detail}")
+                logger.error(f"Error processing blog {blog.id}: {e.detail}")
+                continue
+            except Exception as e:
+                error_count += 1
+                error_messages.append(f"Blog {blog.id}: {str(e)}")
+                logger.error(f"Error processing blog {blog.id}: {e}")
+                continue
+        
+        summary = f"Completed blog feed creation for {website}: {created_count} created"
+        if openai_error_count > 0:
+            summary += f", {openai_error_count} with OpenAI issues"
+        if error_count > 0:
+            summary += f", {error_count} errors"
+        if skipped_count > 0:
+            summary += f", {skipped_count} skipped"
+        
+        logger.info(summary)
+        
+        # Log errors for debugging
+        if openai_errors:
+            logger.warning(f"OpenAI errors for {website}: {openai_errors[:5]}")  # Log first 5
+            
+    finally:
+        db.close()
+
+def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str, overwrite: bool = False, use_ai: bool = True):
+    """Background task to process transcript feed creation."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        created_count = 0
+        skipped_count = 0
+        error_count = 0
+        openai_error_count = 0
+        error_messages = []
+        openai_errors = []
+        
+        for transcript in transcripts:
+            try:
+                existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
+                if existing_feed and not overwrite:
+                    skipped_count += 1
+                    continue
+                
+                # Create feed with AI
+                feed = create_feed_from_transcript(db, transcript, overwrite)
+                
+                if feed:
+                    created_count += 1
+                    if feed.status == "partial":
+                        openai_error_count += 1
+                        openai_errors.append(f"Transcript {transcript.transcript_id}: OpenAI quota/configuration issue")
+                    
+            except HTTPException as e:
+                if "quota" in str(e.detail).lower() or "OpenAI" in str(e.detail):
+                    openai_error_count += 1
+                    openai_errors.append(f"Transcript {transcript.transcript_id}: {e.detail}")
+                else:
+                    error_count += 1
+                    error_messages.append(f"Transcript {transcript.transcript_id}: {e.detail}")
+                logger.error(f"Error processing transcript {transcript.transcript_id}: {e.detail}")
+                continue
+            except Exception as e:
+                error_count += 1
+                error_messages.append(f"Transcript {transcript.transcript_id}: {str(e)}")
+                logger.error(f"Error processing transcript {transcript.transcript_id}: {e}")
+                continue
+        
+        summary = f"Completed transcript feed creation for job {job_id}: {created_count} created"
+        if openai_error_count > 0:
+            summary += f", {openai_error_count} with OpenAI issues"
+        if error_count > 0:
+            summary += f", {error_count} errors"
+        if skipped_count > 0:
+            summary += f", {skipped_count} skipped"
+        
+        logger.info(summary)
+        
+        # Log errors for debugging
+        if openai_errors:
+            logger.warning(f"OpenAI errors for job {job_id}: {openai_errors[:5]}")  # Log first 5
+            
+    finally:
+        db.close()
+
+# ------------------ Endpoints ------------------
 
 @router.get("/sources/with-ids", response_model=List[dict])
 def get_sources_with_ids(
@@ -657,8 +1103,6 @@ def get_feeds_by_source_id(
         logger.error(f"Error fetching feeds for source {source_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch feeds for source")
 
-# ------------------ Existing Feed Router Endpoints ------------------
-
 @router.get("/all", response_model=dict)
 def get_all_feeds(
     response: Response, 
@@ -738,6 +1182,7 @@ def get_all_feeds(
         "total": total, 
         "has_more": has_more
     }
+
 @router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     """Get full AI-generated feed with slides and is_published status."""
@@ -797,29 +1242,44 @@ def create_feeds_from_website(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Create feeds for all blogs from a website - AI only, no fallbacks."""
+    """Create feeds for all blogs from a website."""
     blogs = db.query(Blog).filter(Blog.website == request.website).all()
     if not blogs:
         raise HTTPException(status_code=404, detail="No blogs found for this website")
+    
+    # CHECK OPENAI AVAILABILITY BEFORE STARTING
+    openai_check = check_openai_availability()
+    if not openai_check["available"]:
+        return {
+            "website": request.website,
+            "total_blogs": len(blogs),
+            "use_ai": True,
+            "generate_images": False,
+            "source_type": "blog",
+            "message": f"Cannot start feed creation: {openai_check['reason']}",
+            "status": "failed",
+            "openai_available": False,
+            "openai_reason": openai_check["reason"]
+        }
 
     background_tasks.add_task(
         process_blog_feeds_creation,
-        db,
         blogs,
         request.website,
         request.overwrite,
-        True,  # Always use AI now - no fallbacks
+        True,
     )
 
     return {
         "website": request.website,
         "total_blogs": len(blogs),
-        "use_ai": True,  # Always true now
+        "use_ai": True,
         "generate_images": False,
         "source_type": "blog",
-        "message": "Blog feed creation process started in background (AI-only, no fallbacks)",
+        "message": "Blog feed creation process started in background",
         "status": "processing",
-        # "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
+        "openai_available": True,
+        "warning": "If OpenAI API fails during processing, feeds will be created with minimal content"
     }
 
 @router.post("/feeds/youtube", response_model=dict)
@@ -828,7 +1288,7 @@ def create_feeds_from_youtube(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Create feeds from YouTube transcripts - AI only, no fallbacks."""
+    """Create feeds from YouTube transcripts."""
     transcripts = []
     job_identifier = "all_transcripts"
     
@@ -859,69 +1319,47 @@ def create_feeds_from_youtube(
 
     if not transcripts:
         raise HTTPException(status_code=404, detail="No transcripts found for the given criteria")
+    
+    if not transcripts:
+        raise HTTPException(status_code=404, detail="No transcripts found for the given criteria")
+    
+    # CHECK OPENAI AVAILABILITY BEFORE STARTING
+    openai_check = check_openai_availability()
+    if not openai_check["available"]:
+        return {
+            "job_id": request.job_id,
+            "video_id": request.video_id,
+            "total_transcripts": len(transcripts),
+            "use_ai": True,
+            "generate_images": False,
+            "source_type": "youtube",
+            "message": f"Cannot start feed creation: {openai_check['reason']}",
+            "status": "failed",
+            "openai_available": False,
+            # "openai_reason": openai_check["reason"]
+        }
 
     background_tasks.add_task(
         process_transcript_feeds_creation,
-        db,
         transcripts,
         job_identifier,
         request.overwrite,
-        True,  # Always use AI now - no fallbacks
+        True,
     )
 
     return {
         "job_id": request.job_id,
         "video_id": request.video_id,
         "total_transcripts": len(transcripts),
-        "use_ai": True,  # Always true now
+        "use_ai": True,
         "generate_images": False,
         "source_type": "youtube",
-        "message": f"YouTube transcript feed creation process started for {len(transcripts)} transcripts (AI-only, no fallbacks)",
+        "message": f"YouTube transcript feed creation process started for {len(transcripts)} transcripts",
         "status": "processing",
-        # "warning": "If OpenAI API fails, feed creation will fail with clear error messages"
+        "openai_available": True,
+        "warning": "If OpenAI API fails during processing, feeds will be created with minimal content"
     }
 
-@router.delete("/feeds/slides", response_model=dict)
-def delete_slide_from_feed(
-    request: DeleteSlideRequest, 
-    db: Session = Depends(get_db)
-):
-    """Delete a specific slide from a feed using request body."""
-    feed_id = request.feed_id
-    slide_id = request.slide_id
-
-    # First verify the feed exists
-    feed = db.query(Feed).filter(Feed.id == feed_id).first()
-    if not feed:
-        raise HTTPException(status_code=404, detail="Feed not found")
-    
-    # Find the specific slide
-    slide = db.query(Slide).filter(
-        Slide.id == slide_id, 
-        Slide.feed_id == feed_id
-    ).first()
-    
-    if not slide:
-        raise HTTPException(status_code=404, detail="Slide not found in this feed")
-    
-    try:
-        # Delete the slide
-        db.delete(slide)
-        db.commit()
-        
-        logger.info(f"Successfully deleted slide {slide_id} from feed {feed_id}")
-        
-        return {
-            "message": "Slide deleted successfully",
-            "feed_id": feed_id,
-            "slide_id": slide_id,
-            "deleted_slide_title": slide.title
-        }
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error deleting slide {slide_id} from feed {feed_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete slide")
 
 @router.get("/source/{website}/categorized", response_model=dict)
 def get_categorized_feeds_by_source(
@@ -996,725 +1434,3 @@ def get_categorized_feeds_by_source(
             "exclude_uncategorized": exclude_uncategorized
         }
     }
-# Add these to your feed_router.py
-
-# ------------------ Search & Topic Management ------------------
-
-# @router.get("/search", response_model=dict)
-# def search_feeds_and_topics(
-#     query: str,
-#     page: int = 1,
-#     limit: int = 20,
-#     search_type: str = "all",  # all, topics, feeds, sources
-#     user_id: Optional[int] = None,
-#     auto_create: bool = True,  # Auto-create topics/sources if none exist
-#     db: Session = Depends(get_db)
-# ):
-#     """Search across feeds, topics, and sources."""
-#     if not query or len(query.strip()) < 2:
-#         raise HTTPException(status_code=400, detail="Query must be at least 2 characters long")
-    
-#     # Auto-create topics and sources if none exist and flag is enabled
-#     if auto_create:
-#         auto_create_topics_from_feeds(db)
-#         auto_create_sources_from_feeds(db)
-    
-#     search_query = f"%{query.strip().lower()}%"
-#     results = {
-#         "query": query,
-#         "page": page,
-#         "limit": limit,
-#         "search_type": search_type
-#     }
-    
-#     # Search topics - improved search
-#     if search_type in ["all", "topics"]:
-#         topics_query = db.query(Topic).filter(
-#             Topic.is_active == True,
-#             or_(
-#                 Topic.name.ilike(search_query),
-#                 Topic.description.ilike(search_query)
-#             )
-#         )
-        
-#         total_topics = topics_query.count()
-        
-#         # If no topics found, try to find relevant categories from feeds
-#         if total_topics == 0 and search_type in ["all", "topics"]:
-#             # Search for categories in feeds that match the query
-#             matching_feeds = db.query(Feed).filter(
-#                 Feed.status == "ready",
-#                 Feed.categories.isnot(None),
-#                 or_(
-#                     Feed.categories.cast(String).ilike(search_query),
-#                     Feed.title.ilike(search_query)
-#                 )
-#             ).all()
-            
-#             # Extract unique categories from matching feeds
-#             relevant_categories = set()
-#             for feed in matching_feeds:
-#                 if feed.categories:
-#                     for category in feed.categories:
-#                         if query.lower() in category.lower():
-#                             relevant_categories.add(category)
-            
-#             # Create temporary topic results
-#             topic_results = []
-#             for category_name in list(relevant_categories)[:limit]:
-#                 feed_count = db.query(Feed).filter(
-#                     Feed.categories.contains([category_name]),
-#                     Feed.status == "ready"
-#                 ).count()
-                
-#                 # Check if user follows this topic (by name since it might not be in Topic table yet)
-#                 is_following = False
-#                 if user_id:
-#                     topic_in_db = db.query(Topic).filter(Topic.name == category_name).first()
-#                     if topic_in_db:
-#                         is_following = db.query(UserTopicFollow).filter(
-#                             UserTopicFollow.user_id == user_id,
-#                             UserTopicFollow.topic_id == topic_in_db.id
-#                         ).first() is not None
-                
-#                 topic_results.append({
-#                     "id": None,  # Not in Topic table yet
-#                     "name": category_name,
-#                     "description": f"Category from feeds: {category_name}",
-#                     "feed_count": feed_count,
-#                     "follower_count": 0,
-#                     "is_following": is_following,
-#                     "created_at": None,
-#                     "is_auto_discovered": True  # Flag to indicate this came from feed categories
-#                 })
-            
-#             results["topics"] = {
-#                 "items": topic_results,
-#                 "total": len(topic_results),
-#                 "has_more": False,
-#                 "auto_discovered": True  # Indicate these are from feed categories
-#             }
-#         else:
-#             # Use existing topics from database
-#             topics = topics_query.offset((page - 1) * limit).limit(limit).all()
-            
-#             topic_results = []
-#             for topic in topics:
-#                 # Get feed count for this topic
-#                 feed_count = db.query(Feed).filter(
-#                     Feed.categories.contains([topic.name]),
-#                     Feed.status == "ready"
-#                 ).count()
-                
-#                 # Check if user follows this topic
-#                 is_following = False
-#                 if user_id:
-#                     is_following = db.query(UserTopicFollow).filter(
-#                         UserTopicFollow.user_id == user_id,
-#                         UserTopicFollow.topic_id == topic.id
-#                     ).first() is not None
-                
-#                 topic_results.append({
-#                     "id": topic.id,
-#                     "name": topic.name,
-#                     "description": topic.description,
-#                     "feed_count": feed_count,
-#                     "follower_count": topic.follower_count,
-#                     "is_following": is_following,
-#                     "created_at": topic.created_at.isoformat() if topic.created_at else None,
-#                     "is_auto_discovered": False
-#                 })
-            
-#             results["topics"] = {
-#                 "items": topic_results,
-#                 "total": total_topics,
-#                 "has_more": (page * limit) < total_topics,
-#                 "auto_discovered": False
-#             }
-    
-#     # Search feeds - improved to find more results
-#     if search_type in ["all", "feeds"]:
-#         feeds_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
-#             Feed.status == "ready",
-#             or_(
-#                 Feed.title.ilike(search_query),
-#                 Feed.categories.cast(String).ilike(search_query),
-#                 Feed.ai_generated_content.cast(String).ilike(search_query),
-#                 Feed.source_type.ilike(search_query)
-#             )
-#         ).order_by(Feed.created_at.desc())
-        
-#         total_feeds = feeds_query.count()
-#         feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
-        
-#         feed_results = []
-#         for feed in feeds:
-#             # Determine source metadata
-#             if feed.source_type == "youtube":
-#                 meta = {
-#                     "title": feed.title,
-#                     "original_title": feed.title,
-#                     "author": "YouTube Creator",
-#                     "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
-#                     "source_type": "youtube"
-#                 }
-#             else:
-#                 meta = {
-#                     "title": feed.title,
-#                     "original_title": feed.blog.title if feed.blog else "Unknown",
-#                     "author": getattr(feed.blog, 'author', 'Admin'),
-#                     "source_url": getattr(feed.blog, 'url', '#'),
-#                     "source_type": "blog"
-#                 }
-            
-#             feed_results.append({
-#                 "id": feed.id,
-#                 "title": feed.title,
-#                 "categories": feed.categories,
-#                 "source_type": feed.source_type,
-#                 "slides_count": len(feed.slides),
-#                 "meta": meta,
-#                 "created_at": feed.created_at.isoformat() if feed.created_at else None,
-#                 "ai_generated": bool(feed.ai_generated_content)
-#             })
-        
-#         results["feeds"] = {
-#             "items": feed_results,
-#             "total": total_feeds,
-#             "has_more": (page * limit) < total_feeds
-#         }
-    
-#     # Search sources
-#     if search_type in ["all", "sources"]:
-#         sources_query = db.query(Source).filter(
-#             Source.is_active == True,
-#             or_(
-#                 Source.name.ilike(search_query),
-#                 Source.website.ilike(search_query),
-#                 Source.source_type.ilike(search_query)
-#             )
-#         )
-        
-#         total_sources = sources_query.count()
-#         sources = sources_query.offset((page - 1) * limit).limit(limit).all()
-        
-#         source_results = []
-#         for source in sources:
-#             # Get feed count for this source
-#             if source.source_type == "blog":
-#                 feed_count = db.query(Feed).join(Blog).filter(
-#                     Blog.website == source.website,
-#                     Feed.status == "ready"
-#                 ).count()
-#             else:
-#                 feed_count = db.query(Feed).filter(
-#                     Feed.source_type == "youtube",
-#                     Feed.status == "ready"
-#                 ).count()
-            
-#             # Check if user follows this source
-#             is_following = False
-#             if user_id:
-#                 is_following = db.query(UserSourceFollow).filter(
-#                     UserSourceFollow.user_id == user_id,
-#                     UserSourceFollow.source_id == source.id
-#                 ).first() is not None
-            
-#             source_results.append({
-#                 "id": source.id,
-#                 "name": source.name,
-#                 "website": source.website,
-#                 "source_type": source.source_type,
-#                 "feed_count": feed_count,
-#                 "follower_count": source.follower_count,
-#                 "is_following": is_following,
-#                 "created_at": source.created_at.isoformat() if source.created_at else None
-#             })
-        
-#         results["sources"] = {
-#             "items": source_results,
-#             "total": total_sources,
-#             "has_more": (page * limit) < total_sources
-#         }
-    
-#     return results
-
-# @router.get("/topics/popular", response_model=dict)
-# def get_popular_topics(
-#     page: int = 1,
-#     limit: int = 20,
-#     user_id: Optional[int] = None,
-#     db: Session = Depends(get_db)
-# ):
-#     """Get popular topics based on feed count and follower count."""
-#     # Get all active topics
-#     topics_query = db.query(Topic).filter(Topic.is_active == True)
-    
-#     # Get topic statistics
-#     topics_with_stats = []
-#     for topic in topics_query.all():
-#         feed_count = db.query(Feed).filter(
-#             Feed.categories.contains([topic.name]),
-#             Feed.status == "ready"
-#         ).count()
-        
-#         # Only include topics with feeds
-#         if feed_count > 0:
-#             # Check if user follows this topic
-#             is_following = False
-#             if user_id:
-#                 is_following = db.query(UserTopicFollow).filter(
-#                     UserTopicFollow.user_id == user_id,
-#                     UserTopicFollow.topic_id == topic.id
-#                 ).first() is not None
-            
-#             topics_with_stats.append({
-#                 "topic": topic,
-#                 "feed_count": feed_count,
-#                 "is_following": is_following
-#             })
-    
-#     # Sort by feed count (popularity) and then by follower count
-#     topics_with_stats.sort(key=lambda x: (x["feed_count"], x["topic"].follower_count), reverse=True)
-    
-#     # Paginate
-#     start_idx = (page - 1) * limit
-#     end_idx = start_idx + limit
-#     paginated_topics = topics_with_stats[start_idx:end_idx]
-    
-#     # Format response
-#     items = []
-#     for item in paginated_topics:
-#         topic = item["topic"]
-#         items.append({
-#             "id": topic.id,
-#             "name": topic.name,
-#             "description": topic.description,
-#             "feed_count": item["feed_count"],
-#             "follower_count": topic.follower_count,
-#             "is_following": item["is_following"],
-#             "created_at": topic.created_at.isoformat() if topic.created_at else None
-#         })
-    
-#     total = len(topics_with_stats)
-#     has_more = (page * limit) < total
-    
-#     return {
-#         "items": items,
-#         "page": page,
-#         "limit": limit,
-#         "total": total,
-#         "has_more": has_more
-#     }
-
-# @router.post("/topics/{topic_name}/follow", response_model=dict)
-# def follow_topic(
-#     topic_name: str,
-#     user_id: int,  # In real implementation, get from auth token
-#     db: Session = Depends(get_db)
-# ):
-#     """Follow a topic."""
-#     # Find or create topic
-#     topic = db.query(Topic).filter(Topic.name == topic_name).first()
-#     if not topic:
-#         # Create topic if it doesn't exist
-#         topic = Topic(name=topic_name, description=f"Topic for {topic_name}")
-#         db.add(topic)
-#         db.flush()
-    
-#     # Check if already following
-#     existing_follow = db.query(UserTopicFollow).filter(
-#         UserTopicFollow.user_id == user_id,
-#         UserTopicFollow.topic_id == topic.id
-#     ).first()
-    
-#     if existing_follow:
-#         raise HTTPException(status_code=400, detail="Already following this topic")
-    
-#     # Create follow relationship
-#     follow = UserTopicFollow(user_id=user_id, topic_id=topic.id)
-#     db.add(follow)
-    
-#     # Update follower count
-#     topic.follower_count += 1
-#     topic.updated_at = datetime.utcnow()
-    
-#     db.commit()
-    
-#     return {
-#         "message": f"Started following topic: {topic_name}",
-#         "topic_id": topic.id,
-#         "topic_name": topic.name,
-#         "follower_count": topic.follower_count,
-#         "is_following": True
-#     }
-
-# @router.post("/topics/{topic_name}/unfollow", response_model=dict)
-# def unfollow_topic(
-#     topic_name: str,
-#     user_id: int,  # In real implementation, get from auth token
-#     db: Session = Depends(get_db)
-# ):
-#     """Unfollow a topic."""
-#     topic = db.query(Topic).filter(Topic.name == topic_name).first()
-#     if not topic:
-#         raise HTTPException(status_code=404, detail="Topic not found")
-    
-#     # Find follow relationship
-#     follow = db.query(UserTopicFollow).filter(
-#         UserTopicFollow.user_id == user_id,
-#         UserTopicFollow.topic_id == topic.id
-#     ).first()
-    
-#     if not follow:
-#         raise HTTPException(status_code=400, detail="Not following this topic")
-    
-#     # Remove follow relationship
-#     db.delete(follow)
-    
-#     # Update follower count
-#     topic.follower_count = max(0, topic.follower_count - 1)
-#     topic.updated_at = datetime.utcnow()
-    
-#     db.commit()
-    
-#     return {
-#         "message": f"Stopped following topic: {topic_name}",
-#         "topic_id": topic.id,
-#         "topic_name": topic.name,
-#         "follower_count": topic.follower_count,
-#         "is_following": False
-#     }
-
-# @router.post("/sources/{source_id}/follow", response_model=dict)
-# def follow_source(
-#     source_id: int,
-#     user_id: int,  # In real implementation, get from auth token
-#     db: Session = Depends(get_db)
-# ):
-#     """Follow a source."""
-#     source = db.query(Source).filter(Source.id == source_id).first()
-#     if not source:
-#         raise HTTPException(status_code=404, detail="Source not found")
-    
-#     # Check if already following
-#     existing_follow = db.query(UserSourceFollow).filter(
-#         UserSourceFollow.user_id == user_id,
-#         UserSourceFollow.source_id == source_id
-#     ).first()
-    
-#     if existing_follow:
-#         raise HTTPException(status_code=400, detail="Already following this source")
-    
-#     # Create follow relationship
-#     follow = UserSourceFollow(user_id=user_id, source_id=source_id)
-#     db.add(follow)
-    
-#     # Update follower count
-#     source.follower_count += 1
-#     source.updated_at = datetime.utcnow()
-    
-#     db.commit()
-    
-#     return {
-#         "message": f"Started following source: {source.name}",
-#         "source_id": source.id,
-#         "source_name": source.name,
-#         "follower_count": source.follower_count,
-#         "is_following": True
-#     }
-
-# @router.post("/sources/{source_id}/unfollow", response_model=dict)
-# def unfollow_source(
-#     source_id: int,
-#     user_id: int,  # In real implementation, get from auth token
-#     db: Session = Depends(get_db)
-# ):
-#     """Unfollow a source."""
-#     source = db.query(Source).filter(Source.id == source_id).first()
-#     if not source:
-#         raise HTTPException(status_code=404, detail="Source not found")
-    
-#     # Find follow relationship
-#     follow = db.query(UserSourceFollow).filter(
-#         UserSourceFollow.user_id == user_id,
-#         UserSourceFollow.source_id == source_id
-#     ).first()
-    
-#     if not follow:
-#         raise HTTPException(status_code=400, detail="Not following this source")
-    
-#     # Remove follow relationship
-#     db.delete(follow)
-    
-#     # Update follower count
-#     source.follower_count = max(0, source.follower_count - 1)
-#     source.updated_at = datetime.utcnow()
-    
-#     db.commit()
-    
-#     return {
-#         "message": f"Stopped following source: {source.name}",
-#         "source_id": source.id,
-#         "source_name": source.name,
-#         "follower_count": source.follower_count,
-#         "is_following": False
-#     }
-
-# @router.get("/user/feed", response_model=dict)
-# def get_personalized_feed(
-#     user_id: int,
-#     page: int = 1,
-#     limit: int = 20,
-#     db: Session = Depends(get_db)
-# ):
-#     """Get personalized feed based on followed topics and sources."""
-#     # Get user's followed topics
-#     followed_topics = db.query(UserTopicFollow).filter(
-#         UserTopicFollow.user_id == user_id
-#     ).all()
-    
-#     # Get user's followed sources
-#     followed_sources = db.query(UserSourceFollow).filter(
-#         UserSourceFollow.user_id == user_id
-#     ).all()
-    
-#     # Build query for feeds from followed topics and sources
-#     feed_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
-#         Feed.status == "ready"
-#     )
-    
-#     # Add conditions for followed topics
-#     topic_conditions = []
-#     for topic_follow in followed_topics:
-#         topic = topic_follow.topic
-#         topic_conditions.append(Feed.categories.contains([topic.name]))
-    
-#     # Add conditions for followed sources
-#     source_conditions = []
-#     for source_follow in followed_sources:
-#         source = source_follow.source
-#         if source.source_type == "blog":
-#             source_conditions.append(Blog.website == source.website)
-#         # Add YouTube source conditions if needed
-    
-#     # Combine conditions
-#     if topic_conditions or source_conditions:
-#         combined_conditions = []
-#         if topic_conditions:
-#             combined_conditions.append(or_(*topic_conditions))
-#         if source_conditions:
-#             # Join with Blog for website conditions
-#             feed_query = feed_query.join(Blog)
-#             combined_conditions.append(or_(*source_conditions))
-        
-#         feed_query = feed_query.filter(or_(*combined_conditions))
-    
-#     # Order by creation date (newest first)
-#     feed_query = feed_query.order_by(Feed.created_at.desc())
-    
-#     # Paginate
-#     total = feed_query.count()
-#     feeds = feed_query.offset((page - 1) * limit).limit(limit).all()
-    
-#     # Format response
-#     items = []
-#     for feed in feeds:
-#         if feed.source_type == "youtube":
-#             meta = {
-#                 "title": feed.title,
-#                 "original_title": feed.title,
-#                 "author": "YouTube Creator",
-#                 "source_url": f"https://www.youtube.com/watch?v={feed.transcript_id}" if feed.transcript_id else "#",
-#                 "source_type": "youtube"
-#             }
-#         else:
-#             meta = {
-#                 "title": feed.title,
-#                 "original_title": feed.blog.title if feed.blog else "Unknown",
-#                 "author": getattr(feed.blog, 'author', 'Admin'),
-#                 "source_url": getattr(feed.blog, 'url', '#'),
-#                 "source_type": "blog"
-#             }
-        
-#         items.append({
-#             "id": feed.id,
-#             "title": feed.title,
-#             "categories": feed.categories,
-#             "source_type": feed.source_type,
-#             "slides_count": len(feed.slides),
-#             "meta": meta,
-#             "created_at": feed.created_at.isoformat() if feed.created_at else None,
-#             "ai_generated": bool(feed.ai_generated_content)
-#         })
-    
-#     has_more = (page * limit) < total
-    
-#     return {
-#         "items": items,
-#         "page": page,
-#         "limit": limit,
-#         "total": total,
-#         "has_more": has_more,
-#         "followed_topics_count": len(followed_topics),
-#         "followed_sources_count": len(followed_sources)
-#     }
-
-# # ------------------ Topic and Source Management ------------------
-
-# def auto_create_topics_from_feeds(db: Session):
-#     """Automatically create topics from feed categories."""
-#     # Get all unique categories from feeds
-#     all_feeds = db.query(Feed).filter(Feed.categories.isnot(None)).all()
-    
-#     unique_categories = set()
-#     for feed in all_feeds:
-#         if feed.categories:
-#             unique_categories.update(feed.categories)
-    
-#     created_count = 0
-#     for category_name in unique_categories:
-#         # Skip empty or very short category names
-#         if not category_name or len(category_name.strip()) < 2:
-#             continue
-            
-#         category_name = category_name.strip()
-        
-#         # Check if topic already exists
-#         existing_topic = db.query(Topic).filter(Topic.name == category_name).first()
-#         if not existing_topic:
-#             topic = Topic(
-#                 name=category_name,
-#                 description=f"Automatically created topic for {category_name}"
-#             )
-#             db.add(topic)
-#             created_count += 1
-    
-#     if created_count > 0:
-#         db.commit()
-#         logger.info(f"Auto-created {created_count} topics from feed categories")
-    
-#     return created_count
-
-# def auto_create_sources_from_feeds(db: Session):
-#     """Automatically create sources from blogs and YouTube feeds."""
-#     created_count = 0
-    
-#     # Create sources from blogs
-#     blogs = db.query(Blog).filter(Blog.website.isnot(None)).all()
-#     for blog in blogs:
-#         if blog.website:
-#             existing_source = db.query(Source).filter(
-#                 Source.website == blog.website,
-#                 Source.source_type == "blog"
-#             ).first()
-            
-#             if not existing_source:
-#                 source_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
-#                 source = Source(
-#                     name=source_name,
-#                     website=blog.website,
-#                     source_type="blog"
-#                 )
-#                 db.add(source)
-#                 created_count += 1
-    
-#     # Create sources from YouTube feeds
-#     youtube_feeds = db.query(Feed).filter(
-#         Feed.source_type == "youtube",
-#         Feed.transcript_id.isnot(None)
-#     ).all()
-    
-#     # You might want to extract channel names from YouTube data
-#     # For now, we'll create a generic YouTube source
-#     existing_youtube_source = db.query(Source).filter(
-#         Source.name == "YouTube",
-#         Source.source_type == "youtube"
-#     ).first()
-    
-#     if not existing_youtube_source and youtube_feeds:
-#         youtube_source = Source(
-#             name="YouTube",
-#             website="https://www.youtube.com",
-#             source_type="youtube"
-#         )
-#         db.add(youtube_source)
-#         created_count += 1
-    
-#     if created_count > 0:
-#         db.commit()
-#         logger.info(f"Auto-created {created_count} sources from feeds")
-    
-#     return created_count
-
-# def update_topic_feed_counts(db: Session):
-#     """Update feed counts for all topics."""
-#     topics = db.query(Topic).filter(Topic.is_active == True).all()
-    
-#     for topic in topics:
-#         feed_count = db.query(Feed).filter(
-#             Feed.categories.contains([topic.name]),
-#             Feed.status == "ready"
-#         ).count()
-        
-#         # We're storing this dynamically in the response, but you could add a field to Topic model
-#         # if you want to cache this value
-#         logger.debug(f"Topic '{topic.name}' has {feed_count} feeds")
-    
-#     return len(topics)
-
-
-# @router.post("/admin/initialize-topics", response_model=dict)
-# def initialize_topics_from_feeds(db: Session = Depends(get_db)):
-#     """Admin endpoint to initialize topics from existing feeds."""
-#     try:
-#         created_count = auto_create_topics_from_feeds(db)
-#         updated_count = update_topic_feed_counts(db)
-        
-#         return {
-#             "message": "Topics initialized successfully",
-#             "topics_created": created_count,
-#             "topics_updated": updated_count
-#         }
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Failed to initialize topics: {str(e)}")
-
-# @router.post("/admin/initialize-sources", response_model=dict)
-# def initialize_sources_from_feeds(db: Session = Depends(get_db)):
-#     """Admin endpoint to initialize sources from existing feeds."""
-#     try:
-#         created_count = auto_create_sources_from_feeds(db)
-        
-#         return {
-#             "message": "Sources initialized successfully",
-#             "sources_created": created_count
-#         }
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Failed to initialize sources: {str(e)}")
-
-# @router.get("/debug/feeds-with-categories", response_model=dict)
-# def debug_feeds_with_categories(db: Session = Depends(get_db)):
-#     """Debug endpoint to see what categories exist in feeds."""
-#     feeds_with_categories = db.query(Feed).filter(
-#         Feed.categories.isnot(None),
-#         Feed.status == "ready"
-#     ).all()
-    
-#     all_categories = set()
-#     feed_data = []
-    
-#     for feed in feeds_with_categories:
-#         if feed.categories:
-#             all_categories.update(feed.categories)
-#             feed_data.append({
-#                 "id": feed.id,
-#                 "title": feed.title,
-#                 "categories": feed.categories,
-#                 "source_type": feed.source_type
-#             })
-    
-#     return {
-#         "total_feeds_with_categories": len(feeds_with_categories),
-#         "unique_categories": list(all_categories),
-#         "feeds": feed_data
-#     }
