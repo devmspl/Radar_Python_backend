@@ -133,7 +133,7 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
                     return {
                         "channel_name": channel_title,
                         "channel_id": channel_id,
-                        "description": channel_info.get("description", ""),
+                        # "description": channel_info.get("description", ""),
                         "thumbnail": channel_info.get("thumbnails", {}).get("default", {}).get("url", ""),
                         "subscriber_count": stats.get("subscriberCount", "0"),
                         "video_count": stats.get("videoCount", "0"),
@@ -1151,6 +1151,9 @@ def get_all_feeds(
         
         feed_content_type = feed.content_type.value if feed.content_type else FilterType.BLOG.value
         
+        # Get metadata for each feed
+        meta = get_feed_metadata(feed, db)
+        
         items.append({
             "id": feed.id,
             "blog_id": feed.blog_id,
@@ -1168,6 +1171,7 @@ def get_all_feeds(
             "created_at": feed.created_at.isoformat() if feed.created_at else None,
             "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
             "ai_generated": feed.ai_generated_content is not None,
+            "meta": meta  # Added metadata here
         })
 
     has_more = (page * limit) < total
@@ -1183,6 +1187,7 @@ def get_all_feeds(
         "has_more": has_more
     }
 
+    
 @router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     """Get full AI-generated feed with slides and is_published status."""
