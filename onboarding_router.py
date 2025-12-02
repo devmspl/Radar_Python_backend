@@ -7,7 +7,7 @@ from database import get_db
 import models, schemas
 from dependencies import get_current_user
 from datetime import datetime
-from models import Role, SkillTool, UserOnboarding, UserRole, UserSkillTool
+from models import Role, SkillTool, UserOnboarding, UserRole, UserSkillTool, Category
 router = APIRouter(
     prefix="/onboarding",
     tags=["Onboarding"]
@@ -528,7 +528,7 @@ async def save_onboarding_step(
         2: "skills_tools", 
         3: "interested_roles",
         4: "social_links",
-        5: {"work_email", "personal_email"},
+        5: "emails",  # Special handling needed
         6: "looking_for_job",
         7: "career_stage",
         8: "years_experience",
@@ -548,78 +548,270 @@ async def save_onboarding_step(
             detail=f"Invalid step number: {step_number}"
         )
     
-    # Handle step 5 separately as it has multiple fields
+    # Handle different step types
     if step_number == 5:
+        # Handle email fields - step_data should be dict with work_email and personal_email
+        if not isinstance(step_data, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Step 5 data must be a dictionary with work_email and personal_email"
+            )
+        
         if "work_email" in step_data:
+            # Basic email validation
+            if "@" not in step_data["work_email"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid work email format"
+                )
             onboarding_data.work_email = step_data["work_email"]
+        
         if "personal_email" in step_data:
+            if "@" not in step_data["personal_email"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid personal email format"
+                )
             onboarding_data.personal_email = step_data["personal_email"]
+    
+    elif step_number in [1, 2, 3]:
+        # Get validation rules from QUESTIONNAIRE_DATA
+        question_data = None
+        for question in QUESTIONNAIRE_DATA["questions"]:
+            if question["step"] == step_number:
+                question_data = question
+                break
+        
+        # Handle ID arrays for steps 1-3
+        selected_ids = []
+        custom_inputs = []
+        
+        # Extract IDs/values from different possible formats
+        if isinstance(step_data, dict):
+            # Handle custom inputs separately
+            if "custom_inputs" in step_data:
+                custom_inputs = step_data["custom_inputs"]
+            
+            if "selected_options" in step_data:
+                items = step_data["selected_options"]
+            elif "value" in step_data:
+                items = [step_data["value"]]
+            else:
+                items = list(step_data.values()) if step_data else []
+        elif isinstance(step_data, list):
+            items = step_data
+        else:
+            items = [step_data]
+        
+        # Process each item
+        for item in items:
+            if isinstance(item, dict):
+                # Handle {"id": 1, "value": "ux_design", "label": "UX Design"} format
+                if "id" in item and item["id"] is not None:
+                    selected_ids.append(item["id"])
+                elif "value" in item and item["value"] is not None:
+                    selected_ids.append(item["value"])
+            elif isinstance(item, (int, str)):
+                selected_ids.append(item)
+        
+        # Add custom inputs
+        if custom_inputs and isinstance(custom_inputs, list):
+            selected_ids.extend(custom_inputs)
+        
+        # Validate min/max selections if defined in questionnaire
+        if question_data:
+            min_selections = question_data.get("minSelections")
+            max_selections = question_data.get("maxSelections")
+            
+            total_selections = len(selected_ids)
+            
+            if min_selections and total_selections < min_selections:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Minimum {min_selections} selection(s) required"
+                )
+            
+            if max_selections and total_selections > max_selections:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Maximum {max_selections} selection(s) allowed"
+                )
+        
+        # Convert numeric strings to integers and map string values to IDs
+        processed_ids = []
+        for item in selected_ids:
+            if isinstance(item, str) and item.isdigit():
+                processed_ids.append(int(item))
+            elif isinstance(item, str):
+                # Try to find in database
+                found_id = None
+                
+                if step_number == 1:  # Domains
+                    domain = db.query(Category).filter(
+                        (Category.name.ilike(f"%{item}%")) |
+                        (Category.name == item)
+                    ).first()
+                    if domain:
+                        found_id = domain.id
+                
+                elif step_number == 2:  # Skills
+                    skill = db.query(models.SkillTool).filter(
+                        (models.SkillTool.name.ilike(f"%{item}%")) |
+                        (models.SkillTool.name == item)
+                    ).first()
+                    if skill:
+                        found_id = skill.id
+                
+                elif step_number == 3:  # Roles
+                    role = db.query(models.Role).filter(
+                        (models.Role.title.ilike(f"%{item}%")) |
+                        (models.Role.title == item)
+                    ).first()
+                    if role:
+                        found_id = role.id
+                
+                # Store ID if found, otherwise store the string (custom input)
+                if found_id:
+                    processed_ids.append(found_id)
+                else:
+                    processed_ids.append(item)
+            else:
+                # Direct integer ID
+                processed_ids.append(item)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_processed_ids = []
+        for item in processed_ids:
+            if item not in seen:
+                seen.add(item)
+                unique_processed_ids.append(item)
+        
+        # Store the processed IDs
+        setattr(onboarding_data, field_name, unique_processed_ids)
+        
+        # 🔥 Also sync to UserRole and UserSkillTool tables for consistency
+        if step_number == 3:  # Roles
+            # Clear existing UserRole entries
+            db.query(models.UserRole).filter(
+                models.UserRole.user_id == current_user.id
+            ).delete()
+            
+            # Add to UserRole table (only for valid role IDs)
+            for item in unique_processed_ids:
+                if isinstance(item, int):
+                    role_exists = db.query(models.Role).filter(
+                        models.Role.id == item
+                    ).first()
+                    if role_exists:
+                        user_role = models.UserRole(
+                            user_id=current_user.id,
+                            role_id=item,
+                            seniority_level="mid_level",
+                            is_current=False,
+                            is_target=True
+                        )
+                        db.add(user_role)
+        
+        elif step_number == 2:  # Skills
+            # Clear existing UserSkillTool entries
+            db.query(models.UserSkillTool).filter(
+                models.UserSkillTool.user_id == current_user.id
+            ).delete()
+            
+            # Add to UserSkillTool table (only for valid skill IDs)
+            for item in unique_processed_ids:
+                if isinstance(item, int):
+                    skill_exists = db.query(models.SkillTool).filter(
+                        models.SkillTool.id == item
+                    ).first()
+                    if skill_exists:
+                        user_skill = models.UserSkillTool(
+                            user_id=current_user.id,
+                            skill_tool_id=item,
+                            proficiency_level="intermediate",
+                            years_of_experience=None
+                        )
+                        db.add(user_skill)
+    
+    elif step_number == 4:  # Social links
+        # Validate social links structure
+        if not isinstance(step_data, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Social links must be a dictionary"
+            )
+        
+        # Validate each URL if provided
+        valid_socials = {}
+        for platform, url in step_data.items():
+            if url and isinstance(url, str):
+                # Basic URL validation
+                if url.startswith(("http://", "https://")):
+                    valid_socials[platform] = url
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"{platform} URL must start with http:// or https://"
+                    )
+        
+        setattr(onboarding_data, field_name, valid_socials)
+    
+    elif step_number == 6:  # Looking for job (radio button)
+        if step_data not in ["yes", "no"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid value for 'looking for job'. Must be 'yes' or 'no'."
+            )
+        setattr(onboarding_data, field_name, step_data)
+    
+    elif step_number == 7:  # Career stage
+        valid_stages = ["exploration", "establishment", "mid_career", "late-career"]
+        if step_data not in valid_stages:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid career stage. Must be one of: {', '.join(valid_stages)}"
+            )
+        setattr(onboarding_data, field_name, step_data)
+    
+    elif step_number == 8:  # Years of experience
+        valid_experience = ["0_1", "1_2", "3_5", "5_10", "10_plus"]
+        if step_data not in valid_experience:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid years of experience. Must be one of: {', '.join(valid_experience)}"
+            )
+        setattr(onboarding_data, field_name, step_data)
+    
     elif isinstance(field_name, str):
-    # 🩹 Handle {"selected_options": [...]} or {"value": "..."} wrappers
-      if isinstance(step_data, dict):
-          if "selected_options" in step_data:
-            step_data = step_data["selected_options"]
-          elif "value" in step_data:
-            step_data = step_data["value"]
-          elif "selected_value" in step_data:  # just in case
-            step_data = step_data["selected_value"]
-      setattr(onboarding_data, field_name, step_data)
-
-
+        # Handle other steps normally
+        if isinstance(step_data, dict):
+            if "selected_options" in step_data:
+                step_data = step_data["selected_options"]
+            elif "value" in step_data:
+                step_data = step_data["value"]
+            elif "selected_value" in step_data:
+                step_data = step_data["selected_value"]
+        
+        setattr(onboarding_data, field_name, step_data)
     
     db.commit()
     db.refresh(onboarding_data)
     
-    return {"message": f"Step {step_number} data saved successfully"}
+    return {
+        "message": f"Step {step_number} data saved successfully",
+        "step": step_number,
+        "field": field_name,
+        "user_id": current_user.id
+    }
 
-@router.post("/complete")
-async def complete_onboarding(
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Mark onboarding as completed"""
-    onboarding_data = db.query(models.UserOnboarding).filter(
-        models.UserOnboarding.user_id == current_user.id
-    ).first()
-    
-    if not onboarding_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Onboarding data not found"
-        )
-    
-    # Check if all required fields are filled (simplified validation)
-    required_fields = [
-        onboarding_data.domains_of_interest,
-        onboarding_data.skills_tools,
-        onboarding_data.interested_roles,
-        onboarding_data.work_email,
-        onboarding_data.looking_for_job,
-        onboarding_data.career_stage,
-        onboarding_data.years_experience,
-        onboarding_data.goals,
-        onboarding_data.market_geography
-    ]
-    
-    if not all(required_fields):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Please complete all required fields before finishing onboarding"
-        )
-    
-    onboarding_data.is_completed = True
-    onboarding_data.completed_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {"message": "Onboarding completed successfully"}
 
-@router.get("/data", response_model=schemas.OnboardingResponse)
+@router.get("/data")
 async def get_onboarding_data(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get user's complete onboarding data"""
+    """Get user's complete onboarding data with names instead of IDs"""
     onboarding_data = db.query(models.UserOnboarding).filter(
         models.UserOnboarding.user_id == current_user.id
     ).first()
@@ -630,7 +822,194 @@ async def get_onboarding_data(
             detail="Onboarding data not found"
         )
     
-    return onboarding_data
+    # Convert to dict
+    result = onboarding_data.__dict__.copy()
+    
+    # Handle domains_of_interest (step 1) - Replace IDs with names
+    domains_data = onboarding_data.domains_of_interest
+    if domains_data:
+        domain_names = []
+        
+        # Handle different data formats
+        if isinstance(domains_data, str):
+            try:
+                # Clean and parse JSON string
+                if domains_data.startswith('"[') and domains_data.endswith(']"'):
+                    domains_data = domains_data[1:-1]
+                domains_data = json.loads(domains_data)
+            except:
+                domains_data = []
+        
+        if isinstance(domains_data, list):
+            for item in domains_data:
+                if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                    # Numeric ID - get name from Category
+                    domain = db.query(Category).filter(
+                        Category.id == int(item)
+                    ).first()
+                    if domain:
+                        domain_names.append(domain.name)
+                elif isinstance(item, str):
+                    # String value - could be name or custom input
+                    domain_names.append(item)
+        
+        # Replace IDs with names
+        result["domains_of_interest"] = domain_names
+    
+    # Handle skills_tools (step 2) - Replace IDs with names
+    skills_data = onboarding_data.skills_tools
+    if skills_data:
+        skill_names = []
+        
+        # Handle string format
+        if isinstance(skills_data, str):
+            try:
+                if skills_data.startswith('"[') and skills_data.endswith(']"'):
+                    skills_data = skills_data[1:-1]
+                skills_data = json.loads(skills_data)
+            except:
+                skills_data = []
+        
+        if isinstance(skills_data, list):
+            for item in skills_data:
+                if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                    # Numeric ID - get name from SkillTool
+                    skill = db.query(models.SkillTool).filter(
+                        models.SkillTool.id == int(item)
+                    ).first()
+                    if skill:
+                        skill_names.append(skill.name)
+                    else:
+                        skill_names.append(f"Unknown ID: {item}")
+                elif isinstance(item, str):
+                    # String value - could be name or custom input
+                    skill_names.append(item)
+        
+        # Replace IDs with names
+        result["skills_tools"] = skill_names
+    
+    # Handle interested_roles (step 3) - Replace IDs with names
+    roles_data = onboarding_data.interested_roles
+    if roles_data:
+        role_names = []
+        
+        if isinstance(roles_data, list):
+            for item in roles_data:
+                if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                    # Numeric ID - get title from Role
+                    role = db.query(models.Role).filter(
+                        models.Role.id == int(item)
+                    ).first()
+                    if role:
+                        role_names.append(role.title)
+                    else:
+                        role_names.append(f"Unknown ID: {item}")
+                elif isinstance(item, str):
+                    # String value - could be title or custom input
+                    role_names.append(item)
+        
+        # Replace IDs with names
+        result["interested_roles"] = role_names
+    
+    # Remove the detail fields from the response
+    result.pop("domains_details", None)
+    result.pop("skills_tools_details", None)
+    result.pop("roles_details", None)
+    
+    # Clean up SQLAlchemy internal fields
+    result.pop("_sa_instance_state", None)
+    
+    return result
+
+
+@router.get("/user/{user_id}/domains")
+def get_user_domains(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get all domains of interest for a specific user"""
+    try:
+        # Check permissions (user can view their own data, admin can view any)
+        if current_user.id != user_id and current_user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to view this user's data"
+            )
+        
+        onboarding = db.query(models.UserOnboarding).filter(
+            models.UserOnboarding.user_id == user_id
+        ).first()
+        
+        if not onboarding or not onboarding.domains_of_interest:
+            return {
+                "user_id": user_id,
+                "domains": [],
+                "count": 0
+            }
+        
+        # Parse domains data
+        domains_data = onboarding.domains_of_interest
+        if isinstance(domains_data, str):
+            try:
+                if domains_data.startswith('"['):
+                    domains_data = domains_data[1:-1]
+                domains_data = json.loads(domains_data)
+            except:
+                domains_data = []
+        
+        domains = []
+        if isinstance(domains_data, list):
+            for item in domains_data:
+                if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                    domain = db.query(Category).filter(
+                        Category.id == int(item)
+                    ).first()
+                    if domain:
+                        domains.append({
+                            "id": domain.id,
+                            "uuid": domain.uuid,
+                            "name": domain.name,
+                            "description": domain.description,
+                            "is_active": domain.is_active,
+                            "type": "database"
+                        })
+                elif isinstance(item, str):
+                    # Try to find by name
+                    domain = db.query(Category).filter(
+                        Category.name.ilike(f"%{item}%")
+                    ).first()
+                    if domain:
+                        domains.append({
+                            "id": domain.id,
+                            "uuid": domain.uuid,
+                            "name": domain.name,
+                            "description": domain.description,
+                            "is_active": domain.is_active,
+                            "type": "database"
+                        })
+                    else:
+                        domains.append({
+                            "id": None,
+                            "name": item,
+                            "type": "custom"
+                        })
+        
+        return {
+            "user_id": user_id,
+            "domains": domains,
+            "count": len(domains)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user domains: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch user domains"
+        )
+
 
 @router.put("/data")
 async def update_onboarding_data(
@@ -947,26 +1326,66 @@ def add_user_skills_tools(
 
 @router.get("/user/{user_id}/roles")
 def get_user_roles(user_id: int, db: Session = Depends(get_db)):
-    """Get all roles for a user."""
+    """Get all roles for a user from onboarding data."""
     try:
-        user_roles = db.query(UserRole).options(
-            joinedload(UserRole.role)
-        ).filter(UserRole.user_id == user_id).all()
+        onboarding = db.query(models.UserOnboarding).filter(
+            models.UserOnboarding.user_id == user_id
+        ).first()
+        
+        if not onboarding or not onboarding.interested_roles:
+            return {
+                "user_id": user_id,
+                "roles": []
+            }
+        
+        # Parse roles data
+        roles_data = onboarding.interested_roles
+        
+        # Handle string format if any
+        if isinstance(roles_data, str):
+            try:
+                if roles_data.startswith('"['):
+                    roles_data = roles_data[1:-1]
+                roles_data = json.loads(roles_data)
+            except:
+                roles_data = []
+        
+        roles = []
+        if isinstance(roles_data, list):
+            for item in roles_data:
+                if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                    role = db.query(models.Role).filter(
+                        models.Role.id == int(item)
+                    ).first()
+                    if role:
+                        roles.append({
+                            "id": role.id,
+                            "role_id": role.id,
+                            "title": role.title,
+                            "category": role.category,
+                            "seniority_level": "not_specified",  # Default
+                            "is_current": False,
+                            "is_target": True  # Assuming interested roles are target roles
+                        })
+                elif isinstance(item, str):
+                    # String value - try to find in database
+                    role = db.query(models.Role).filter(
+                        models.Role.title.ilike(f"%{item}%")
+                    ).first()
+                    if role:
+                        roles.append({
+                            "id": role.id,
+                            "role_id": role.id,
+                            "title": role.title,
+                            "category": role.category,
+                            "seniority_level": "not_specified",
+                            "is_current": False,
+                            "is_target": True
+                        })
         
         return {
             "user_id": user_id,
-            "roles": [
-                {
-                    "id": ur.id,
-                    "role_id": ur.role_id,
-                    "title": ur.role.title,
-                    "category": ur.role.category,
-                    "seniority_level": ur.seniority_level,
-                    "is_current": ur.is_current,
-                    "is_target": ur.is_target
-                }
-                for ur in user_roles
-            ]
+            "roles": roles
         }
         
     except Exception as e:
@@ -978,25 +1397,55 @@ def get_user_roles(user_id: int, db: Session = Depends(get_db)):
 
 @router.get("/user/{user_id}/skills-tools")
 def get_user_skills_tools(user_id: int, db: Session = Depends(get_db)):
-    """Get all skills and tools for a user."""
+    """Get all skills and tools for a user from onboarding data."""
     try:
-        user_skills = db.query(UserSkillTool).options(
-            joinedload(UserSkillTool.skill_tool)
-        ).filter(UserSkillTool.user_id == user_id).all()
+        onboarding = db.query(models.UserOnboarding).filter(
+            models.UserOnboarding.user_id == user_id
+        ).first()
+        
+        if not onboarding or not onboarding.skills_tools:
+            return {
+                "user_id": user_id,
+                "skills_tools": []
+            }
+        
+        # Parse skills data
+        skills_data = onboarding.skills_tools
+        if isinstance(skills_data, str):
+            try:
+                if skills_data.startswith('"['):
+                    skills_data = skills_data[1:-1]
+                skills_data = json.loads(skills_data)
+            except:
+                skills_data = []
+        
+        skill_ids = []
+        for item in skills_data if isinstance(skills_data, list) else []:
+            if isinstance(item, int):
+                skill_ids.append(item)
+            elif isinstance(item, str) and item.isdigit():
+                skill_ids.append(int(item))
+        
+        # Fetch skills from database
+        skills = []
+        if skill_ids:
+            skill_objects = db.query(models.SkillTool).filter(
+                models.SkillTool.id.in_(skill_ids)
+            ).all()
+            
+            for skill in skill_objects:
+                skills.append({
+                    "id": skill.id,
+                    "name": skill.name,
+                    "category": skill.category,
+                    "skill_tool_id": skill.id,
+                    "proficiency_level": "intermediate",  # Default or from another table
+                    "years_of_experience": None
+                })
         
         return {
             "user_id": user_id,
-            "skills_tools": [
-                {
-                    "id": ust.id,
-                    "skill_tool_id": ust.skill_tool_id,
-                    "name": ust.skill_tool.name,
-                    "category": ust.skill_tool.category,
-                    "proficiency_level": ust.proficiency_level,
-                    "years_of_experience": ust.years_of_experience
-                }
-                for ust in user_skills
-            ]
+            "skills_tools": skills
         }
         
     except Exception as e:
