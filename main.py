@@ -219,6 +219,35 @@ async def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+    
+    # If you want to convert IDs to names, you need to query the related tables
+    if db_user.onboarding_data:
+        # Convert domains_of_interest IDs to category names
+        if db_user.onboarding_data.domains_of_interest:
+            categories = db.query(models.Category).filter(
+                models.Category.id.in_(db_user.onboarding_data.domains_of_interest)
+            ).all()
+            domain_names = [cat.name for cat in categories]
+            db_user.onboarding_data.domains_of_interest = domain_names
+        
+        # Convert skills_tools IDs to skill/tool names
+        if db_user.onboarding_data.skills_tools:
+            # Assuming you have a SkillTool model
+            skills = db.query(models.SkillTool).filter(
+                models.SkillTool.id.in_(db_user.onboarding_data.skills_tools)
+            ).all()
+            skill_names = [skill.name for skill in skills]
+            db_user.onboarding_data.skills_tools = skill_names
+        
+        # Convert interested_roles IDs to role names
+        if db_user.onboarding_data.interested_roles:
+            # Assuming you have a Role model
+            roles = db.query(models.Role).filter(
+                models.Role.id.in_(db_user.onboarding_data.interested_roles)
+            ).all()
+            role_names = [role.title for role in roles]
+            db_user.onboarding_data.interested_roles = role_names
+    
     return db_user
 
 

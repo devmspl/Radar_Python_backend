@@ -447,8 +447,8 @@ class BatchScrapeResponse(BaseModel):
 
 class OnboardingBase(BaseModel):
     domains_of_interest: Optional[List[Union[int, str]]] = None
-    skills_tools: Optional[List[str]] = None
-    interested_roles: Optional[List[str]] = None
+    skills_tools: Optional[List[Union[int,str]]] = None
+    interested_roles: Optional[List[Union[int,str]]] = None
     social_links: Optional[Dict[str, str]] = None
     work_email: Optional[EmailStr] = None
     personal_email: Optional[EmailStr] = None
