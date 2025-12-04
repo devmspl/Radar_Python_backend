@@ -456,10 +456,10 @@ class OnboardingBase(BaseModel):
     career_stage: Optional[str] = None
     years_experience: Optional[str] = None
     goals: Optional[List[Union[str,int]]] = None
-    market_geography: Optional[List[str]] = None
-    qualifications: Optional[List[str]] = None
+    market_geography: Optional[List[Union[str,int]]] = None
+    qualifications: Optional[List[Union[str,int]]] = None
     education: Optional[Dict[str, str]] = None
-    companies: Optional[List[str]] = None
+    companies: Optional[List[Union[str,int]]] = None
     certifications: Optional[Dict[str, List[str]]] = None
 
     @field_validator("certifications", mode="before")
