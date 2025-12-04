@@ -455,7 +455,7 @@ class OnboardingBase(BaseModel):
     looking_for_job: Optional[str] = None
     career_stage: Optional[str] = None
     years_experience: Optional[str] = None
-    goals: Optional[List[str]] = None
+    goals: Optional[List[Union[str,int]]] = None
     market_geography: Optional[List[str]] = None
     qualifications: Optional[List[str]] = None
     education: Optional[Dict[str, str]] = None
