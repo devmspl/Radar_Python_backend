@@ -1,515 +1,362 @@
-#!/usr/bin/env python3
 """
-Script to add AI-generated tags to existing feeds.
-This will automatically analyze feed content and generate appropriate tags for filtering.
+SQLite-specific script to update database models with category-subcategory relationships.
 """
 
 import os
 import sys
-import json
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Any
-import openai
-from sqlalchemy.orm import Session
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-import time
-import logging
 
-# Add parent directory to path to import models
+# Add the parent directory to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models import Feed, Blog, Transcript, Slide, FilterType
-from config import settings
-from database import SessionLocal,engine
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('tag_migration.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+from sqlalchemy import create_engine, text, inspect, Column, String, ForeignKey
+from sqlalchemy.orm import sessionmaker
+import uuid
 
-# Load OpenAI API key from .env
-from dotenv import load_dotenv
-load_dotenv()
+# Database configuration - update with your actual SQLite database URL
+DATABASE_URL = "sqlite:///./test.db"  # Update this to match your actual SQLite file
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("❌ OPENAI_API_KEY not found in .env file")
-    sys.exit(1)
+# Initialize database connection
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-openai.api_key = OPENAI_API_KEY
+def check_table_exists(table_name):
+    """Check if a table exists in SQLite database."""
+    inspector = inspect(engine)
+    return table_name in inspector.get_table_names()
 
-# Database setup
-Database_URL = settings.DATABASE_URL
-class FeedTagGenerator:
-    """Generate tags for feeds using OpenAI API."""
-    
-    def __init__(self):
-        self.api_key = OPENAI_API_KEY
-        self.model = "gpt-3.5-turbo"  # You can use "gpt-4" for better results
-        self.default_content_type = FilterType.BLOG
-        
-        # Template tags for fallback
-        self.default_tags = {
-            "WEBINAR": {
-                "skills": ["Presentation", "Communication", "Public Speaking", "Teaching", "Knowledge Sharing"],
-                "tools": ["Zoom", "Google Meet", "Microsoft Teams", "Slides", "Presentation Software"],
-                "roles": ["Speaker", "Presenter", "Educator", "Trainer", "Workshop Facilitator"]
-            },
-            "BLOG": {
-                "skills": ["Writing", "Research", "Content Creation", "SEO", "Editing"],
-                "tools": ["WordPress", "Medium", "Google Docs", "Notion", "Markdown Editors"],
-                "roles": ["Writer", "Blogger", "Content Creator", "Editor", "Journalist"]
-            },
-            "PODCAST": {
-                "skills": ["Audio Editing", "Interviewing", "Storytelling", "Voice Modulation", "Script Writing"],
-                "tools": ["Audacity", "GarageBand", "Podcast Hosting", "Microphones", "Audio Interfaces"],
-                "roles": ["Podcaster", "Host", "Producer", "Audio Engineer", "Interviewer"]
-            },
-            "VIDEO": {
-                "skills": ["Video Editing", "Script Writing", "Camerawork", "Lighting", "Directing"],
-                "tools": ["Premiere Pro", "Final Cut Pro", "YouTube Studio", "Cameras", "Editing Software"],
-                "roles": ["Video Creator", "Editor", "Director", "Content Creator", "YouTuber"]
-            }
-        }
-    
-    def analyze_feed_content(self, feed: Feed, db: Session) -> Dict[str, Any]:
-        """Extract content from feed for AI analysis."""
-        content_parts = []
-        
-        # Add feed title
-        if feed.title:
-            content_parts.append(f"Title: {feed.title}")
-        
-        # Add categories
-        if feed.categories:
-            content_parts.append(f"Categories: {', '.join(feed.categories[:5])}")
-        
-        # Get content from slides
-        if feed.slides:
-            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
-            slide_contents = []
-            for slide in sorted_slides[:5]:  # First 5 slides
-                slide_text = f"{slide.title}: {slide.body[:200]}"
-                slide_contents.append(slide_text)
-            content_parts.append(f"Slides Content: {' '.join(slide_contents)}")
-        
-        # Get content from source
-        if feed.source_type == "blog" and feed.blog:
-            blog = feed.blog
-            if blog.content:
-                content_parts.append(f"Blog Content: {blog.content[:500]}")
-            if blog.title:
-                content_parts.append(f"Blog Title: {blog.title}")
-            if blog.description:
-                content_parts.append(f"Blog Description: {blog.description[:300]}")
-        
-        elif feed.source_type == "youtube" and feed.transcript_id:
-            transcript = db.query(Transcript).filter(
-                Transcript.transcript_id == feed.transcript_id
-            ).first()
-            if transcript and transcript.transcript_text:
-                content_parts.append(f"Transcript: {transcript.transcript_text[:500]}")
-            if transcript and transcript.title:
-                content_parts.append(f"Video Title: {transcript.title}")
-        
-        # Combine all content
-        combined_content = "\n".join(content_parts)
-        return {"content": combined_content, "title": feed.title or "Untitled Feed"}
-    
-    def generate_tags_with_ai(self, feed_content: Dict[str, Any]) -> Dict[str, Any]:
-        """Use OpenAI to generate tags for the feed content."""
-        content_preview = feed_content["content"][:1500]  # Limit content for token efficiency
-        title = feed_content["title"]
-        
-        prompt = f"""
-        Analyze this educational/professional content and suggest appropriate tags:
-        
-        Title: {title}
-        
-        Content Preview:
-        {content_preview}
-        
-        Based on this content, please provide:
-        1. Primary content type (choose ONE): ["Webinar", "Blog", "Podcast", "Video"]
-        2. Relevant skills (3-5 specific skills mentioned or required)
-        3. Relevant tools/software (3-5 tools mentioned or used)
-        4. Relevant job roles (3-5 roles that would benefit from this content)
-        
-        Return ONLY a JSON object in this exact format:
-        {{
-            "content_type": "string (Webinar, Blog, Podcast, or Video)",
-            "skills": ["skill1", "skill2", "skill3"],
-            "tools": ["tool1", "tool2", "tool3"],
-            "roles": ["role1", "role2", "role3"]
-        }}
-        
-        Make the tags professional, specific, and relevant to the content.
-        """
-        
-        try:
-            response = openai.ChatCompletion.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a professional content analyst specializing in educational and professional development materials."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            
-            # Extract JSON from response
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
-            if json_start != -1 and json_end != 0:
-                json_str = response_text[json_start:json_end]
-                tags = json.loads(json_str)
-            else:
-                tags = json.loads(response_text)
-            
-            # Validate and clean tags
-            tags = self._validate_and_clean_tags(tags)
-            
-            logger.info(f"✅ Generated tags: {tags['content_type']} with {len(tags['skills'])} skills")
-            return tags
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse AI response: {e}. Using fallback tags.")
-            return self._get_fallback_tags(title, content_preview)
-        except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            return self._get_fallback_tags(title, content_preview)
-    
-    def _validate_and_clean_tags(self, tags: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and clean AI-generated tags."""
-        # Validate content type
-        valid_content_types = ["Webinar", "Blog", "Podcast", "Video"]
-        if tags.get("content_type") not in valid_content_types:
-            tags["content_type"] = "Blog"
-        
-        # Clean lists
-        for key in ["skills", "tools", "roles"]:
-            if key in tags:
-                items = tags[key]
-                if isinstance(items, list):
-                    # Remove empty strings, capitalize, deduplicate
-                    cleaned = []
-                    for item in items:
-                        if isinstance(item, str) and item.strip():
-                            # Capitalize each word
-                            cleaned_item = ' '.join(word.capitalize() for word in item.strip().split())
-                            cleaned.append(cleaned_item)
-                    # Remove duplicates and limit to 5
-                    tags[key] = list(dict.fromkeys(cleaned))[:5]
-                else:
-                    tags[key] = []
-            else:
-                tags[key] = []
-        
-        return tags
-    
-    def _get_fallback_tags(self, title: str, content_preview: str) -> Dict[str, Any]:
-        """Get fallback tags based on content analysis."""
-        content_lower = (title + " " + content_preview).lower()
-        
-        # Determine content type based on keywords
-        if any(word in content_lower for word in ["webinar", "workshop", "seminar", "training", "lecture"]):
-            content_type = "Webinar"
-        elif any(word in content_lower for word in ["podcast", "audio", "episode", "interview", "show"]):
-            content_type = "Podcast"
-        elif any(word in content_lower for word in ["video", "youtube", "tutorial", "screen cast", "recording"]):
-            content_type = "Video"
-        else:
-            content_type = "Blog"
-        
-        # Get appropriate default tags
-        tags_key = content_type.upper()
-        if tags_key in self.default_tags:
-            return {
-                "content_type": content_type,
-                "skills": self.default_tags[tags_key]["skills"],
-                "tools": self.default_tags[tags_key]["tools"],
-                "roles": self.default_tags[tags_key]["roles"]
-            }
-        else:
-            return {
-                "content_type": content_type,
-                "skills": ["Learning", "Research", "Professional Development"],
-                "tools": ["Web Browser", "Note-taking App", "PDF Reader"],
-                "roles": ["Learner", "Professional", "Student"]
-            }
-    
-    def map_content_type_to_enum(self, content_type_str: str) -> FilterType:
-        """Map string content type to FilterType enum."""
-        content_type_str = content_type_str.lower()
-        if content_type_str == "webinar":
-            return FilterType.WEBINAR
-        elif content_type_str == "blog":
-            return FilterType.BLOG
-        elif content_type_str == "podcast":
-            return FilterType.PODCAST
-        elif content_type_str == "video":
-            return FilterType.VIDEO
-        else:
-            return FilterType.BLOG
-    
-    def update_feed_with_tags(self, feed: Feed, tags: Dict[str, Any], db: Session) -> bool:
-        """Update feed with generated tags."""
-        try:
-            # Map content type to enum
-            content_type_enum = self.map_content_type_to_enum(tags["content_type"])
-            feed.content_type = content_type_enum
-            
-            # Update skills, tools, roles (only if they don't exist or are minimal)
-            if not feed.skills or len(feed.skills) < 3:
-                feed.skills = tags["skills"]
-            else:
-                # Merge existing with new tags
-                existing = set(feed.skills)
-                new = set(tags["skills"])
-                feed.skills = list(existing.union(new))
-            
-            if not feed.tools or len(feed.tools) < 3:
-                feed.tools = tags["tools"]
-            else:
-                existing = set(feed.tools)
-                new = set(tags["tools"])
-                feed.tools = list(existing.union(new))
-            
-            if not feed.roles or len(feed.roles) < 3:
-                feed.roles = tags["roles"]
-            else:
-                existing = set(feed.roles)
-                new = set(tags["roles"])
-                feed.roles = list(existing.union(new))
-            
-            feed.updated_at = datetime.utcnow()
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating feed {feed.id}: {e}")
-            return False
+def get_column_info(table_name):
+    """Get information about columns in a SQLite table."""
+    inspector = inspect(engine)
+    columns = inspector.get_columns(table_name)
+    return [col['name'] for col in columns]
 
-def get_feeds_needing_tags(db: Session, limit: int = None, specific_ids: List[int] = None) -> List[Feed]:
-    """Get feeds that need tag generation."""
-    query = db.query(Feed).options(
-        # joinedload(Feed.slides),
-        # joinedload(Feed.blog)
-    )
-    
-    if specific_ids:
-        query = query.filter(Feed.id.in_(specific_ids))
-    else:
-        # Get feeds with minimal or no tags
-        # You can adjust this condition based on your needs
-        query = query.filter(
-            (Feed.skills == None) | 
-            (Feed.tools == None) | 
-            (Feed.roles == None) |
-            (Feed.content_type == FilterType.BLOG)  # Default value
-        )
-    
-    if limit:
-        query = query.limit(limit)
-    
-    return query.all()
+def generate_uuid():
+    """Generate a UUID string."""
+    return str(uuid.uuid4())
 
-def main():
-    """Main function to run the tag migration."""
-    print("=" * 60)
-    print("FEED TAG MIGRATION SCRIPT")
-    print("=" * 60)
-    
-    # Configuration
-    BATCH_SIZE = 10  # Process feeds in batches to avoid rate limits
-    DELAY_BETWEEN_BATCHES = 2  # Seconds to wait between batches
-    LIMIT = None  # Set to None for all feeds, or specify a number
-    SPECIFIC_FEED_IDS = None  # Set to [1, 2, 3] to process specific feeds only
-    
+def update_database_sqlite():
+    """Update SQLite database with new category-subcategory relationships."""
     db = SessionLocal()
-    tag_generator = FeedTagGenerator()
     
     try:
-        # Get feeds that need tagging
-        feeds = get_feeds_needing_tags(db, limit=LIMIT, specific_ids=SPECIFIC_FEED_IDS)
+        print("Starting SQLite database update...")
         
-        if not feeds:
-            print("✅ No feeds need tagging. All feeds already have tags!")
-            return
+        # 1. Check if tables exist
+        required_tables = ['subcategories', 'categories', 'feeds']
+        for table in required_tables:
+            if not check_table_exists(table):
+                print(f"❌ '{table}' table does not exist.")
+                return
         
-        print(f"📊 Found {len(feeds)} feeds that need tagging")
-        print("=" * 60)
+        print("✅ All required tables exist")
         
-        # Process in batches
-        total_updated = 0
-        total_failed = 0
+        # 2. Get current columns in feeds table
+        feed_columns = get_column_info('feeds')
+        print(f"\nCurrent columns in 'feeds' table: {feed_columns}")
         
-        for i in range(0, len(feeds), BATCH_SIZE):
-            batch = feeds[i:i + BATCH_SIZE]
-            batch_num = (i // BATCH_SIZE) + 1
-            total_batches = (len(feeds) + BATCH_SIZE - 1) // BATCH_SIZE
+        # 3. Add category_id column if it doesn't exist (SQLite specific syntax)
+        if 'category_id' not in feed_columns:
+            print("\nAdding 'category_id' column to feeds table...")
+            # SQLite doesn't support adding columns with constraints in ALTER TABLE
+            # We need to recreate the table or use a workaround
             
-            print(f"\n🔄 Processing Batch {batch_num}/{total_batches} ({len(batch)} feeds)")
-            print("-" * 40)
+            # First check what type categories.id uses
+            category_columns = db.execute(text("PRAGMA table_info(categories);")).fetchall()
+            category_id_type = "TEXT"  # default
+            for col in category_columns:
+                if col[1] == 'id':
+                    category_id_type = col[2]
+                    break
             
-            batch_updated = 0
-            batch_failed = 0
-            
-            for feed in batch:
+            try:
+                # Try simple ALTER TABLE first (works in newer SQLite)
+                db.execute(text(f"""
+                    ALTER TABLE feeds 
+                    ADD COLUMN category_id {category_id_type};
+                """))
+                print("✅ Added 'category_id' column")
+            except Exception as e:
+                print(f"⚠️ Simple ALTER failed: {e}")
+                print("Using workaround for older SQLite...")
+                # Workaround for older SQLite that doesn't support ALTER TABLE ADD COLUMN
+                # This is complex - you might need to manually add the column via SQLite browser
+                print("Please add 'category_id' column manually to 'feeds' table")
+                print(f"Column type should be: {category_id_type}")
+                return
+        else:
+            print("✅ 'category_id' column already exists")
+        
+        # 4. Add subcategory_id column if it doesn't exist
+        if 'subcategory_id' not in feed_columns:
+            print("\nAdding 'subcategory_id' column to feeds table...")
+            try:
+                db.execute(text(f"""
+                    ALTER TABLE feeds 
+                    ADD COLUMN subcategory_id TEXT;
+                """))
+                print("✅ Added 'subcategory_id' column")
+            except Exception as e:
+                print(f"⚠️ Could not add subcategory_id: {e}")
+        else:
+            print("✅ 'subcategory_id' column already exists")
+        
+        # 5. Check if categories table has uuid column
+        category_columns = get_column_info('categories')
+        if 'uuid' not in category_columns:
+            print("\nAdding 'uuid' column to categories table...")
+            try:
+                db.execute(text("""
+                    ALTER TABLE categories 
+                    ADD COLUMN uuid TEXT;
+                """))
+                print("✅ Added 'uuid' column to categories table")
+                
+                # Generate UUIDs for existing records
+                categories = db.execute(text("SELECT id FROM categories WHERE uuid IS NULL")).fetchall()
+                for cat in categories:
+                    new_uuid = generate_uuid()
+                    db.execute(text("UPDATE categories SET uuid = :uuid WHERE id = :id"), 
+                              {"uuid": new_uuid, "id": cat[0]})
+                print(f"✅ Generated UUIDs for {len(categories)} categories")
+            except Exception as e:
+                print(f"⚠️ Could not add uuid to categories: {e}")
+        else:
+            print("✅ 'uuid' column already exists in categories table")
+        
+        # 6. Check if subcategories table exists and has uuid column
+        if check_table_exists('subcategories'):
+            subcategory_columns = get_column_info('subcategories')
+            if 'uuid' not in subcategory_columns:
+                print("\nAdding 'uuid' column to subcategories table...")
                 try:
-                    print(f"\n📝 Feed #{feed.id}: {feed.title[:50]}...")
+                    db.execute(text("""
+                        ALTER TABLE subcategories 
+                        ADD COLUMN uuid TEXT;
+                    """))
+                    print("✅ Added 'uuid' column to subcategories table")
                     
-                    # Skip if feed has comprehensive tags already
-                    current_tags = {
-                        "skills": len(feed.skills or []),
-                        "tools": len(feed.tools or []),
-                        "roles": len(feed.roles or [])
-                    }
-                    
-                    if all(count >= 3 for count in current_tags.values()) and feed.content_type != FilterType.BLOG:
-                        print(f"   ⏭️ Already has tags: {current_tags}")
-                        continue
-                    
-                    # Analyze feed content
-                    feed_content = tag_generator.analyze_feed_content(feed, db)
-                    
-                    # Generate tags with AI
-                    print(f"   🤖 Generating tags with AI...")
-                    tags = tag_generator.generate_tags_with_ai(feed_content)
-                    
-                    # Update feed
-                    print(f"   📝 Applying tags...")
-                    success = tag_generator.update_feed_with_tags(feed, tags, db)
-                    
-                    if success:
-                        db.commit()
-                        batch_updated += 1
-                        print(f"   ✅ Updated: {tags['content_type']}")
-                        print(f"      Skills: {', '.join(tags['skills'][:3])}")
-                        print(f"      Tools: {', '.join(tags['tools'][:3])}")
-                        print(f"      Roles: {', '.join(tags['roles'][:3])}")
-                    else:
-                        batch_failed += 1
-                        print(f"   ❌ Failed to update")
-                        
+                    # Generate UUIDs for existing records
+                    subcategories = db.execute(text("SELECT id FROM subcategories WHERE uuid IS NULL")).fetchall()
+                    for subcat in subcategories:
+                        new_uuid = generate_uuid()
+                        db.execute(text("UPDATE subcategories SET uuid = :uuid WHERE id = :id"), 
+                                  {"uuid": new_uuid, "id": subcat[0]})
+                    print(f"✅ Generated UUIDs for {len(subcategories)} subcategories")
                 except Exception as e:
-                    batch_failed += 1
-                    print(f"   ❌ Error processing feed {feed.id}: {str(e)[:100]}")
-                    db.rollback()
-                    continue
-            
-            total_updated += batch_updated
-            total_failed += batch_failed
-            
-            print(f"\n📊 Batch {batch_num} Summary:")
-            print(f"   ✅ Updated: {batch_updated}")
-            print(f"   ❌ Failed: {batch_failed}")
-            
-            # Wait between batches to avoid rate limits
-            if i + BATCH_SIZE < len(feeds):
-                print(f"\n⏳ Waiting {DELAY_BETWEEN_BATCHES} seconds before next batch...")
-                time.sleep(DELAY_BETWEEN_BATCHES)
+                    print(f"⚠️ Could not add uuid to subcategories: {e}")
+            else:
+                print("✅ 'uuid' column already exists in subcategories table")
+        else:
+            print("⚠️ 'subcategories' table doesn't exist - skipping uuid column")
         
-        # Final statistics
-        print("\n" + "=" * 60)
-        print("📊 MIGRATION COMPLETE")
-        print("=" * 60)
-        print(f"Total feeds processed: {len(feeds)}")
-        print(f"✅ Successfully updated: {total_updated}")
-        print(f"❌ Failed: {total_failed}")
+        # 7. SQLite foreign key support needs to be enabled
+        print("\nEnabling SQLite foreign key support...")
+        db.execute(text("PRAGMA foreign_keys = ON;"))
+        print("✅ Foreign key support enabled")
         
-        # Show content type distribution
-        print("\n📈 Content Type Distribution:")
-        content_types = db.query(Feed.content_type, db.func.count(Feed.id)).group_by(Feed.content_type).all()
-        for content_type, count in content_types:
-            print(f"   {content_type.value if content_type else 'None'}: {count}")
+        # 8. Create indexes for better performance
+        print("\nCreating indexes for better performance...")
+        indexes_to_create = [
+            ("idx_feeds_category_id", "feeds", "category_id"),
+            ("idx_feeds_subcategory_id", "feeds", "subcategory_id"),
+        ]
         
-        # Show sample of updated feeds
-        print("\n🎯 Sample of Updated Feeds:")
-        sample_feeds = db.query(Feed).filter(
-            Feed.skills != None,
-            Feed.tools != None
-        ).order_by(Feed.updated_at.desc()).limit(5).all()
+        if check_table_exists('subcategories'):
+            indexes_to_create.append(("idx_subcategories_category_id", "subcategories", "category_id"))
         
-        for i, feed in enumerate(sample_feeds, 1):
-            print(f"{i}. Feed #{feed.id}: {feed.title[:50]}...")
-            print(f"   Type: {feed.content_type.value if feed.content_type else 'None'}")
-            print(f"   Skills: {', '.join(feed.skills[:3] if feed.skills else [])}")
-            print(f"   Tools: {', '.join(feed.tools[:3] if feed.tools else [])}")
+        for index_name, table_name, column_name in indexes_to_create:
+            try:
+                # Check if index already exists
+                existing = db.execute(text(f"""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='index' AND name='{index_name}';
+                """)).fetchone()
+                
+                if not existing:
+                    db.execute(text(f"""
+                        CREATE INDEX {index_name} ON {table_name}({column_name});
+                    """))
+                    print(f"✅ Created index {index_name}")
+                else:
+                    print(f"✅ Index {index_name} already exists")
+            except Exception as e:
+                print(f"⚠️ Could not create index {index_name}: {e}")
+        
+        # 9. Commit all changes
+        db.commit()
+        
+        print("\n" + "="*50)
+        print("✅ SQLite database update completed successfully!")
+        print("="*50)
+        
+        # 10. Show summary
+        print("\nSummary of changes:")
+        print("1. Added category_id column to feeds table")
+        print("2. Added subcategory_id column to feeds table")
+        print("3. Added uuid columns to categories and subcategories tables")
+        print("4. Generated UUIDs for existing records")
+        print("5. Enabled foreign key support")
+        print("6. Created indexes for better performance")
+        
+        # 11. Note about foreign keys in SQLite
+        print("\n📝 Note for SQLite:")
+        print("SQLite has limited ALTER TABLE support. To add proper foreign key constraints,")
+        print("you may need to:")
+        print("1. Export data")
+        print("2. Recreate the table with constraints")
+        print("3. Import data back")
+        print("\nOr use SQLite browser tool to add foreign keys manually")
         
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        db.rollback()
+        print(f"❌ Error updating database: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         db.close()
-        print("\n🔚 Database connection closed.")
 
-def verify_tags():
-    """Verify that tags have been added correctly."""
-    print("\n" + "=" * 60)
-    print("🔍 VERIFYING TAGS")
-    print("=" * 60)
+def verify_changes_sqlite():
+    """Verify that the changes were applied successfully in SQLite."""
+    print("\n" + "="*50)
+    print("Verifying SQLite database changes...")
+    print("="*50)
     
     db = SessionLocal()
     
     try:
-        # Count feeds with tags
-        total_feeds = db.query(Feed).count()
-        feeds_with_skills = db.query(Feed).filter(Feed.skills != None, Feed.skills != []).count()
-        feeds_with_tools = db.query(Feed).filter(Feed.tools != None, Feed.tools != []).count()
-        feeds_with_roles = db.query(Feed).filter(Feed.roles != None, Feed.roles != []).count()
-        feeds_with_content_type = db.query(Feed).filter(Feed.content_type != None, Feed.content_type != FilterType.BLOG).count()
+        # Check feeds table columns
+        result = db.execute(text("PRAGMA table_info(feeds);")).fetchall()
+        print("\nColumns in 'feeds' table:")
+        new_columns_found = False
+        for col in result:
+            if col[1] in ['category_id', 'subcategory_id']:
+                print(f"  ✅ {col[1]}: {col[2]} (NEW)")
+                new_columns_found = True
+            else:
+                print(f"  - {col[1]}: {col[2]}")
         
-        print(f"Total feeds in database: {total_feeds}")
-        print(f"Feeds with skills tags: {feeds_with_skills} ({feeds_with_skills/total_feeds*100:.1f}%)")
-        print(f"Feeds with tools tags: {feeds_with_tools} ({feeds_with_tools/total_feeds*100:.1f}%)")
-        print(f"Feeds with roles tags: {feeds_with_roles} ({feeds_with_roles/total_feeds*100:.1f}%)")
-        print(f"Feeds with specific content type: {feeds_with_content_type} ({feeds_with_content_type/total_feeds*100:.1f}%)")
+        if not new_columns_found:
+            print("  No new columns found in feeds table")
         
-        # Show feeds still missing tags
-        feeds_missing_tags = db.query(Feed).filter(
-            (Feed.skills == None) | (Feed.skills == []) |
-            (Feed.tools == None) | (Feed.tools == []) |
-            (Feed.roles == None) | (Feed.roles == [])
-        ).count()
+        # Check indexes
+        print("\nIndexes on 'feeds' table:")
+        indexes = db.execute(text("""
+            SELECT name, sql FROM sqlite_master 
+            WHERE type='index' AND tbl_name='feeds'
+            AND name LIKE 'idx_feeds_%';
+        """)).fetchall()
         
-        print(f"\nFeeds still missing some tags: {feeds_missing_tags}")
+        if indexes:
+            for idx in indexes:
+                print(f"  ✅ {idx[0]}")
+        else:
+            print("  No new indexes found")
         
-        if feeds_missing_tags > 0:
-            print("\nSample of feeds missing tags:")
-            missing_feeds = db.query(Feed).filter(
-                (Feed.skills == None) | (Feed.skills == [])
-            ).limit(5).all()
+        # Count feeds
+        result = db.execute(text("""
+            SELECT 
+                COUNT(*) as total_feeds,
+                COUNT(CASE WHEN category_id IS NOT NULL THEN 1 END) as feeds_with_category,
+                COUNT(CASE WHEN subcategory_id IS NOT NULL THEN 1 END) as feeds_with_subcategory
+            FROM feeds;
+        """)).fetchone()
+        
+        if result:
+            print(f"\nFeed statistics:")
+            print(f"  Total feeds: {result[0]}")
+            if result[0] > 0:
+                print(f"  Feeds with category: {result[1]} ({result[1]/result[0]*100:.1f}%)")
+                print(f"  Feeds with subcategory: {result[2]} ({result[2]/result[0]*100:.1f}%)")
+        
+        # Check if categories have UUIDs
+        result = db.execute(text("""
+            SELECT 
+                COUNT(*) as total_categories,
+                COUNT(CASE WHEN uuid IS NOT NULL THEN 1 END) as categories_with_uuid
+            FROM categories;
+        """)).fetchone()
+        
+        if result:
+            print(f"\nCategory statistics:")
+            print(f"  Total categories: {result[0]}")
+            print(f"  Categories with UUID: {result[1]} ({result[1]/result[0]*100:.1f}%)" if result[0] > 0 else "  No categories")
+        
+        print("\n✅ SQLite verification completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during verification: {e}")
+    finally:
+        db.close()
+
+def create_subcategories_table_if_not_exists():
+    """Create subcategories table if it doesn't exist."""
+    db = SessionLocal()
+    
+    try:
+        if not check_table_exists('subcategories'):
+            print("\nCreating 'subcategories' table...")
             
-            for i, feed in enumerate(missing_feeds, 1):
-                print(f"{i}. Feed #{feed.id}: {feed.title[:50]}...")
-        
+            # Check categories table structure to match ID type
+            category_info = db.execute(text("PRAGMA table_info(categories);")).fetchall()
+            id_type = "TEXT"  # default
+            for col in category_info:
+                if col[1] == 'id':
+                    id_type = col[2]
+                    break
+            
+            # Create subcategories table
+            db.execute(text(f"""
+                CREATE TABLE subcategories (
+                    id {id_type} PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    category_id {id_type} NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    uuid TEXT
+                );
+            """))
+            
+            db.commit()
+            print("✅ Created 'subcategories' table")
+            
+            # Create index
+            db.execute(text("""
+                CREATE INDEX idx_subcategories_category_id ON subcategories(category_id);
+            """))
+            print("✅ Created index on category_id")
+            
+            return True
+        else:
+            print("✅ 'subcategories' table already exists")
+            return False
+            
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error creating subcategories table: {e}")
+        return False
     finally:
         db.close()
 
 if __name__ == "__main__":
-    print("🚀 Starting Feed Tag Migration")
-    print("Make sure your .env file has OPENAI_API_KEY and database is accessible")
-    print("-" * 60)
+    print("SQLite Database Migration Script")
+    print("="*50)
     
-    # Run the main migration
-    main()
+    # First, create subcategories table if needed
+    create_subcategories_table_if_not_exists()
     
-    # Verify the results
-    verify_tags()
+    # Then update the database
+    update_database_sqlite()
     
-    print("\n✅ Script completed!")
-    print("\n💡 Next steps:")
-    print("1. Test your filter endpoints with the new tags")
-    print("2. Use: POST /publish/feeds/advanced-filter-with-tags")
-    print("3. Try filtering by content_type: 'Podcast', 'Webinar', etc.")
-    print("4. Try filtering by skills/tools/roles")
+    # Then verify the changes
+    verify_changes_sqlite()
+    
+    print("\n" + "="*50)
+    print("Migration script completed!")
+    print("="*50)
+    print("\n📋 Next steps:")
+    print("1. Restart your FastAPI application")
+    print("2. New feeds will automatically get category/subcategory assignments")
+    print("3. Run your application to test the changes")

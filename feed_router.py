@@ -7,7 +7,7 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from database import get_db
-from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType
+from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory
 from openai import OpenAI, APIError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
@@ -451,29 +451,51 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
     slides = []
     
     try:
-        # 1. Title slide
+        # 0. COVER/SUMMARY SLIDE (NEW - added at position 1)
+        cover_context = f"""Create a comprehensive cover slide that summarizes all the key points from this content.
+        Title: {title}
+        Content Type: {content_type}
+        Categories: {', '.join(categories)}
+        
+        Available Content:
+        - Summary: {ai_generated_content.get('summary', '')[:200]}...
+        - Key Points: {', '.join(ai_generated_content.get('key_points', [])[:5])}
+        - Conclusion: {ai_generated_content.get('conclusion', '')[:150]}...
+        
+        Create an engaging cover slide that provides an overview of what will be covered in all slides."""
+        
+        cover_slide = generate_slide_with_ai("cover", cover_context, categories, content_type)
+        cover_slide["order"] = 1  # First position
+        cover_slide["title"] = f"Overview: {title}"  # Enhanced title
+        cover_slide["background_color"] = background_color
+        slides.append(cover_slide)
+        
+        # 1. Original title slide (now becomes slide 2)
         title_context = f"Create an engaging title slide for: {title}\nSummary: {ai_generated_content.get('summary', '')}\nCategories: {', '.join(categories)}\nType: {content_type}"
-        title_slide = generate_slide_with_ai("title", title_context, categories, content_type)
-        title_slide["order"] = 1
+        title_slide = generate_slide_with_ai("title", title_context, categories, content_type, slides)
+        title_slide["order"] = 2  # Changed from 1 to 2
         title_slide["background_color"] = background_color
         slides.append(title_slide)
         
         if slide_count == 1:
-            return slides
+            return slides[:1]  # Return only cover slide if count is 1
         
-        # 2. Summary slide
-        summary_context = f"Create a comprehensive summary slide for: {title}\nFull Summary: {ai_generated_content.get('summary', '')}\nType: {content_type}"
-        summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
-        summary_slide["order"] = 2
-        summary_slide["background_color"] = background_color
-        slides.append(summary_slide)
+        # 2. Summary slide (now becomes slide 3 if slide_count > 1)
+        if slide_count > 2:
+            summary_context = f"Create a comprehensive summary slide for: {title}\nFull Summary: {ai_generated_content.get('summary', '')}\nType: {content_type}"
+            summary_slide = generate_slide_with_ai("summary", summary_context, categories, content_type, slides)
+            summary_slide["order"] = 3  # Changed from 2 to 3
+            summary_slide["background_color"] = background_color
+            slides.append(summary_slide)
         
-        if slide_count == 2:
-            return slides
+        if slide_count <= 2:
+            return slides[:slide_count]
+        
+        # Adjust remaining slides calculation (since we added a cover slide)
+        remaining_slides = slide_count - len(slides)
         
         # 3. Key point slides
         key_points = ai_generated_content.get("key_points", [])
-        remaining_slides = slide_count - 2
         key_point_slides_count = min(remaining_slides, len(key_points), 5)
         
         for i in range(key_point_slides_count):
@@ -495,26 +517,26 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         
         # 5. Fill remaining slots
         while len(slides) < slide_count:
-            insight_context = f"Create an additional insights slide for: {title}\nAvailable Content: Summary - {ai_generated_content.get('summary', '')[:200]}...\nRemaining Key Points: {', '.join(key_points[len(slides)-2:]) if len(slides)-2 < len(key_points) else 'Various important aspects'}\nType: {content_type}"
+            insight_context = f"Create an additional insights slide for: {title}\nAvailable Content: Summary - {ai_generated_content.get('summary', '')[:200]}...\nRemaining Key Points: {', '.join(key_points[len(slides)-3:]) if len(slides)-3 < len(key_points) else 'Various important aspects'}\nType: {content_type}"
             insight_slide = generate_slide_with_ai("additional_insights", insight_context, categories, content_type, slides)
             insight_slide["order"] = len(slides) + 1
             insight_slide["background_color"] = background_color
             slides.append(insight_slide)
         
-        logger.info(f"Successfully generated {len(slides)} slides for '{title}'")
+        logger.info(f"Successfully generated {len(slides)} slides for '{title}' (including cover slide)")
         return slides[:slide_count]
         
     except HTTPException as e:
         # If OpenAI fails, create minimal slides
         logger.error(f"Error in generate_slides_with_ai for '{title}': {e.detail}")
         
-        # Create minimal fallback slides
+        # Create minimal fallback slides with cover
         fallback_slides = [
             {
                 "order": 1,
-                "title": title,
-                "body": "Feed generation requires OpenAI API access. Please check your API key and quota.",
-                "bullets": ["AI processing failed"],
+                "title": f"Cover: {title}",
+                "body": "Overview of all key points...",
+                "bullets": ["AI processing failed for detailed content"],
                 "background_color": "#FFFFFF",
                 "source_refs": [],
                 "render_markdown": True
@@ -524,9 +546,9 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
         if slide_count > 1:
             fallback_slides.append({
                 "order": 2,
-                "title": "Content Unavailable",
-                "body": "The content could not be processed due to API limitations.",
-                "bullets": ["Check OpenAI API configuration"],
+                "title": title,
+                "body": "Feed generation requires OpenAI API access. Please check your API key and quota.",
+                "bullets": ["AI processing failed"],
                 "background_color": "#FFFFFF",
                 "source_refs": [],
                 "render_markdown": True
@@ -536,6 +558,8 @@ def generate_slides_with_ai(title: str, content: str, ai_generated_content: Dict
     except Exception as e:
         logger.error(f"Unexpected error in generate_slides_with_ai for '{title}': {str(e)}")
         raise
+
+
 
 def generate_feed_background_color(title: str, content_type: str, categories: List[str]) -> str:
     """Generate background color from predefined distinct colors."""
@@ -577,6 +601,24 @@ def create_feed_from_blog(db: Session, blog: Blog):
         
         try:
             categories, skills, tools, roles, content_type = categorize_content_with_openai(blog.content, admin_categories)
+            
+            # NEW: Get or assign category and subcategory
+            category_obj = None
+            subcategory_obj = None
+            
+            if categories and len(categories) > 0:
+                # Get the first category
+                category_name = categories[0]
+                category_obj = db.query(Category).filter(
+                    Category.name.ilike(f"%{category_name}%")
+                ).first()
+                
+                # If category found, get its first subcategory
+                if category_obj:
+                    subcategory_obj = db.query(SubCategory).filter(
+                        SubCategory.category_id == category_obj.id
+                    ).first()
+            
             ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
             slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
             
@@ -590,6 +632,11 @@ def create_feed_from_blog(db: Session, blog: Blog):
             tools = []
             roles = []
             content_type = ContentType.BLOG
+            
+            # NEW: Set category and subcategory to None for fallback
+            category_obj = None
+            subcategory_obj = None
+            
             ai_generated_content = {
                 "title": blog.title,
                 "summary": "Content processing requires OpenAI API access. Please check your API key and quota.",
@@ -612,6 +659,9 @@ def create_feed_from_blog(db: Session, blog: Blog):
             ai_generated_content=ai_generated_content,
             image_generation_enabled=False,
             source_type="blog",
+            # NEW: Add category and subcategory references
+            category_id=category_obj.id if category_obj else None,
+            subcategory_id=subcategory_obj.id if subcategory_obj else None,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -642,6 +692,11 @@ def create_feed_from_blog(db: Session, blog: Blog):
         db.rollback()
         logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create feed for blog: {str(e)}")
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create feed for blog: {str(e)}")
 
 def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: bool = False):
     """Generate feed and slides from a YouTube transcript using AI."""
@@ -658,6 +713,24 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
         
         try:
             categories, skills, tools, roles, content_type = categorize_content_with_openai(transcript.transcript_text, admin_categories)
+            
+            # NEW: Get or assign category and subcategory
+            category_obj = None
+            subcategory_obj = None
+            
+            if categories and len(categories) > 0:
+                # Get the first category
+                category_name = categories[0]
+                category_obj = db.query(Category).filter(
+                    Category.name.ilike(f"%{category_name}%")
+                ).first()
+                
+                # If category found, get its first subcategory
+                if category_obj:
+                    subcategory_obj = db.query(SubCategory).filter(
+                        SubCategory.category_id == category_obj.id
+                    ).first()
+            
             ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
             slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
             
@@ -671,6 +744,11 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             tools = []
             roles = []
             content_type = ContentType.VIDEO
+            
+            # NEW: Set category and subcategory to None for fallback
+            category_obj = None
+            subcategory_obj = None
+            
             ai_generated_content = {
                 "title": transcript.title,
                 "summary": "Content processing requires OpenAI API access. Please check your API key and quota.",
@@ -691,6 +769,8 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             existing_feed.content_type = content_type
             existing_feed.status = status
             existing_feed.ai_generated_content = ai_generated_content
+            existing_feed.category_id = category_obj.id if category_obj else None  # NEW
+            existing_feed.subcategory_id = subcategory_obj.id if subcategory_obj else None  # NEW
             existing_feed.updated_at = datetime.utcnow()
             
             # Delete old slides
@@ -731,6 +811,9 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
                 ai_generated_content=ai_generated_content,
                 image_generation_enabled=False,
                 source_type="youtube",
+                # NEW: Add category and subcategory references
+                category_id=category_obj.id if category_obj else None,
+                subcategory_id=subcategory_obj.id if subcategory_obj else None,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -1116,7 +1199,12 @@ def get_all_feeds(
     db: Session = Depends(get_db)
 ):
     """Get all feeds (both published and unpublished) with filtering."""
-    query = db.query(Feed).options(joinedload(Feed.blog))
+    # Update query to include category and subcategory
+    query = db.query(Feed).options(
+        joinedload(Feed.blog),
+        joinedload(Feed.category),  # NEW
+        joinedload(Feed.subcategory)  # NEW
+    )
     
     if category:
         query = query.filter(Feed.categories.contains([category]))
@@ -1154,6 +1242,10 @@ def get_all_feeds(
         # Get metadata for each feed
         meta = get_feed_metadata(feed, db)
         
+        # NEW: Get category and subcategory names
+        category_name = feed.category.name if feed.category else None
+        subcategory_name = feed.subcategory.name if feed.subcategory else None
+        
         items.append({
             "id": feed.id,
             "blog_id": feed.blog_id,
@@ -1171,7 +1263,13 @@ def get_all_feeds(
             "created_at": feed.created_at.isoformat() if feed.created_at else None,
             "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
             "ai_generated": feed.ai_generated_content is not None,
-            "meta": meta  # Added metadata here
+            # NEW: Add category and subcategory info
+            "category_name": category_name,
+            "subcategory_name": subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+            "meta": meta
         })
 
     has_more = (page * limit) < total
@@ -1191,10 +1289,13 @@ def get_all_feeds(
 @router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     """Get full AI-generated feed with slides and is_published status."""
+    # Update the query to include category and subcategory joins
     feed = db.query(Feed).options(
         joinedload(Feed.blog), 
         joinedload(Feed.slides),
-        joinedload(Feed.published_feed)
+        joinedload(Feed.published_feed),
+        joinedload(Feed.category),  # NEW: Join category
+        joinedload(Feed.subcategory)  # NEW: Join subcategory
     ).filter(Feed.id == feed_id).first()
     
     if not feed:
@@ -1208,6 +1309,10 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     # Get proper metadata
     meta = get_feed_metadata(feed, db)
     
+    # NEW: Get category and subcategory names
+    category_name = feed.category.name if feed.category else None
+    subcategory_name = feed.subcategory.name if feed.subcategory else None
+    
     return {
         "id": feed.id,
         "blog_id": feed.blog_id,
@@ -1220,6 +1325,14 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "is_published": is_published,
         "published_at": feed.published_feed.published_at.isoformat() if is_published else None,
         "meta": meta,
+        # NEW: Add category and subcategory info
+        "category_name": category_name,
+        "subcategory_name": subcategory_name,
+        "category_id": feed.category_id,
+        "subcategory_id": feed.subcategory_id,
+        # Display as requested format: "category_name { subcategory_name }"
+        "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+        
         "slides": sorted([
             {
                 "id": s.id,

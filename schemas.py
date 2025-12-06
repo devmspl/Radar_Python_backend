@@ -55,32 +55,107 @@ class PasswordReset(BaseModel):
     otp_code: str
     new_password: str = Field(..., min_length=8)
 
-class CategoryBase(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
+class SubCategoryBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    note: Optional[str] = None
-    admin_note: Optional[str] = None
+    category_id: str = Field(..., description="Parent category ID")
+    is_active: Optional[bool] = True
 
-class CategoryCreate(CategoryBase):
+class SubCategoryCreate(SubCategoryBase):
     pass
 
-class CategoryResponse(CategoryBase):
-    id: int
+class SubCategoryUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    category_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class SubCategoryResponse(BaseModel):
+    id: str
     uuid: str
+    name: str
+    description: Optional[str]
+    category_id: str
     is_active: bool
     created_at: datetime
     updated_at: datetime
-    admin_id: int
     
     class Config:
         from_attributes = True
 
+# Category schemas
+class CategoryBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    note: Optional[str] = None
+    admin_note: Optional[str] = None
+    admin_id: Optional[int] = None
+    is_active: Optional[bool] = True
+
+class CategoryCreate(CategoryBase):
+    pass
+
 class CategoryUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
     note: Optional[str] = None
     admin_note: Optional[str] = None
     is_active: Optional[bool] = None
+
+# Category response without subcategories (for lists)
+class CategoryResponse(BaseModel):
+    id: str
+    uuid: str
+    name: str
+    description: Optional[str]
+    note: Optional[str]
+    admin_note: Optional[str]
+    admin_id: Optional[int]
+    is_active: bool
+    subcategory_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Category with subcategories (detailed view)
+class CategoryWithSubcategories(CategoryResponse):
+    subcategories: List[SubCategoryResponse] = []
+
+# For creating multiple subcategories at once
+class BulkSubCategoryCreate(BaseModel):
+    subcategories: List[SubCategoryCreate]
+
+# For response when creating/updating categories with subcategories
+class CategoryCreateResponse(BaseModel):
+    category: CategoryResponse
+    subcategories_created: int
+    message: str
+
+# For updating category with subcategories
+class CategoryUpdateWithSubcategories(BaseModel):
+    category_data: CategoryUpdate
+    subcategories_to_add: Optional[List[SubCategoryCreate]] = None
+    subcategories_to_remove: Optional[List[str]] = None  # List of subcategory IDs to remove
+    subcategories_to_update: Optional[List[SubCategoryUpdate]] = None
+
+# Response for subcategory operations
+class SubCategoryListResponse(BaseModel):
+    subcategories: List[SubCategoryResponse]
+    total: int
+    page: int
+    limit: int
+    has_more: bool
+
+class CategoryListResponse(BaseModel):
+    categories: List[CategoryResponse]
+    total: int
+    page: int
+    limit: int
+    has_more: bool
+    total_subcategories: int
+
 
 # YouTube Transcript Schemas
 class TranscriptRequest(BaseModel):
@@ -267,7 +342,7 @@ class SlideResponse(BaseModel):
 class FeedDetailResponse(BaseModel):
     id: int
     title: str
-    categories: List[str]
+    # categories: List[str]
     status: str
     is_published: bool
     ai_generated_content: Optional[Dict[str, Any]]
@@ -275,18 +350,24 @@ class FeedDetailResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     slides: List[SlideResponse]
+    category_name: Optional[str] = None
+    subcategory_name: Optional[str] = None
+    category_id: Optional[str] = None
+    subcategory_id: Optional[str] = None
 
     class Config:
         from_attributes = True
 
 class PublishedFeedResponse(BaseModel):
+
     id: int
     feed_id: int
     admin_id: int
     admin_name: str
+    category_name: Optional[str] = None
+    subcategory_name: Optional[str] = None
     published_at: datetime
     is_active: bool
-    
     # Feed details
     feed_title: str
     feed_categories: List[str]
@@ -380,6 +461,18 @@ class QuizResultResponse(BaseModel):
     passed: bool
     results: List[Dict[str, Any]]
     user_rank: str
+    
+class UserProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+    domains_of_interest: Optional[List[int]] = None
+    skills_tools: Optional[List[int]] = None
+    interested_roles: Optional[List[int]] = None
+    
+    class Config:
+        from_attributes = True
 
 class QuizSubmission(BaseModel):
     quiz_id: int

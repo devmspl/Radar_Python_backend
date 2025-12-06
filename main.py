@@ -11,7 +11,7 @@ from fastapi import File, UploadFile, Form
 import shutil
 from file_utils import handle_profile_photo_upload, delete_profile_photo
 from typing import Optional
-
+import json
 # Import routers
 from admin import router as admin_router
 from youtube_router import router as youtube_router
@@ -22,6 +22,7 @@ from publish_router import router as publish_router
 from quiz_router import router as quiz_router
 from onboarding_router import router as onboarding_router
 from bookmark_router import bookmark_router as bookmark_router
+from Subcategory_router import router as subcategory_router
 import traceback
 import sys
 import logging
@@ -575,6 +576,184 @@ async def admin_delete_user(
 
     return {"message": f"User with ID {user_id} has been deleted successfully"}
 
+@auth_router.put("/users/me/profile", response_model=schemas.UserResponse)
+async def update_user_profile(
+    background_tasks: BackgroundTasks,
+    full_name: Optional[str] = Form(None),
+    last_name: Optional[str] = Form(None),
+    current_password: Optional[str] = Form(None),
+    new_password: Optional[str] = Form(None),
+    domains_of_interest: Optional[str] = Form(None),  # JSON string of category IDs
+    skills_tools: Optional[str] = Form(None),  # JSON string of skill IDs
+    interested_roles: Optional[str] = Form(None),  # JSON string of role IDs
+    profile_photo: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_user)
+):
+    """
+    Update user profile with onboarding data
+    
+    This endpoint allows updating:
+    - Basic user info (full_name, last_name)
+    - Password (requires current password)
+    - Onboarding data (domains, skills, roles)
+    - Profile photo
+    
+    All fields are optional. Only provided fields will be updated.
+    """
+    try:
+        # Start a transaction
+        db.begin()
+        
+        # 1. Update basic user info if provided
+        if full_name is not None:
+            current_user.full_name = full_name
+        if last_name is not None:
+            current_user.last_name = last_name
+        
+        # 2. Handle password change if requested
+        if current_password and new_password:
+            # Verify current password
+            if not utils.verify_password(current_password, current_user.hashed_password):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Current password is incorrect"
+                )
+            
+            # Update to new password
+            current_user.hashed_password = utils.get_password_hash(new_password)
+            
+            # Send password change notification email
+            email_body = """
+            <h2>Password Changed Successfully</h2>
+            <p>Your password has been updated successfully.</p>
+            <p>If you did not make this change, please contact support immediately.</p>
+            """
+            
+            background_tasks.add_task(
+                utils.send_email,
+                current_user.email,
+                "Password Changed",
+                email_body
+            )
+        
+        # 3. Handle profile photo upload if provided
+        if profile_photo:
+            new_photo_path = await handle_profile_photo_upload(
+                profile_photo, 
+                current_user.id, 
+                current_user.profile_photo
+            )
+            current_user.profile_photo = new_photo_path
+        
+        # 4. Handle onboarding data updates
+        if any([domains_of_interest, skills_tools, interested_roles]):
+            # Get or create onboarding data for user
+            onboarding_data = db.query(models.OnboardingData).filter(
+                models.OnboardingData.user_id == current_user.id
+            ).first()
+            
+            if not onboarding_data:
+                onboarding_data = models.OnboardingData(
+                    user_id=current_user.id,
+                    is_completed=False  # Set to True only when user explicitly completes onboarding
+                )
+                db.add(onboarding_data)
+            
+            # Parse and update domains of interest
+            if domains_of_interest is not None:
+                try:
+                    domain_ids = json.loads(domains_of_interest)
+                    if isinstance(domain_ids, list):
+                        # Validate category IDs exist
+                        valid_categories = db.query(models.Category.id).filter(
+                            models.Category.id.in_(domain_ids)
+                        ).all()
+                        valid_ids = [cat[0] for cat in valid_categories]
+                        onboarding_data.domains_of_interest = valid_ids
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid JSON format for domains_of_interest"
+                    )
+            
+            # Parse and update skills/tools
+            if skills_tools is not None:
+                try:
+                    skill_ids = json.loads(skills_tools)
+                    if isinstance(skill_ids, list):
+                        # Validate skill IDs exist
+                        valid_skills = db.query(models.SkillTool.id).filter(
+                            models.SkillTool.id.in_(skill_ids)
+                        ).all()
+                        valid_ids = [skill[0] for skill in valid_skills]
+                        onboarding_data.skills_tools = valid_ids
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid JSON format for skills_tools"
+                    )
+            
+            # Parse and update interested roles
+            if interested_roles is not None:
+                try:
+                    role_ids = json.loads(interested_roles)
+                    if isinstance(role_ids, list):
+                        # Validate role IDs exist
+                        valid_roles = db.query(models.Role.id).filter(
+                            models.Role.id.in_(role_ids)
+                        ).all()
+                        valid_ids = [role[0] for role in valid_roles]
+                        onboarding_data.interested_roles = valid_ids
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid JSON format for interested_roles"
+                    )
+            
+            # Mark onboarding as completed if all required fields are present
+            if (onboarding_data.domains_of_interest and 
+                onboarding_data.skills_tools and 
+                onboarding_data.interested_roles):
+                onboarding_data.is_completed = True
+        
+        # 5. Commit changes
+        db.commit()
+        db.refresh(current_user)
+        
+        # 6. Send profile update notification email
+        email_body = f"""
+        <h2>Profile Updated Successfully</h2>
+        <p>Your profile has been updated successfully.</p>
+        <p>Changes made:</p>
+        <ul>
+            {"<li>Name updated</li>" if full_name or last_name else ""}
+            {"<li>Password changed</li>" if current_password and new_password else ""}
+            {"<li>Profile photo updated</li>" if profile_photo else ""}
+            {"<li>Onboarding preferences updated</li>" if domains_of_interest or skills_tools or interested_roles else ""}
+        </ul>
+        """
+        
+        background_tasks.add_task(
+            utils.send_email,
+            current_user.email,
+            "Profile Updated",
+            email_body
+        )
+        
+        return current_user
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating profile: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating profile: {str(e)}"
+        )
+
 
 # @auth_router.get("/users/me/profile", response_model=schemas.UserResponse)
 # async def get_user_profile(
@@ -592,7 +771,8 @@ from fastapi.staticfiles import StaticFiles
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.include_router(auth_router)
 app.include_router(onboarding_router) 
-app.include_router(admin_router)    
+app.include_router(admin_router)
+app.include_router(subcategory_router)   
 app.include_router(youtube_router)
 app.include_router(scrapping_router)  
 app.include_router(feed_router)
