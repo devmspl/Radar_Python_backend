@@ -58,7 +58,7 @@ class PasswordReset(BaseModel):
 class SubCategoryBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    category_id: str = Field(..., description="Parent category ID")
+    category_id: int = Field(..., description="Parent category ID")
     is_active: Optional[bool] = True
 
 class SubCategoryCreate(SubCategoryBase):
@@ -67,7 +67,7 @@ class SubCategoryCreate(SubCategoryBase):
 class SubCategoryUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
-    category_id: Optional[str] = None
+    category_id: Optional[int] = None
     is_active: Optional[bool] = None
 
 class SubCategoryResponse(BaseModel):
