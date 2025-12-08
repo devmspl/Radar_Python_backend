@@ -71,11 +71,11 @@ class SubCategoryUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 class SubCategoryResponse(BaseModel):
-    id: str
+    id: Union[str, int]
     uuid: str
     name: str
     description: Optional[str]
-    category_id: str
+    category_id: Union[str, int]
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -104,13 +104,13 @@ class CategoryUpdate(BaseModel):
 
 # Category response without subcategories (for lists)
 class CategoryResponse(BaseModel):
-    id: str
+    id: Union[str, int]
     uuid: str
     name: str
     description: Optional[str]
     note: Optional[str]
     admin_note: Optional[str]
-    admin_id: Optional[int]
+    admin_id: Optional[Union[str, int]]
     is_active: bool
     subcategory_count: int = 0
     created_at: datetime

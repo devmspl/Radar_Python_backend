@@ -484,16 +484,16 @@ class SubCategory(Base):
     __tablename__ = "subcategories"
     
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String(255), nullable=False, unique=True)
+    name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     category_id = Column(String(36), ForeignKey('categories.id'), nullable=False)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True)  # Make sure this exists
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    uuid = Column(String(36), default=lambda: str(uuid.uuid4()), unique=True)  # Make sure this exists
     
     # Relationship back to category
     category = relationship("Category", back_populates="subcategories")
-    feeds = relationship("Feed", back_populates="subcategory")
     
-    # If you want subcategories to have their own UUID for external reference
-    uuid = Column(String(36), default=lambda: str(uuid.uuid4()), unique=True)
+    # If you want subcategories to have feeds relationship
+    feeds = relationship("Feed", back_populates="subcategory")

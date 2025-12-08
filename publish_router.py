@@ -10,7 +10,7 @@ from googleapiclient.errors import HttpError
 from pydantic import BaseModel, Field  # ADD THIS IMPORT
 
 from database import get_db
-from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source, UserOnboarding
+from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source, UserOnboarding,SubCategory
 from schemas import (
     PublishFeedRequest, 
     PublishStatusResponse, 
@@ -157,31 +157,77 @@ def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
 def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, Any]:
     """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
     if feed.source_type == "youtube":
+        # Get the transcript to access YouTube-specific data
         transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
         
         if transcript:
-            video_id = getattr(transcript, 'video_id', None) or getattr(transcript, 'youtube_video_id', feed.transcript_id)
+            # Extract video ID from transcript data
+            video_id = getattr(transcript, 'video_id', None)
+            if not video_id:
+                # Try to extract from transcript_id or other fields
+                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
+            
+            # Get original title from transcript
             original_title = transcript.title if transcript else feed.title
+            
+            # Get channel information from YouTube API
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            # Construct proper YouTube URL
+            source_url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            # Get category and subcategory names
+            category_name = None
+            subcategory_name = None
+            if feed.category_id:
+                category = db.query(Category).filter(Category.id == feed.category_id).first()
+                if category:
+                    category_name = category.name
+            
+            if feed.subcategory_id:
+                subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+                if subcategory:
+                    subcategory_name = subcategory.name
             
             return {
                 "title": feed.title,
                 "original_title": original_title,
                 "author": channel_name,
-                "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                "source_url": source_url,
                 "source_type": "youtube",
                 "channel_name": channel_name,
                 "channel_id": channel_info.get("channel_id"),
                 "video_id": video_id,
+                "channel_info": channel_info,
+                # NEW: Add category and subcategory
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
                 "website_name": "YouTube",
                 "favicon": "https://www.youtube.com/favicon.ico",
                 "channel_logo": channel_info.get("thumbnails", {}).get('default', {}).get('url') if channel_info.get("thumbnails") else None,
             }
         else:
+            # Fallback if transcript not found
             video_id = feed.transcript_id
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
+            
+            # Get category and subcategory names
+            category_name = None
+            subcategory_name = None
+            if feed.category_id:
+                category = db.query(Category).filter(Category.id == feed.category_id).first()
+                if category:
+                    category_name = category.name
+            
+            if feed.subcategory_id:
+                subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+                if subcategory:
+                    subcategory_name = subcategory.name
             
             return {
                 "title": feed.title,
@@ -190,6 +236,15 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "source_url": f"https://www.youtube.com/watch?v={video_id}",
                 "source_type": "youtube",
                 "channel_name": channel_name,
+                "channel_id": channel_info.get("channel_id"),
+                "video_id": video_id,
+                "channel_info": channel_info,
+                # NEW: Add category and subcategory
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
                 "website_name": "YouTube",
                 "favicon": "https://www.youtube.com/favicon.ico",
             }
@@ -199,6 +254,19 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
         if blog:
             website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
             author = getattr(blog, 'author', 'Admin') or 'Admin'
+            
+            # Get category and subcategory names
+            category_name = None
+            subcategory_name = None
+            if feed.category_id:
+                category = db.query(Category).filter(Category.id == feed.category_id).first()
+                if category:
+                    category_name = category.name
+            
+            if feed.subcategory_id:
+                subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+                if subcategory:
+                    subcategory_name = subcategory.name
             
             return {
                 "title": feed.title,
@@ -210,8 +278,27 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "website": blog.website,
                 "favicon": f"https://{website_name}/favicon.ico",
                 "channel_name": website_name,
+                # NEW: Add category and subcategory
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
             }
         else:
+            # Get category and subcategory names
+            category_name = None
+            subcategory_name = None
+            if feed.category_id:
+                category = db.query(Category).filter(Category.id == feed.category_id).first()
+                if category:
+                    category_name = category.name
+            
+            if feed.subcategory_id:
+                subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+                if subcategory:
+                    subcategory_name = subcategory.name
+            
             return {
                 "title": feed.title,
                 "original_title": "Unknown",
@@ -220,6 +307,14 @@ def get_feed_metadata(db: Session, feed: Feed, blog: Blog = None) -> Dict[str, A
                 "source_type": "blog",
                 "website_name": "Unknown",
                 "website": "Unknown",
+                "favicon": None,
+                "channel_name": "Unknown",
+                # NEW: Add category and subcategory
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
             }
 
 def format_slide_response(slide: Slide) -> SlideResponse:
@@ -244,6 +339,19 @@ def format_published_feed_response(published_feed: PublishedFeed, db: Session) -
             return None
             
         feed = published_feed.feed
+        
+        # NEW: Get category and subcategory names
+        category_name = None
+        subcategory_name = None
+        if feed.category_id:
+            category = db.query(Category).filter(Category.id == feed.category_id).first()
+            if category:
+                category_name = category.name
+        
+        if feed.subcategory_id:
+            subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+            if subcategory:
+                subcategory_name = subcategory.name
         
         # Process slides
         slides_data = []
@@ -282,7 +390,13 @@ def format_published_feed_response(published_feed: PublishedFeed, db: Session) -
             "roles": getattr(feed, 'roles', []) or [],
             "slides_count": len(slides_data),
             "slides": slides_data,
-            "meta": meta_data
+            "meta": meta_data,
+            # NEW: Add category and subcategory info
+            "category_name": category_name,
+            "subcategory_name": subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
         }
         
     except Exception as e:
@@ -671,87 +785,92 @@ def advanced_filter_published_feeds(
             detail="Failed to apply advanced filters"
         )
 
-@router.get("/feeds/with-sources", response_model=dict)
-def get_published_feeds_with_sources(
+@router.get("/feeds", response_model=List[PublishedFeedResponse])
+def get_published_feeds(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     active_only: bool = Query(True, description="Show only active published feeds"),
-    include_source_info: bool = Query(True, description="Include source information"),
     db: Session = Depends(get_db)
 ):
     """
-    Get all published feeds with detailed source information including:
-    - Source name, website, type
-    - Number of published contents for each source
-    - Follower count
+    Get all published feeds with slides included and enhanced metadata.
     """
     try:
+        # Query with proper joins to load all related data
         query = db.query(PublishedFeed).options(
             joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-            joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+            joinedload(PublishedFeed.feed).joinedload(Feed.blog),
+            joinedload(PublishedFeed.feed).joinedload(Feed.category),  # NEW: Join category
+            joinedload(PublishedFeed.feed).joinedload(Feed.subcategory)  # NEW: Join subcategory
         )
         
+        # Filter by active status
         if active_only:
             query = query.filter(PublishedFeed.is_active == True)
         
+        # Order by most recent first
         query = query.order_by(PublishedFeed.published_at.desc())
         
-        total = query.count()
+        # Pagination
         published_feeds = query.offset((page - 1) * limit).limit(limit).all()
         
-        # Format response with source information
-        feeds_data = []
-        sources_map = {}  # Track unique sources
-        
+        response_data = []
         for pf in published_feeds:
-            if pf.feed:
-                feed_data = format_published_feed_response(pf, db)
-                if feed_data:
-                    # Add source information
-                    if include_source_info:
-                        source_info = get_source_for_feed(db, pf.feed)
-                        feed_data["source"] = source_info
-                        
-                        # Track source statistics
-                        if source_info and source_info.get("id"):
-                            source_id = source_info["id"]
-                            if source_id not in sources_map:
-                                sources_map[source_id] = {
-                                    "source": source_info,
-                                    "feed_count": 0
-                                }
-                            sources_map[source_id]["feed_count"] += 1
-                    
-                    feeds_data.append(feed_data)
+            # Safely get feed data
+            if not pf.feed:
+                continue  # Skip if no feed associated
+                
+            feed = pf.feed
+            
+            # Get category and subcategory names
+            category_name = feed.category.name if feed.category else None
+            subcategory_name = feed.subcategory.name if feed.subcategory else None
+            
+            feed_title = pf.feed.title
+            blog_title = pf.feed.blog.title if pf.feed.blog else None
+            categories = pf.feed.categories or []
+            
+            # Process slides
+            slides_data = []
+            if pf.feed.slides:
+                # Sort slides by order and format them
+                sorted_slides = sorted(pf.feed.slides, key=lambda x: x.order)
+                slides_data = [format_slide_response(slide) for slide in sorted_slides]
+            
+            # Count slides
+            slides_count = len(slides_data)
+            
+            # Get enhanced metadata with channel info, logos, and website data
+            meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
+            
+            response_data.append(PublishedFeedResponse(
+                id=pf.id,
+                feed_id=pf.feed_id,
+                admin_id=pf.admin_id,
+                admin_name=pf.admin_name,
+                published_at=pf.published_at,
+                is_active=pf.is_active,
+                feed_title=feed_title,
+                blog_title=blog_title,
+                feed_categories=categories,
+                # NEW: Add category and subcategory
+                category_name=category_name,
+                subcategory_name=subcategory_name,
+                category_id=feed.category_id,
+                subcategory_id=feed.subcategory_id,
+                category_display=f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+                slides_count=slides_count,
+                slides=slides_data if slides_data else None,
+                meta=meta_data
+            ))
         
-        # Prepare sources summary
-        sources_summary = [
-            {
-                "source": source_data["source"],
-                "published_feeds_count": source_data["feed_count"],
-                "percentage_of_total": round((source_data["feed_count"] / len(feeds_data)) * 100, 2) if feeds_data else 0
-            }
-            for source_data in sources_map.values()
-        ]
-        
-        # Sort sources by feed count (most popular first)
-        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
-        
-        return {
-            "feeds": feeds_data,
-            "sources_summary": sources_summary,
-            "total_feeds": total,
-            "unique_sources": len(sources_map),
-            "page": page,
-            "limit": limit,
-            "has_more": (page * limit) < total
-        }
+        return response_data
         
     except Exception as e:
-        logger.error(f"Error fetching published feeds with sources: {e}")
+        logger.error(f"Error fetching published feeds: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch published feeds with sources"
+            detail="Failed to fetch published feeds"
         )
 
 @router.get("/source/{source_id}/related-content", response_model=dict)
@@ -780,19 +899,22 @@ def get_related_content_by_source_id(
         if source.source_type == "blog":
             query = db.query(PublishedFeed).options(
                 joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-                joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+                joinedload(PublishedFeed.feed).joinedload(Feed.blog),
+                joinedload(PublishedFeed.feed).joinedload(Feed.category),  # NEW
+                joinedload(PublishedFeed.feed).joinedload(Feed.subcategory)  # NEW
             ).join(Feed).join(Blog).filter(
                 PublishedFeed.is_active == True,
                 Blog.website == source.website
             )
         else:
             query = db.query(PublishedFeed).options(
-                joinedload(PublishedFeed.feed).joinedload(Feed.slides)
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+                joinedload(PublishedFeed.feed).joinedload(Feed.category),  # NEW
+                joinedload(PublishedFeed.feed).joinedload(Feed.subcategory)  # NEW
             ).join(Feed).filter(
                 PublishedFeed.is_active == True,
                 Feed.source_type == "youtube"
             )
-        
         # Apply content type filter
         if content_type:
             content_type_upper = content_type.upper()
@@ -942,14 +1064,18 @@ def get_published_feeds_by_source_id(
         if source.source_type == "blog":
             query = db.query(PublishedFeed).options(
                 joinedload(PublishedFeed.feed).joinedload(Feed.slides),
-                joinedload(PublishedFeed.feed).joinedload(Feed.blog)
+                joinedload(PublishedFeed.feed).joinedload(Feed.blog),
+                joinedload(PublishedFeed.feed).joinedload(Feed.category),  # NEW
+                joinedload(PublishedFeed.feed).joinedload(Feed.subcategory)  # NEW
             ).join(Feed).join(Blog).filter(
                 PublishedFeed.is_active == True,
                 Blog.website == source.website
             )
         else:
             query = db.query(PublishedFeed).options(
-                joinedload(PublishedFeed.feed).joinedload(Feed.slides)
+                joinedload(PublishedFeed.feed).joinedload(Feed.slides),
+                joinedload(PublishedFeed.feed).joinedload(Feed.category),  # NEW
+                joinedload(PublishedFeed.feed).joinedload(Feed.subcategory)  # NEW
             ).join(Feed).filter(
                 PublishedFeed.is_active == True,
                 Feed.source_type == "youtube"

@@ -11,161 +11,151 @@ from schemas import (
     SubCategoryCreate, SubCategoryUpdate, SubCategoryResponse,
     SubCategoryListResponse, BulkSubCategoryCreate
 )
+from sqlalchemy import or_
 
 class CRUDSubCategory:
-    def get(self, db: Session, subcategory_id: str) -> Optional[SubCategory]:
+    def get_by_id(self, db: Session, subcategory_id: str) -> Optional[SubCategory]:
         return db.query(SubCategory).filter(SubCategory.id == subcategory_id).first()
     
-    def get_by_category(self, db: Session, category_id: str) -> List[SubCategory]:
-        return db.query(SubCategory).filter(SubCategory.category_id == category_id).all()
+    def get_by_uuid(self, db: Session, subcategory_uuid: str) -> Optional[SubCategory]:
+        return db.query(SubCategory).filter(SubCategory.uuid == subcategory_uuid).first()
     
     def get_by_name(self, db: Session, name: str) -> Optional[SubCategory]:
         return db.query(SubCategory).filter(SubCategory.name == name).first()
     
-    def get_multi(self, db: Session, skip: int = 0, limit: int = 100) -> List[SubCategory]:
-        return db.query(SubCategory).offset(skip).limit(limit).all()
+    def get_by_category(self, db: Session, category_id: str, skip: int = 0, limit: int = 100, active_only: bool = True) -> List[SubCategory]:
+        query = db.query(SubCategory).filter(SubCategory.category_id == category_id)
+        if active_only:
+            query = query.filter(SubCategory.is_active == True)
+        return query.offset(skip).limit(limit).all()
     
-    def create(self, db: Session, obj_in: SubCategoryCreate) -> SubCategory:
-        db_obj = SubCategory(
-            id=str(uuid.uuid4()),
-            name=obj_in.name,
-            description=obj_in.description,
-            category_id=obj_in.category_id
-        )
-        db.add(db_obj)
-        db.commit()
-        db.refresh(db_obj)
-        return db_obj
+    def get_all(self, db: Session, skip: int = 0, limit: int = 100, active_only: bool = True) -> List[SubCategory]:
+        query = db.query(SubCategory)
+        if active_only:
+            query = query.filter(SubCategory.is_active == True)
+        return query.offset(skip).limit(limit).all()
     
-    def update(self, db: Session, subcategory_id: str, obj_in: SubCategoryUpdate) -> Optional[SubCategory]:
-        db_obj = self.get(db, subcategory_id)
-        if not db_obj:
-            return None
+    def search(self, db: Session, search_term: str, skip: int = 0, limit: int = 100) -> List[SubCategory]:
+        return db.query(SubCategory).filter(
+            or_(
+                SubCategory.name.ilike(f"%{search_term}%"),
+                SubCategory.description.ilike(f"%{search_term}%")
+            )
+        ).offset(skip).limit(limit).all()
+    
+    def create(self, db: Session, subcategory_data: Dict[str, Any]) -> SubCategory:
+        # Check if category exists
+        category = db.query(Category).filter(Category.id == subcategory_data["category_id"]).first()
+        if not category:
+            raise ValueError("Category not found")
         
-        update_data = obj_in.dict(exclude_unset=True)
-        for field, value in update_data.items():
-            setattr(db_obj, field, value)
+        # Check if subcategory with same name exists in this category
+        existing = db.query(SubCategory).filter(
+            SubCategory.name == subcategory_data["name"],
+            SubCategory.category_id == subcategory_data["category_id"]
+        ).first()
         
-        db.commit()
-        db.refresh(db_obj)
-        return db_obj
-    
-    def delete(self, db: Session, subcategory_id: str) -> Optional[SubCategory]:
-        db_obj = self.get(db, subcategory_id)
-        if not db_obj:
-            return None
+        if existing:
+            raise ValueError(f"Subcategory '{subcategory_data['name']}' already exists in this category")
         
-        db.delete(db_obj)
-        db.commit()
-        return db_obj
-    def get_with_subcategories(self, db: Session, category_id: str) -> Optional[Category]:
-        return db.query(Category).filter(Category.id == category_id).first()
-    
-    def create_with_subcategories(self, db: Session, category_data: Dict[str, Any], subcategories: List[Dict[str, Any]] = None) -> Category:
-        # Create category
-        category = Category(
+        subcategory = SubCategory(
             id=str(uuid.uuid4()),
             uuid=str(uuid.uuid4()),
-            name=category_data["name"],
-            description=category_data.get("description"),
-            note=category_data.get("note"),
-            admin_note=category_data.get("admin_note"),
-            admin_id=category_data.get("admin_id"),
-            is_active=category_data.get("is_active", True)
+            name=subcategory_data["name"],
+            description=subcategory_data.get("description"),
+            category_id=subcategory_data["category_id"],
+            is_active=subcategory_data.get("is_active", True)
         )
         
-        db.add(category)
-        db.flush()  # Flush to get category ID
-        
-        # Create subcategories if provided
-        if subcategories:
-            for subcat_data in subcategories:
-                subcategory = SubCategory(
-                    id=str(uuid.uuid4()),
-                    uuid=str(uuid.uuid4()),
-                    name=subcat_data["name"],
-                    description=subcat_data.get("description"),
-                    category_id=category.id,
-                    is_active=subcat_data.get("is_active", True)
-                )
-                db.add(subcategory)
-        
+        db.add(subcategory)
         db.commit()
-        db.refresh(category)
-        return category
+        db.refresh(subcategory)
+        return subcategory
     
-    def update_with_subcategories(self, db: Session, category_id: str, 
-                                  category_update: Dict[str, Any],
-                                  subcategories_to_add: List[Dict[str, Any]] = None,
-                                  subcategories_to_remove: List[str] = None,
-                                  subcategories_to_update: List[Dict[str, Any]] = None) -> Optional[Category]:
-        
-        category = self.get_by_id(db, category_id)
-        if not category:
+    def update(self, db: Session, subcategory_id: str, update_data: Dict[str, Any]) -> Optional[SubCategory]:
+        subcategory = self.get_by_id(db, subcategory_id)
+        if not subcategory:
             return None
         
-        # Update category fields
-        for key, value in category_update.items():
-            if hasattr(category, key) and value is not None:
-                setattr(category, key, value)
+        # If changing category_id, verify new category exists
+        if "category_id" in update_data and update_data["category_id"] != subcategory.category_id:
+            new_category = db.query(Category).filter(Category.id == update_data["category_id"]).first()
+            if not new_category:
+                raise ValueError("New category not found")
+            
+            # Check if subcategory with same name exists in new category
+            existing = db.query(SubCategory).filter(
+                SubCategory.name == update_data.get("name", subcategory.name),
+                SubCategory.category_id == update_data["category_id"],
+                SubCategory.id != subcategory_id
+            ).first()
+            
+            if existing:
+                raise ValueError(f"Subcategory with name '{update_data.get('name', subcategory.name)}' already exists in the new category")
         
-        # Remove subcategories
-        if subcategories_to_remove:
-            for subcat_id in subcategories_to_remove:
-                subcategory = db.query(SubCategory).filter(SubCategory.id == subcat_id).first()
-                if subcategory and subcategory.category_id == category_id:
-                    db.delete(subcategory)
+        # If changing name, check for duplicates in same category
+        if "name" in update_data and update_data["name"] != subcategory.name:
+            existing = db.query(SubCategory).filter(
+                SubCategory.name == update_data["name"],
+                SubCategory.category_id == update_data.get("category_id", subcategory.category_id),
+                SubCategory.id != subcategory_id
+            ).first()
+            
+            if existing:
+                raise ValueError(f"Subcategory with name '{update_data['name']}' already exists in this category")
         
-        # Update subcategories
-        if subcategories_to_update:
-            for subcat_update in subcategories_to_update:
-                subcat_id = subcat_update.get("id")
-                if subcat_id:
-                    subcategory = db.query(SubCategory).filter(SubCategory.id == subcat_id).first()
-                    if subcategory and subcategory.category_id == category_id:
-                        for key, value in subcat_update.items():
-                            if hasattr(subcategory, key) and key != "id":
-                                setattr(subcategory, key, value)
+        for key, value in update_data.items():
+            if hasattr(subcategory, key):
+                setattr(subcategory, key, value)
         
-        # Add new subcategories
-        if subcategories_to_add:
-            for subcat_data in subcategories_to_add:
-                # Check if subcategory already exists
-                existing = db.query(SubCategory).filter(
-                    SubCategory.name == subcat_data["name"],
-                    SubCategory.category_id == category_id
-                ).first()
-                
-                if not existing:
-                    subcategory = SubCategory(
-                        id=str(uuid.uuid4()),
-                        uuid=str(uuid.uuid4()),
-                        name=subcat_data["name"],
-                        description=subcat_data.get("description"),
-                        category_id=category_id,
-                        is_active=subcat_data.get("is_active", True)
-                    )
-                    db.add(subcategory)
-        
-        category.updated_at = datetime.utcnow()
+        subcategory.updated_at = datetime.utcnow()
         db.commit()
-        db.refresh(category)
-        return category
+        db.refresh(subcategory)
+        return subcategory
     
-    def get_category_stats(self, db: Session) -> Dict[str, Any]:
-        total_categories = db.query(Category).count()
-        active_categories = db.query(Category).filter(Category.is_active == True).count()
-        total_subcategories = db.query(SubCategory).count()
-        active_subcategories = db.query(SubCategory).filter(SubCategory.is_active == True).count()
+    def delete(self, db: Session, subcategory_id: str) -> bool:
+        subcategory = self.get_by_id(db, subcategory_id)
+        if not subcategory:
+            return False
         
-        return {
-            "total_categories": total_categories,
-            "active_categories": active_categories,
-            "total_subcategories": total_subcategories,
-            "active_subcategories": active_subcategories
-        }
+        db.delete(subcategory)
+        db.commit()
+        return True
+    
+    def deactivate(self, db: Session, subcategory_id: str) -> Optional[SubCategory]:
+        subcategory = self.get_by_id(db, subcategory_id)
+        if not subcategory:
+            return None
+        
+        subcategory.is_active = False
+        subcategory.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(subcategory)
+        return subcategory
+    
+    def activate(self, db: Session, subcategory_id: str) -> Optional[SubCategory]:
+        subcategory = self.get_by_id(db, subcategory_id)
+        if not subcategory:
+            return None
+        
+        subcategory.is_active = True
+        subcategory.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(subcategory)
+        return subcategory
+    
+    def get_count_by_category(self, db: Session, category_id: str, active_only: bool = True) -> int:
+        query = db.query(SubCategory).filter(SubCategory.category_id == category_id)
+        if active_only:
+            query = query.filter(SubCategory.is_active == True)
+        return query.count()
+    
+    # The following methods are from your old CRUD class but don't seem to be used in the router
+    def get_multi(self, db: Session, skip: int = 0, limit: int = 100) -> List[SubCategory]:
+        return self.get_all(db, skip, limit)
 
-subcategory = CRUDSubCategory()
+# Create instance - IMPORTANT: variable name must match what the router uses
+crud_subcategory = CRUDSubCategory()  # Changed from 'subcategory' to 'crud_subcategory'
 
 router = APIRouter(
     prefix="/subcategories",
@@ -180,7 +170,7 @@ def create_subcategory(
     """Create a new subcategory"""
     try:
         subcategory_data = subcategory_in.model_dump()
-        subcategory = crud_subcategory.create(db, subcategory_data)
+        subcategory = crud_subcategory.create(db, subcategory_data)  # Now matches variable name
         return subcategory
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -198,7 +188,7 @@ def create_bulk_subcategories(
     
     for subcat_data in bulk_data.subcategories:
         try:
-            crud_subcategory.create(db, subcat_data.model_dump())
+            crud_subcategory.create(db, subcat_data.model_dump())  # Now matches variable name
             created += 1
         except Exception as e:
             failed.append({
@@ -225,13 +215,13 @@ def get_subcategories(
 ):
     """Get all subcategories with filtering options"""
     if search:
-        subcategories = crud_subcategory.search(db, search, skip, limit)
+        subcategories = crud_subcategory.search(db, search, skip, limit)  # Now matches variable name
         total = len(subcategories)  # Simplified count
     elif category_id:
-        subcategories = crud_subcategory.get_by_category(db, category_id, skip, limit)
+        subcategories = crud_subcategory.get_by_category(db, category_id, skip, limit, active_only)  # Added active_only
         total = crud_subcategory.get_count_by_category(db, category_id, active_only)
     else:
-        subcategories = crud_subcategory.get_all(db, skip, limit, active_only)
+        subcategories = crud_subcategory.get_all(db, skip, limit, active_only)  # Now matches variable name
         total = len(subcategories)  # Simplified count
     
     return {
@@ -248,7 +238,7 @@ def get_subcategory(
     db: Session = Depends(get_db)
 ):
     """Get a specific subcategory by ID"""
-    subcategory = crud_subcategory.get_by_id(db, subcategory_id)
+    subcategory = crud_subcategory.get_by_id(db, subcategory_id)  # Now matches variable name
     if not subcategory:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
     return subcategory
@@ -259,7 +249,7 @@ def get_subcategory_by_uuid(
     db: Session = Depends(get_db)
 ):
     """Get a specific subcategory by UUID"""
-    subcategory = crud_subcategory.get_by_uuid(db, subcategory_uuid)
+    subcategory = crud_subcategory.get_by_uuid(db, subcategory_uuid)  # Now matches variable name
     if not subcategory:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
     return subcategory
@@ -274,7 +264,7 @@ def update_subcategory(
     update_data = {k: v for k, v in subcategory_in.model_dump().items() if v is not None}
     
     try:
-        subcategory = crud_subcategory.update(db, subcategory_id, update_data)
+        subcategory = crud_subcategory.update(db, subcategory_id, update_data)  # Now matches variable name
         if not subcategory:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
         return subcategory
@@ -287,9 +277,10 @@ def delete_subcategory(
     db: Session = Depends(get_db)
 ):
     """Delete a subcategory"""
-    success = crud_subcategory.delete(db, subcategory_id)
+    success = crud_subcategory.delete(db, subcategory_id)  # Now matches variable name
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
+    return None  # 204 No Content
 
 @router.patch("/{subcategory_id}/activate", response_model=SubCategoryResponse)
 def activate_subcategory(
@@ -297,7 +288,7 @@ def activate_subcategory(
     db: Session = Depends(get_db)
 ):
     """Activate a subcategory"""
-    subcategory = crud_subcategory.activate(db, subcategory_id)
+    subcategory = crud_subcategory.activate(db, subcategory_id)  # Now matches variable name
     if not subcategory:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
     return subcategory
@@ -308,7 +299,7 @@ def deactivate_subcategory(
     db: Session = Depends(get_db)
 ):
     """Deactivate a subcategory"""
-    subcategory = crud_subcategory.deactivate(db, subcategory_id)
+    subcategory = crud_subcategory.deactivate(db, subcategory_id)  # Now matches variable name
     if not subcategory:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subcategory not found")
     return subcategory
