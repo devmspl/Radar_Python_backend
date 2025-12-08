@@ -58,19 +58,32 @@ class CRUDSubCategory:
         if existing:
             raise ValueError(f"Subcategory '{subcategory_data['name']}' already exists in this category")
         
+        # Create subcategory with explicit field assignment
+        # Make sure we're using the correct types
         subcategory = SubCategory(
-            id=str(uuid.uuid4()),
+            id=str(uuid.uuid4()),  # This should be String in your model
             uuid=str(uuid.uuid4()),
             name=subcategory_data["name"],
-            description=subcategory_data.get("description"),
-            category_id=subcategory_data["category_id"],
+            description=subcategory_data.get("description", ""),  # Provide default
+            category_id=str(subcategory_data["category_id"]),  # Ensure it's string
             is_active=subcategory_data.get("is_active", True)
         )
         
-        db.add(subcategory)
-        db.commit()
-        db.refresh(subcategory)
-        return subcategory
+        # Debug: Print what we're trying to insert
+        print(f"Inserting subcategory: {subcategory.__dict__}")
+        
+        try:
+            db.add(subcategory)
+            db.commit()
+            db.refresh(subcategory)
+            return subcategory
+        except Exception as e:
+            db.rollback()
+            # Get more details about the error
+            print(f"Database error: {e}")
+            raise ValueError(f"Database error: {str(e)}")
+    
+
     
     def update(self, db: Session, subcategory_id: str, update_data: Dict[str, Any]) -> Optional[SubCategory]:
         subcategory = self.get_by_id(db, subcategory_id)
@@ -170,13 +183,42 @@ def create_subcategory(
     """Create a new subcategory"""
     try:
         subcategory_data = subcategory_in.model_dump()
-        subcategory = crud_subcategory.create(db, subcategory_data)  # Now matches variable name
+        
+        # Convert category_id to string if it's not already
+        if 'category_id' in subcategory_data:
+            subcategory_data['category_id'] = str(subcategory_data['category_id'])
+        
+        subcategory = crud_subcategory.create(db, subcategory_data)
         return subcategory
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
+        # Add more detailed logging
+        print(f"Unexpected error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Internal server error: {str(e)}"
+        )
+@router.get("/debug/schema")
+def debug_schema(db: Session = Depends(get_db)):
+    """Debug endpoint to check table schema"""
+    from sqlalchemy import inspect
+    
+    inspector = inspect(db.get_bind())
+    columns = inspector.get_columns('subcategories')
+    
+    schema_info = []
+    for column in columns:
+        schema_info.append({
+            'name': column['name'],
+            'type': str(column['type']),
+            'nullable': column['nullable'],
+            'default': column.get('default'),
+            'autoincrement': column.get('autoincrement', False)
+        })
+    
+    return {"schema": schema_info}
+    
 @router.post("/bulk", response_model=dict, status_code=status.HTTP_201_CREATED)
 def create_bulk_subcategories(
     bulk_data: BulkSubCategoryCreate,
