@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import List, Optional
 
 
@@ -48,31 +49,105 @@ def create_category(
     
     return db_category
 
-@router.get("/categories", response_model=List[schemas.CategoryResponse])
+@router.get("/categories", response_model=schemas.CategoryListResponse)
 def get_categories(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db),
-    # admin_user: models.User = Depends(get_current_admin)
-):
-    categories = db.query(models.Category).offset(skip).limit(limit).all()
-    return categories
-
-@router.get("/categories/{category_id}", response_model=schemas.CategoryResponse)
-def get_category(
-    category_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    search: Optional[str] = None,
+    include_inactive: bool = False,
+    sort_by: Optional[str] = Query(None, description="Sort by field: name, created_at, etc."),
+    sort_order: str = Query("asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
     admin_user: models.User = Depends(get_current_admin)
 ):
-    category = db.query(models.Category).filter(models.Category.id == category_id).first()
-    
-    if not category:
+    """Get all categories with filtering, searching, and pagination options"""
+    try:
+        from sqlalchemy import or_, func
+        
+        # Base query for categories
+        query = db.query(models.Category)
+        
+        # Filter by active status if needed
+        if not include_inactive:
+            query = query.filter(models.Category.is_active == True)
+        
+        # Search functionality
+        if search:
+            search_term = f"%{search}%"
+            query = query.filter(
+                or_(
+                    models.Category.name.ilike(search_term),
+                    models.Category.description.ilike(search_term),
+                    models.Category.note.ilike(search_term),
+                    models.Category.admin_note.ilike(search_term)
+                )
+            )
+        
+        # Sorting
+        if sort_by:
+            if sort_by == "name":
+                sort_field = models.Category.name
+            elif sort_by == "created_at":
+                sort_field = models.Category.created_at
+            elif sort_by == "updated_at":
+                sort_field = models.Category.updated_at
+            else:
+                sort_field = models.Category.created_at
+            
+            if sort_order.lower() == "desc":
+                query = query.order_by(sort_field.desc())
+            else:
+                query = query.order_by(sort_field.asc())
+        else:
+            # Default sorting by created_at descending
+            query = query.order_by(models.Category.created_at.desc())
+        
+        # Get total count before pagination
+        total = query.count()
+        
+        # Apply pagination
+        categories = query.offset(skip).limit(limit).all()
+        
+        # Calculate if there are more results
+        has_more = skip + limit < total
+        
+        # Calculate page number
+        page = (skip // limit) + 1 if limit > 0 else 1
+        
+        # Calculate total subcategories across all returned categories
+        total_subcategories = 0
+        if categories:
+            # Get all category IDs
+            category_ids = [category.id for category in categories]
+            
+            # Query total subcategories for these categories
+            # Assuming you have a SubCategory model with category_id field
+            # and is_active field for filtering
+            from models import SubCategory
+            
+            subcategory_query = db.query(func.count(SubCategory.id)).filter(
+                SubCategory.category_id.in_(category_ids)
+            )
+            
+            if not include_inactive:
+                subcategory_query = subcategory_query.filter(SubCategory.is_active == True)
+            
+            total_subcategories = subcategory_query.scalar() or 0
+        
+        return {
+            "categories": categories,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": has_more,
+            "total_subcategories": total_subcategories  # This is now included
+        }
+        
+    except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Category not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching categories: {str(e)}"
         )
-    
-    return category
 
 @router.get("/categories/uuid/{category_uuid}", response_model=schemas.CategoryResponse)
 def get_category_by_uuid(
