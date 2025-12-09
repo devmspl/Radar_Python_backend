@@ -7,7 +7,7 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from database import get_db
-from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory
+from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory,ScrapeJob
 from openai import OpenAI, APIError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
@@ -846,8 +846,42 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
         logger.error(f"Error creating/updating AI-generated feed for transcript {transcript.transcript_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create feed for transcript: {str(e)}")
 
+def get_website_favicon(website_url: str) -> str:
+    """Get favicon URL for a website."""
+    try:
+        # Clean and format the URL
+        if not website_url.startswith(('http://', 'https://')):
+            website_url = f"https://{website_url}"
+        
+        # Extract domain
+        from urllib.parse import urlparse
+        parsed_url = urlparse(website_url)
+        domain = parsed_url.netloc
+        
+        if not domain:
+            # If parsing failed, try to extract domain manually
+            domain = website_url.replace('https://', '').replace('http://', '').split('/')[0]
+        
+        # Common favicon locations
+        favicon_urls = [
+            f"https://{domain}/favicon.ico",
+            f"https://{domain}/favicon.png",
+            f"https://www.{domain}/favicon.ico",
+            f"https://www.{domain}/favicon.png",
+            f"https://{domain}/apple-touch-icon.png",
+            f"https://www.{domain}/apple-touch-icon.png"
+        ]
+        
+        # Try to check if favicon exists (optional)
+        # For simplicity, we'll just return the most likely URL
+        return favicon_urls[0]
+        
+    except Exception:
+        # Fallback to a generic favicon
+        return "https://www.google.com/s2/favicons?domain=" + (website_url.split('//')[-1].split('/')[0] if '//' in website_url else website_url)
+
 def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
-    """Extract proper metadata for feeds including YouTube channel names and correct URLs."""
+    """Extract proper metadata for feeds including YouTube channel names, correct URLs, and favicons."""
     if feed.source_type == "youtube":
         # Get the transcript to access YouTube-specific data
         transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
@@ -869,6 +903,9 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
             # Construct proper YouTube URL
             source_url = f"https://www.youtube.com/watch?v={video_id}"
             
+            # Use YouTube favicon
+            favicon = "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico"
+            
             return {
                 "title": feed.title,
                 "original_title": original_title,
@@ -878,6 +915,7 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "channel_name": channel_name,
                 "channel_id": channel_info.get("channel_id"),
                 "video_id": video_id,
+                "favicon": favicon,
                 "channel_info": channel_info
             }
         else:
@@ -895,6 +933,7 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "channel_name": channel_name,
                 "channel_id": channel_info.get("channel_id"),
                 "video_id": video_id,
+                "favicon": "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico",
                 "channel_info": channel_info
             }
     
@@ -904,6 +943,9 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
             website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
             author = getattr(blog, 'author', 'Admin') or 'Admin'
             
+            # Get favicon URL
+            favicon = get_website_favicon(blog.website)
+            
             return {
                 "title": feed.title,
                 "original_title": blog.title,
@@ -911,7 +953,8 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "source_url": blog.url,
                 "source_type": "blog",
                 "website_name": website_name,
-                "website": blog.website
+                "website": blog.website,
+                "favicon": favicon
             }
         else:
             # Fallback if blog not found
@@ -922,7 +965,8 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "source_url": "#",
                 "source_type": "blog",
                 "website_name": "Unknown",
-                "website": "Unknown"
+                "website": "Unknown",
+                "favicon": get_website_favicon("Unknown")
             }
 
 def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True):
@@ -1478,77 +1522,297 @@ def create_feeds_from_youtube(
         "warning": "If OpenAI API fails during processing, feeds will be created with minimal content"
     }
 
-
-@router.get("/source/{website}/categorized", response_model=dict)
-def get_categorized_feeds_by_source(
-    website: str,
-    response: Response, 
-    page: int = 1, 
+@router.get("/feeds/job-id", response_model=dict)
+def get_feeds_by_job_id(
+    job_id: Optional[str] = None,
+    website_uuid: Optional[str] = None,
+    page: int = 1,
     limit: int = 20,
-    exclude_uncategorized: bool = True,
+    content_type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get categorized feeds from a specific source URL/website."""
-    # First, verify the website exists and get its blogs
-    blogs = db.query(Blog).filter(Blog.website == website).all()
-    if not blogs:
-        raise HTTPException(status_code=404, detail=f"No blogs found for website: {website}")
+    """
+    Get feeds by transcript job ID OR website UUID.
     
-    # Get blog IDs for this website
-    blog_ids = [blog.id for blog in blogs]
+    For YouTube: Uses job_id to find transcripts, then feeds via transcript_id
+    For Blogs: Uses website_uuid to find blogs, then feeds via blog_id
+    """
     
-    # Query feeds for these blog IDs with category filters
-    query = db.query(Feed).options(joinedload(Feed.blog)).filter(Feed.blog_id.in_(blog_ids))
+    if not job_id and not website_uuid:
+        raise HTTPException(
+            status_code=400,
+            detail="Either job_id or website_uuid must be provided"
+        )
     
-    # Filter feeds that have categories
-    query = query.filter(Feed.categories.isnot(None))
+    if job_id and website_uuid:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide only one of job_id or website_uuid, not both"
+        )
     
-    if exclude_uncategorized:
-        # Exclude feeds that contain "Uncategorized" in their categories
-        query = query.filter(~Feed.categories.contains(["Uncategorized"]))
-    
-    # Order by creation date (newest first)
-    query = query.order_by(Feed.created_at.desc())
-    
-    # Get total count and paginated results
-    total = query.count()
-    feeds = query.offset((page - 1) * limit).limit(limit).all()
-
-    # Format the response
-    items = []
-    for f in feeds:
-        # Additional validation to ensure meaningful categories
-        if f.categories and (not exclude_uncategorized or "Uncategorized" not in f.categories):
-            # Get proper metadata
-            meta = get_feed_metadata(f, db)
+    try:
+        # Base query for feeds
+        query = db.query(Feed).options(
+            joinedload(Feed.blog),
+            joinedload(Feed.slides),
+            joinedload(Feed.category),
+            joinedload(Feed.subcategory)
+        )
+        
+        source_info = {}
+        source_type = None
+        
+        if job_id:
+            # Handle YouTube transcript job ID
+            logger.info(f"Searching for YouTube feeds by job ID: {job_id}")
             
-            items.append({
-                "id": f.id,
-                "blog_id": f.blog_id,
-                "title": f.title,
-                "categories": f.categories,
-                "status": f.status,
-                "slides_count": len(f.slides),
-                "meta": meta,
-                "created_at": f.created_at.isoformat() if f.created_at else None,
-                "updated_at": f.updated_at.isoformat() if f.updated_at else None,
-                "ai_generated": hasattr(f, 'ai_generated_content') and f.ai_generated_content is not None,
-                "images_generated": False
-            })
-
-    has_more = (page * limit) < total
-    response.headers["X-Total-Count"] = str(total)
-    response.headers["X-Page"] = str(page)
-    response.headers["X-Limit"] = str(limit)
-
-    return {
-        "website": website,
-        "items": items, 
-        "page": page, 
-        "limit": limit, 
-        "total": total, 
-        "has_more": has_more,
-        "filters": {
-            "exclude_uncategorized": exclude_uncategorized
+            # First, find the transcript job
+            transcript_job = db.query(TranscriptJob).filter(
+                TranscriptJob.job_id == job_id
+            ).first()
+            
+            if not transcript_job:
+                # Try finding a single video by video_id if job_id is a video ID
+                video_transcript = db.query(Transcript).filter(
+                    Transcript.video_id == job_id
+                ).first()
+                
+                if video_transcript:
+                    # Query feeds for this specific transcript
+                    query = query.filter(Feed.transcript_id == video_transcript.transcript_id)
+                    source_info = {
+                        "type": "youtube_video",
+                        "identifier": job_id,
+                        "title": video_transcript.title,
+                        "video_id": video_transcript.video_id,
+                        "transcript_id": video_transcript.transcript_id
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No transcript job or video found with ID: {job_id}"
+                    )
+            else:
+                # Get all transcript IDs for this job
+                transcripts = db.query(Transcript).filter(
+                    Transcript.job_id == transcript_job.id
+                ).all()
+                
+                transcript_ids = [t.transcript_id for t in transcripts]
+                
+                if not transcript_ids:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No transcripts found for job: {job_id}"
+                    )
+                
+                # Query feeds for these transcript IDs
+                query = query.filter(Feed.transcript_id.in_(transcript_ids))
+                source_info = {
+                    "type": "youtube_job",
+                    "identifier": job_id,
+                    "job_id": transcript_job.job_id,
+                    "url": transcript_job.url,
+                    "content_type": transcript_job.type.value if transcript_job.type else "video",
+                    "content_name": transcript_job.content_name,
+                    "description": transcript_job.description,
+                    "total_items": transcript_job.total_items,
+                    "processed_items": transcript_job.processed_items,
+                    "transcript_count": len(transcripts)
+                }
+            
+            # Filter by source type
+            query = query.filter(Feed.source_type == "youtube")
+            source_type = "youtube"
+        
+        elif website_uuid:
+            # Handle website UUID - could be website, scrape job UID, or source name
+            logger.info(f"Searching for blog feeds by identifier: {website_uuid}")
+            
+            # FIRST: Check if this is a scrape job UID
+            scrape_job = db.query(ScrapeJob).filter(
+                ScrapeJob.uid == website_uuid
+            ).first()
+            
+            if scrape_job:
+                # This is a scrape job UID
+                logger.info(f"Identifier {website_uuid} is a scrape job UID")
+                
+                # Find blogs for this website from the scrape job
+                blogs = db.query(Blog).filter(
+                    Blog.website == scrape_job.website
+                ).all()
+                
+                blog_ids = [blog.id for blog in blogs]
+                
+                if not blog_ids:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No blogs found for scrape job website: {scrape_job.website}"
+                    )
+                
+                # Query feeds for these blog IDs
+                query = query.filter(Feed.blog_id.in_(blog_ids))
+                source_info = {
+                    "type": "scrape_job",
+                    "identifier": website_uuid,
+                    "website": scrape_job.website,
+                    "url": scrape_job.url,
+                    "status": scrape_job.status,
+                    "items_processed": getattr(scrape_job, 'items_processed', None),
+                    "created_at": scrape_job.created_at.isoformat() if scrape_job.created_at else None,
+                    "blog_count": len(blogs)
+                }
+            
+            else:
+                # Not a scrape job UID, check if it's a website URL/name
+                # Look for blogs with this website
+                blogs = db.query(Blog).filter(
+                    Blog.website.ilike(f"%{website_uuid}%")
+                ).all()
+                
+                if blogs:
+                    # Found blogs by website
+                    blog_ids = [blog.id for blog in blogs]
+                    query = query.filter(Feed.blog_id.in_(blog_ids))
+                    source_info = {
+                        "type": "blog_website",
+                        "identifier": website_uuid,
+                        "website": blogs[0].website if blogs else website_uuid,
+                        "blog_count": len(blogs)
+                    }
+                
+                else:
+                    # Check if it's a Source name
+                    source = db.query(Source).filter(
+                        or_(
+                            Source.website.ilike(f"%{website_uuid}%"),
+                            Source.name.ilike(f"%{website_uuid}%")
+                        )
+                    ).first()
+                    
+                    if source:
+                        # Get blogs for this source website
+                        blogs = db.query(Blog).filter(
+                            Blog.website == source.website
+                        ).all()
+                        
+                        blog_ids = [blog.id for blog in blogs]
+                        
+                        if not blog_ids:
+                            raise HTTPException(
+                                status_code=404,
+                                detail=f"No blogs found for source: {source.website}"
+                            )
+                        
+                        query = query.filter(Feed.blog_id.in_(blog_ids))
+                        source_info = {
+                            "type": "source",
+                            "identifier": website_uuid,
+                            "website": source.website,
+                            "source_name": source.name,
+                            "blog_count": len(blogs)
+                        }
+                    
+                    else:
+                        # Nothing found
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"No website, source, or scrape job found with identifier: {website_uuid}"
+                        )
+            
+            # Filter by source type
+            query = query.filter(Feed.source_type == "blog")
+            source_type = "blog"
+        
+        # Apply content type filter if provided
+        if content_type:
+            try:
+                content_type_enum = FilterType(content_type)
+                query = query.filter(Feed.content_type == content_type_enum)
+            except ValueError:
+                logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        # Apply ordering and pagination
+        query = query.order_by(Feed.created_at.desc())
+        total = query.count()
+        feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format the response
+        feeds_data = []
+        for feed in feeds:
+            # Check if published
+            is_published = db.query(PublishedFeed).filter(
+                PublishedFeed.feed_id == feed.id,
+                PublishedFeed.is_active == True
+            ).first() is not None
+            
+            # Get proper metadata
+            meta = get_feed_metadata(feed, db)
+            
+            # Get category and subcategory names
+            category_name = feed.category.name if feed.category else None
+            subcategory_name = feed.subcategory.name if feed.subcategory else None
+            
+            # Format content type
+            feed_content_type = feed.content_type.value if feed.content_type else FilterType.BLOG.value
+            
+            # Get source-specific details
+            feed_details = {
+                "id": feed.id,
+                "title": feed.title,
+                "categories": feed.categories or [],
+                "content_type": feed_content_type,
+                "skills": getattr(feed, 'skills', []) or [],
+                "tools": getattr(feed, 'tools', []) or [],
+                "roles": getattr(feed, 'roles', []) or [],
+                "status": feed.status,
+                "source_type": feed.source_type or "blog",
+                "is_published": is_published,
+                "slides_count": len(feed.slides) if feed.slides else 0,
+                "created_at": feed.created_at.isoformat() if feed.created_at else None,
+                "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+                "ai_generated": feed.ai_generated_content is not None,
+                # Category info
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+                "meta": meta
+            }
+            
+            # Add source-specific IDs
+            if feed.source_type == "blog":
+                feed_details["blog_id"] = feed.blog_id
+                if feed.blog:
+                    feed_details["website"] = feed.blog.website
+            elif feed.source_type == "youtube":
+                feed_details["transcript_id"] = feed.transcript_id
+                # Try to get video_id from transcript
+                if feed.transcript_id:
+                    transcript = db.query(Transcript).filter(
+                        Transcript.transcript_id == feed.transcript_id
+                    ).first()
+                    if transcript:
+                        feed_details["video_id"] = transcript.video_id
+            
+            feeds_data.append(feed_details)
+        
+        return {
+            "source": source_info,
+            "feeds": feeds_data,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": (page * limit) < total
         }
-    }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching feeds by source: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch feeds: {str(e)}"
+        )

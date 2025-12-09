@@ -115,9 +115,6 @@ class CRUDSubCategory:
             
             if existing:
                 raise ValueError(f"Subcategory with name '{update_data.get('name', subcategory.name)}' already exists in the new category")
-            
-            # Update with integer value
-            update_data["category_id"] = new_category_id
         
         # If changing name, check for duplicates in same category
         if "name" in update_data and update_data["name"] != subcategory.name:

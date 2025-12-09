@@ -233,6 +233,8 @@ class JSONEncodedList(TypeDecorator):
         if value is None:
             return None
         return json.loads(value)
+
+
 class Feed(Base):
     __tablename__ = "feeds"
     
@@ -240,12 +242,10 @@ class Feed(Base):
     blog_id = Column(Integer, ForeignKey("blogs.id"), nullable=True)
     title = Column(String(500), nullable=True)
     categories = Column(JSONEncodedList, default=list)
-    # ADD THESE NEW FIELDS:
-    content_type = Column(Enum(FilterType), default=FilterType.BLOG)  # Webinar, Blog, Podcast, Video
-    skills = Column(JSONEncodedList, default=list)      # List of related skills
-    tools = Column(JSONEncodedList, default=list)       # List of related tools  
-    roles = Column(JSONEncodedList, default=list)       # List of related roles
-    # EXISTING FIELDS:
+    content_type = Column(Enum(FilterType), default=FilterType.BLOG)
+    skills = Column(JSONEncodedList, default=list)
+    tools = Column(JSONEncodedList, default=list)
+    roles = Column(JSONEncodedList, default=list)
     status = Column(String(50), default="processing")
     ai_generated_content = Column(JSON, nullable=True)
     image_generation_enabled = Column(Boolean, default=True)
@@ -258,12 +258,11 @@ class Feed(Base):
     published_feed = relationship("PublishedFeed", back_populates="feed", uselist=False, overlaps="published_feed")
     quizzes = relationship("Quiz", back_populates="feed")
     bookmarks = relationship("Bookmark", back_populates="feed")
-    category_id = Column(String(36), ForeignKey('categories.id'), nullable=True)
-    subcategory_id = Column(String(36), ForeignKey('subcategories.id'), nullable=True)
+    category_id = Column(Integer, ForeignKey('categories.id'), nullable=True)  # Changed to Integer
+    subcategory_id = Column(Integer, ForeignKey('subcategories.id'), nullable=True)  # Changed to Integer
     # Relationships
     category = relationship("Category", back_populates="feeds")
     subcategory = relationship("SubCategory", back_populates="feeds")
-
 
 class Slide(Base):
     __tablename__ = "slides"
@@ -348,13 +347,6 @@ class UserQuizScore(Base):
     # Relationships
     user = relationship("User", back_populates="quiz_scores")
     quiz = relationship("Quiz", back_populates="user_scores")
-
-# Add to existing models:
-# QuizCategory.quizzes = relationship("Quiz", back_populates="category")
-# Feed.quizzes = relationship("Quiz", back_populates="feed")
-# User.quiz_scores = relationship("UserQuizScore", back_populates="user")
-
-# Add to your models.py
 
 class Topic(Base):
     __tablename__ = "topics"
@@ -483,17 +475,17 @@ class UserRole(Base):
 class SubCategory(Base):
     __tablename__ = "subcategories"
     
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(Integer, primary_key=True, index=True)  # Changed to Integer
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    category_id = Column(String(36), ForeignKey('categories.id'), nullable=False)
-    is_active = Column(Boolean, default=True)  # Make sure this exists
+    category_id = Column(Integer, ForeignKey('categories.id'), nullable=False)  # Changed to Integer
+    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    uuid = Column(String(36), default=lambda: str(uuid.uuid4()), unique=True)  # Make sure this exists
+    uuid = Column(String(36), default=lambda: str(uuid.uuid4()), unique=True)  # Optional: Keep UUID for external reference
     
     # Relationship back to category
     category = relationship("Category", back_populates="subcategories")
     
-    # If you want subcategories to have feeds relationship
+    # Relationship to feeds
     feeds = relationship("Feed", back_populates="subcategory")
