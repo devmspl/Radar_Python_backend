@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 # Update with your database URL
-DATABASE_URL = "sqlite:///database.db"
+DATABASE_URL = "sqlite:///test.db"
 
 def get_subcategory_mapping():
     """Return comprehensive subcategory mapping for ALL categories"""
