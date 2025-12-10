@@ -26,6 +26,7 @@ from Subcategory_router import router as subcategory_router
 import traceback
 import sys
 import logging
+from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ async def custom_swagger_ui_html():
             "persistAuthorization": True,    # Keep authorization between refreshes
         }
     )
-
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 @app.get("/openapi.json", include_in_schema=False)
 async def get_open_api_endpoint():
     openapi_schema = get_openapi(
@@ -93,15 +94,6 @@ async def get_open_api_endpoint():
         ]
 
     return openapi_schema
-
-# Include routers with explicit tags
-# app.include_router(admin_router)    
-# app.include_router(youtube_router)
-# app.include_router(scrapping_router)  
-# app.include_router(feed_router)
-# app.include_router(publish_router)
-# app.include_router(quiz_router)     
-      # tags=["Authentication"]
 
 # CORS middleware
 app.add_middleware(
@@ -576,175 +568,177 @@ async def admin_delete_user(
 
     return {"message": f"User with ID {user_id} has been deleted successfully"}
 
+
+
 @auth_router.put("/users/me/profile", response_model=schemas.UserResponse)
 async def update_user_profile(
-    background_tasks: BackgroundTasks,
     full_name: Optional[str] = Form(None),
     last_name: Optional[str] = Form(None),
-    current_password: Optional[str] = Form(None),
-    new_password: Optional[str] = Form(None),
+    bio: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    linkedin_url: Optional[str] = Form(None),
+    github_url: Optional[str] = Form(None),
+    portfolio_url: Optional[str] = Form(None),
     domains_of_interest: Optional[str] = Form(None),  # JSON string of category IDs
     skills_tools: Optional[str] = Form(None),  # JSON string of skill IDs
     interested_roles: Optional[str] = Form(None),  # JSON string of role IDs
-    profile_photo: Optional[UploadFile] = File(None),
+    years_of_experience: Optional[int] = Form(None),
+    current_company: Optional[str] = Form(None),
+    current_role: Optional[str] = Form(None),
+    highest_education: Optional[str] = Form(None),
+    university: Optional[str] = Form(None),
+    graduation_year: Optional[int] = Form(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_user)
 ):
     """
-    Update user profile with onboarding data
+    Update user profile with all fields
     
-    This endpoint allows updating:
-    - Basic user info (full_name, last_name)
-    - Password (requires current password)
-    - Onboarding data (domains, skills, roles)
-    - Profile photo
+    - **full_name**: User's first name
+    - **last_name**: User's last name
+    - **bio**: User biography
+    - **location**: User's location
+    - **linkedin_url**: LinkedIn profile URL
+    - **github_url**: GitHub profile URL
+    - **portfolio_url**: Portfolio website URL
+    - **domains_of_interest**: JSON array of category IDs (e.g., "[1, 2, 3]")
+    - **skills_tools**: JSON array of skill/tool IDs (e.g., "[4, 5, 6]")
+    - **interested_roles**: JSON array of role IDs (e.g., "[7, 8, 9]")
+    - **years_of_experience**: Years of professional experience
+    - **current_company**: Current company name
+    - **current_role**: Current job role
+    - **highest_education**: Highest education level
+    - **university**: University name
+    - **graduation_year**: Year of graduation
     
-    All fields are optional. Only provided fields will be updated.
+    Returns: Updated user object with onboarding data
     """
     try:
-        # Start a transaction
-        db.begin()
-        
-        # 1. Update basic user info if provided
+        # Update basic user information
         if full_name is not None:
             current_user.full_name = full_name
         if last_name is not None:
             current_user.last_name = last_name
+        if bio is not None:
+            current_user.bio = bio
+        if location is not None:
+            current_user.location = location
+        if linkedin_url is not None:
+            current_user.linkedin_url = linkedin_url
+        if github_url is not None:
+            current_user.github_url = github_url
+        if portfolio_url is not None:
+            current_user.portfolio_url = portfolio_url
         
-        # 2. Handle password change if requested
-        if current_password and new_password:
-            # Verify current password
-            if not utils.verify_password(current_password, current_user.hashed_password):
+        # Parse JSON strings to lists
+        domains_list = None
+        if domains_of_interest:
+            try:
+                domains_list = json.loads(domains_of_interest)
+                if not isinstance(domains_list, list):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="domains_of_interest must be a JSON array"
+                    )
+                # Validate category IDs exist
+                for cat_id in domains_list:
+                    category = db.query(models.Category).filter(models.Category.id == cat_id).first()
+                    if not category:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Category ID {cat_id} not found"
+                        )
+            except json.JSONDecodeError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Current password is incorrect"
+                    detail="Invalid JSON format for domains_of_interest"
                 )
-            
-            # Update to new password
-            current_user.hashed_password = utils.get_password_hash(new_password)
-            
-            # Send password change notification email
-            email_body = """
-            <h2>Password Changed Successfully</h2>
-            <p>Your password has been updated successfully.</p>
-            <p>If you did not make this change, please contact support immediately.</p>
-            """
-            
-            background_tasks.add_task(
-                utils.send_email,
-                current_user.email,
-                "Password Changed",
-                email_body
-            )
         
-        # 3. Handle profile photo upload if provided
-        if profile_photo:
-            new_photo_path = await handle_profile_photo_upload(
-                profile_photo, 
-                current_user.id, 
-                current_user.profile_photo
-            )
-            current_user.profile_photo = new_photo_path
-        
-        # 4. Handle onboarding data updates
-        if any([domains_of_interest, skills_tools, interested_roles]):
-            # Get or create onboarding data for user
-            onboarding_data = db.query(models.OnboardingData).filter(
-                models.OnboardingData.user_id == current_user.id
-            ).first()
-            
-            if not onboarding_data:
-                onboarding_data = models.OnboardingData(
-                    user_id=current_user.id,
-                    is_completed=False  # Set to True only when user explicitly completes onboarding
+        skills_list = None
+        if skills_tools:
+            try:
+                skills_list = json.loads(skills_tools)
+                if not isinstance(skills_list, list):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="skills_tools must be a JSON array"
+                    )
+                # Validate skill IDs exist
+                for skill_id in skills_list:
+                    skill = db.query(models.SkillTool).filter(models.SkillTool.id == skill_id).first()
+                    if not skill:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Skill/Tool ID {skill_id} not found"
+                        )
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid JSON format for skills_tools"
                 )
-                db.add(onboarding_data)
-            
-            # Parse and update domains of interest
-            if domains_of_interest is not None:
-                try:
-                    domain_ids = json.loads(domains_of_interest)
-                    if isinstance(domain_ids, list):
-                        # Validate category IDs exist
-                        valid_categories = db.query(models.Category.id).filter(
-                            models.Category.id.in_(domain_ids)
-                        ).all()
-                        valid_ids = [cat[0] for cat in valid_categories]
-                        onboarding_data.domains_of_interest = valid_ids
-                except json.JSONDecodeError:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid JSON format for domains_of_interest"
-                    )
-            
-            # Parse and update skills/tools
-            if skills_tools is not None:
-                try:
-                    skill_ids = json.loads(skills_tools)
-                    if isinstance(skill_ids, list):
-                        # Validate skill IDs exist
-                        valid_skills = db.query(models.SkillTool.id).filter(
-                            models.SkillTool.id.in_(skill_ids)
-                        ).all()
-                        valid_ids = [skill[0] for skill in valid_skills]
-                        onboarding_data.skills_tools = valid_ids
-                except json.JSONDecodeError:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid JSON format for skills_tools"
-                    )
-            
-            # Parse and update interested roles
-            if interested_roles is not None:
-                try:
-                    role_ids = json.loads(interested_roles)
-                    if isinstance(role_ids, list):
-                        # Validate role IDs exist
-                        valid_roles = db.query(models.Role.id).filter(
-                            models.Role.id.in_(role_ids)
-                        ).all()
-                        valid_ids = [role[0] for role in valid_roles]
-                        onboarding_data.interested_roles = valid_ids
-                except json.JSONDecodeError:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid JSON format for interested_roles"
-                    )
-            
-            # Mark onboarding as completed if all required fields are present
-            if (onboarding_data.domains_of_interest and 
-                onboarding_data.skills_tools and 
-                onboarding_data.interested_roles):
-                onboarding_data.is_completed = True
         
-        # 5. Commit changes
+        roles_list = None
+        if interested_roles:
+            try:
+                roles_list = json.loads(interested_roles)
+                if not isinstance(roles_list, list):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="interested_roles must be a JSON array"
+                    )
+                # Validate role IDs exist
+                for role_id in roles_list:
+                    role = db.query(models.Role).filter(models.Role.id == role_id).first()
+                    if not role:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Role ID {role_id} not found"
+                        )
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid JSON format for interested_roles"
+                )
+        
+        # Get or create onboarding data - NOTE: Changed from OnboardingData to UserOnboarding
+        onboarding_data = db.query(models.UserOnboarding).filter(
+            models.UserOnboarding.user_id == current_user.id
+        ).first()
+        
+        if not onboarding_data:
+            # Create new onboarding data
+            onboarding_data = models.UserOnboarding(
+                user_id=current_user.id,
+                domains_of_interest=domains_list or [],
+                skills_tools=skills_list or [],
+                interested_roles=roles_list or [],
+                years_experience=str(years_of_experience) if years_of_experience else None,
+                is_completed=True
+            )
+            db.add(onboarding_data)
+        else:
+            # Update existing onboarding data
+            if domains_list is not None:
+                onboarding_data.domains_of_interest = domains_list
+            if skills_list is not None:
+                onboarding_data.skills_tools = skills_list
+            if roles_list is not None:
+                onboarding_data.interested_roles = roles_list
+            if years_of_experience is not None:
+                onboarding_data.years_experience = str(years_of_experience)
+            onboarding_data.is_completed = True
+        
+        # Commit all changes
         db.commit()
         db.refresh(current_user)
+        db.refresh(onboarding_data)
         
-        # 6. Send profile update notification email
-        email_body = f"""
-        <h2>Profile Updated Successfully</h2>
-        <p>Your profile has been updated successfully.</p>
-        <p>Changes made:</p>
-        <ul>
-            {"<li>Name updated</li>" if full_name or last_name else ""}
-            {"<li>Password changed</li>" if current_password and new_password else ""}
-            {"<li>Profile photo updated</li>" if profile_photo else ""}
-            {"<li>Onboarding preferences updated</li>" if domains_of_interest or skills_tools or interested_roles else ""}
-        </ul>
-        """
-        
-        background_tasks.add_task(
-            utils.send_email,
-            current_user.email,
-            "Profile Updated",
-            email_body
-        )
+        # Update the user's onboarding_data relationship
+        current_user.onboarding_data = onboarding_data
         
         return current_user
         
     except HTTPException:
-        db.rollback()
         raise
     except Exception as e:
         db.rollback()
@@ -755,20 +749,7 @@ async def update_user_profile(
         )
 
 
-# @auth_router.get("/users/me/profile", response_model=schemas.UserResponse)
-# async def get_user_profile(
-#     current_user: models.User = Depends(dependencies.get_current_user)
-# ):
-#     """
-#     Get current user's profile with photo URL
-    
-#     - Returns: User profile data
-#     """
-#     return current_user
 
-from fastapi.staticfiles import StaticFiles
-
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.include_router(auth_router)
 app.include_router(onboarding_router) 
 app.include_router(admin_router)
