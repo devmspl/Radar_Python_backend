@@ -5,7 +5,8 @@ from sqlalchemy import or_, func, String, cast
 from typing import List, Optional, Dict, Any
 import logging
 from datetime import datetime
-
+import json  # Add this if not already present
+from models import TranscriptJob, Transcript
 from database import get_db
 from models import (
     Feed, Blog, Transcript, Topic, Source, Concept, Domain, 
@@ -86,6 +87,109 @@ def format_feed_for_search(feed: Feed, db: Session, user_id: Optional[int] = Non
         "created_at": feed.created_at.isoformat() if feed.created_at else None,
         "ai_generated": bool(feed.ai_generated_content)
     }
+
+def auto_create_lists_from_youtube(db: Session):
+    """Auto-create ContentList entries from existing YouTube feeds."""
+    logger.info("Auto-creating lists from YouTube feeds...")
+    
+    # Instead of checking TranscriptJob, check existing feeds
+    youtube_feeds = db.query(Feed).filter(
+        Feed.source_type == "youtube",
+        Feed.status == "ready"
+    ).all()
+    
+    created_count = 0
+    
+    # Group by playlist
+    playlist_groups = {}
+    for feed in youtube_feeds:
+        # Get transcript to find playlist_id
+        if feed.transcript_id:
+            transcript = db.query(Transcript).filter(
+                Transcript.transcript_id == feed.transcript_id
+            ).first()
+            
+            if transcript and transcript.playlist_id:
+                playlist_id = transcript.playlist_id
+                if playlist_id not in playlist_groups:
+                    playlist_groups[playlist_id] = []
+                playlist_groups[playlist_id].append(feed.id)
+    
+    # Create lists for playlists
+    for playlist_id, feed_ids in playlist_groups.items():
+        if len(feed_ids) >= 2:  # Only create if at least 2 feeds
+            # Check if list already exists
+            existing_list = db.query(ContentList).filter(
+                ContentList.source_type == "youtube",
+                ContentList.source_id == playlist_id
+            ).first()
+            
+            if not existing_list:
+                # Try to get playlist name
+                playlist_name = f"YouTube Playlist {playlist_id}"
+                
+                # Create list
+                new_list = ContentList(
+                    name=playlist_name,
+                    description=f"Auto-generated from YouTube playlist",
+                    source_type="youtube",
+                    source_id=playlist_id,
+                    feed_ids=feed_ids,
+                    is_active=True,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(new_list)
+                created_count += 1
+    
+    # Group by channel
+    channel_groups = {}
+    for feed in youtube_feeds:
+        meta = get_feed_metadata(feed, db)
+        channel_id = meta.get("channel_id")
+        channel_name = meta.get("channel_name")
+        
+        if channel_id and channel_name:
+            if channel_id not in channel_groups:
+                channel_groups[channel_id] = {
+                    "name": f"{channel_name} Videos",
+                    "channel_name": channel_name,
+                    "feeds": []
+                }
+            channel_groups[channel_id]["feeds"].append(feed.id)
+    
+    # Create channel-based lists
+    for channel_id, data in channel_groups.items():
+        if len(data["feeds"]) >= 3:
+            # Check if list exists
+            existing_list = db.query(ContentList).filter(
+                ContentList.source_type == "youtube",
+                ContentList.source_id == f"channel_{channel_id}"
+            ).first()
+            
+            if not existing_list:
+                new_list = ContentList(
+                    name=data["name"],
+                    description=f"Videos from {data['channel_name']} YouTube channel",
+                    source_type="youtube",
+                    source_id=f"channel_{channel_id}",
+                    feed_ids=data["feeds"],
+                    is_active=True,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(new_list)
+                created_count += 1
+    
+    try:
+        db.commit()
+        logger.info(f"Auto-created {created_count} lists from YouTube feeds")
+        return created_count
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error auto-creating lists: {str(e)}")
+        return 0
+
 
 # ------------------ Tab 1: Content Search ------------------
 
@@ -199,13 +303,51 @@ def search_content(
     }
 
 # ------------------ Tab 2: Lists Search ------------------
+@router.get("/debug/youtube-playlists")
+def debug_youtube_playlists(db: Session = Depends(get_db)):
+    """Debug endpoint to check YouTube playlist jobs."""
+    
+    playlist_jobs = db.query(TranscriptJob).filter(
+        TranscriptJob.type == "playlist"
+    ).all()
+    
+    job_info = []
+    for job in playlist_jobs:
+        transcript_count = db.query(Transcript).filter(
+            Transcript.job_id == job.id
+        ).count()
+        
+        # Parse playlists
+        playlists = []
+        if job.playlists:
+            try:
+                playlists = json.loads(job.playlists)
+            except json.JSONDecodeError:
+                pass
+        
+        job_info.append({
+            "job_id": job.job_id,
+            "url": job.url,
+            "content_name": job.content_name,
+            "status": job.status.value,
+            "transcript_count": transcript_count,
+            "playlists": playlists,
+            "created_at": job.created_at
+        })
+    
+    return {
+        "total_playlist_jobs": len(playlist_jobs),
+        "completed_jobs": len([j for j in playlist_jobs if j.status.value == "completed"]),
+        "jobs": job_info
+    }
+
 
 @router.get("/lists", response_model=Dict[str, Any])
 def search_lists(
     query: Optional[str] = Query(None, description="Search query"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
-    source_type: Optional[str] = Query(None, description="Filter by source type"),
+    source_type: Optional[str] = Query(None, description="Filter by source type: youtube, blog, or manual"),
     user_id: Optional[int] = Query(None, description="User ID"),
     db: Session = Depends(get_db)
 ):
@@ -213,7 +355,16 @@ def search_lists(
     Search content lists (playlists or curated collections).
     
     This is for Tab 2: Lists
+    Auto-generated from YouTube playlists or created manually
     """
+    # Try to auto-create lists from existing YouTube playlists if no lists exist
+    all_lists = db.query(ContentList).count()
+    if all_lists == 0:
+        # Auto-create lists from YouTube playlists in transcripts
+        logger.info("No lists found, auto-creating from YouTube playlists...")
+        auto_create_lists_from_youtube(db)  # This will now work with the import
+    
+    # Base query
     query_obj = db.query(ContentList).filter(ContentList.is_active == True)
     
     if query:
@@ -221,7 +372,8 @@ def search_lists(
         query_obj = query_obj.filter(
             or_(
                 ContentList.name.ilike(search_term),
-                ContentList.description.ilike(search_term)
+                ContentList.description.ilike(search_term),
+                ContentList.source_id.ilike(search_term)
             )
         )
     
@@ -231,21 +383,86 @@ def search_lists(
     # Count and paginate
     total = query_obj.count()
     query_obj = query_obj.order_by(ContentList.created_at.desc())
-    lists = query_obj.offset((page - 1) * limit).limit(limit).all()
+    content_lists = query_obj.offset((page - 1) * limit).limit(limit).all()
     
     # Format results
     items = []
-    for content_list in lists:
-        # Get feed details for this list
+    for content_list in content_lists:
+        # Get feed details
         feed_details = []
-        if content_list.feed_ids:
-            feeds = db.query(Feed).filter(Feed.id.in_(content_list.feed_ids[:3])).all()
-            for feed in feeds:
+        all_feeds = []
+        
+        if content_list.feed_ids and len(content_list.feed_ids) > 0:
+            # Get feeds with their relationships
+            feeds = db.query(Feed).options(
+                joinedload(Feed.blog),
+                joinedload(Feed.slides),
+                joinedload(Feed.category),
+                joinedload(Feed.subcategory)
+            ).filter(
+                Feed.id.in_(content_list.feed_ids),
+                Feed.status == "ready"
+            ).all()
+            
+            all_feeds = feeds
+            
+            # Format sample feeds (first 3)
+            for feed in feeds[:3]:
+                meta = get_feed_metadata(feed, db)
+                
+                # Extract summary
+                summary = ""
+                if feed.ai_generated_content and "summary" in feed.ai_generated_content:
+                    summary = feed.ai_generated_content["summary"]
+                    if len(summary) > 100:
+                        summary = summary[:97] + "..."
+                elif feed.slides and len(feed.slides) > 0:
+                    summary = feed.slides[0].body
+                    if len(summary) > 100:
+                        summary = summary[:97] + "..."
+                
+                # Get source info
+                source_info = {}
+                if feed.source_type == "youtube":
+                    source_info = {
+                        "type": "youtube",
+                        "name": meta.get("channel_name", "YouTube"),
+                        "url": meta.get("source_url", "#")
+                    }
+                elif feed.source_type == "blog" and feed.blog:
+                    source_info = {
+                        "type": "blog",
+                        "name": feed.blog.website,
+                        "url": feed.blog.website
+                    }
+                
                 feed_details.append({
                     "id": feed.id,
                     "title": feed.title,
-                    "content_type": feed.content_type.value if feed.content_type else "Unknown"
+                    "summary": summary,
+                    "content_type": feed.content_type.value if feed.content_type else "Video",
+                    "source_type": feed.source_type,
+                    "source_info": source_info,
+                    "meta": meta
                 })
+        
+        # Extract topics from all feeds
+        all_topics = set()
+        for feed in all_feeds:
+            if feed.categories:
+                for category in feed.categories:
+                    all_topics.add(category)
+        
+        # Get list type based on source
+        list_type = "playlist" if content_list.source_type == "youtube" else "collection"
+        if content_list.source_type == "blog":
+            list_type = "blog_collection"
+        
+        # Get thumbnail from first feed
+        thumbnail_url = None
+        if all_feeds:
+            meta = get_feed_metadata(all_feeds[0], db)
+            thumbnail_url = meta.get("thumbnail_url")
         
         items.append({
             "id": content_list.id,
@@ -253,9 +470,13 @@ def search_lists(
             "description": content_list.description,
             "source_type": content_list.source_type,
             "source_id": content_list.source_id,
+            "list_type": list_type,
             "feed_count": len(content_list.feed_ids) if content_list.feed_ids else 0,
             "sample_feeds": feed_details,
-            "created_at": content_list.created_at.isoformat() if content_list.created_at else None
+            "topics": list(all_topics)[:10],
+            "thumbnail_url": thumbnail_url,
+            "created_at": content_list.created_at.isoformat() if content_list.created_at else None,
+            "updated_at": content_list.updated_at.isoformat() if content_list.updated_at else None
         })
     
     return {
@@ -271,6 +492,32 @@ def search_lists(
         }
     }
 
+@router.get("/debug/lists")
+def debug_lists(
+    db: Session = Depends(get_db)
+):
+    """
+    Debug endpoint to check list data.
+    """
+    lists = db.query(ContentList).all()
+    
+    debug_info = []
+    for clist in lists:
+        debug_info.append({
+            "id": clist.id,
+            "name": clist.name,
+            "description": clist.description,
+            "source_type": clist.source_type,
+            "is_active": clist.is_active,
+            "feed_ids": clist.feed_ids if hasattr(clist, 'feed_ids') else None,
+            "feed_count": len(clist.feed_ids) if clist.feed_ids else 0,
+            "created_at": clist.created_at
+        })
+    
+    return {
+        "total_lists": len(lists),
+        "lists": debug_info
+    }
 # ------------------ Tab 3: Topics Search ------------------
 
 @router.get("/topics", response_model=Dict[str, Any])

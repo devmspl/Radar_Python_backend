@@ -729,29 +729,146 @@ def create_or_update_content_list(playlist_id: str, feed_id: int, db: Session):
     """Create or update content list for YouTube playlist."""
     # Find existing content list for this playlist
     content_list = db.query(ContentList).filter(
-        ContentList.source_type == "youtube_playlist",
+        ContentList.source_type == "youtube",
         ContentList.source_id == playlist_id
     ).first()
     
     if content_list:
         # Add feed_id to existing list if not already present
-        if feed_id not in (content_list.feed_ids or []):
-            content_list.feed_ids = (content_list.feed_ids or []) + [feed_id]
+        current_feed_ids = content_list.feed_ids or []
+        if feed_id not in current_feed_ids:
+            content_list.feed_ids = current_feed_ids + [feed_id]
             content_list.updated_at = datetime.utcnow()
+            logger.info(f"Updated list '{content_list.name}' with feed {feed_id}")
     else:
-        # Get playlist info from YouTube API (you'll need to implement this)
-        # For now, create with basic info
+        # Try to get playlist info from YouTube API
+        playlist_name = f"YouTube Playlist {playlist_id}"
+        
+        # Try to get playlist name from transcript job
+        if feed_id:
+            feed = db.query(Feed).filter(Feed.id == feed_id).first()
+            if feed and feed.transcript_id:
+                transcript = db.query(Transcript).filter(
+                    Transcript.transcript_id == feed.transcript_id
+                ).first()
+                if transcript:
+                    # Try to find the job that created this transcript
+                    job = db.query(TranscriptJob).filter(
+                        TranscriptJob.id == transcript.job_id
+                    ).first()
+                    if job and job.playlists:
+                        try:
+                            playlists = json.loads(job.playlists)
+                            for pl in playlists:
+                                if pl.get("id") == playlist_id:
+                                    playlist_name = pl.get("name", playlist_name)
+                                    break
+                        except json.JSONDecodeError:
+                            pass
+        
+        # Create new list
         content_list = ContentList(
-            name=f"YouTube Playlist {playlist_id}",
-            description="Auto-generated from YouTube playlist",
-            source_type="youtube_playlist",
+            name=playlist_name,
+            description=f"Auto-generated from YouTube playlist: {playlist_name}",
+            source_type="youtube",
             source_id=playlist_id,
             feed_ids=[feed_id],
-            is_active=True
+            is_active=True,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
         )
         db.add(content_list)
+        logger.info(f"Created new list '{playlist_name}' for playlist {playlist_id} with feed {feed_id}")
     
     db.flush()
+    return content_list
+def auto_create_lists_from_existing_youtube_feeds(db: Session):
+    """Auto-create ContentList entries from existing YouTube feeds with playlist_id."""
+    try:
+        logger.info("Starting auto-creation of lists from existing YouTube feeds...")
+        
+        # Find all YouTube feeds with transcripts that have playlist_id
+        youtube_feeds = db.query(Feed).filter(
+            Feed.source_type == "youtube",
+            Feed.status == "ready"
+        ).all()
+        
+        list_created = 0
+        list_updated = 0
+        
+        for feed in youtube_feeds:
+            # Get the transcript for this feed
+            transcript = None
+            if feed.transcript_id:
+                transcript = db.query(Transcript).filter(
+                    Transcript.transcript_id == feed.transcript_id
+                ).first()
+            
+            if transcript and transcript.playlist_id:
+                # Create or update content list for this playlist
+                try:
+                    content_list = create_or_update_content_list(transcript.playlist_id, feed.id, db)
+                    # Check if this was a new list or updated list
+                    if content_list.created_at == content_list.updated_at:
+                        list_created += 1
+                    else:
+                        list_updated += 1
+                except Exception as e:
+                    logger.error(f"Error creating list for feed {feed.id}: {e}")
+                    continue
+        
+        # Also create channel-based lists
+        channel_groups = {}
+        for feed in youtube_feeds:
+            meta = get_feed_metadata(feed, db)
+            channel_id = meta.get("channel_id")
+            channel_name = meta.get("channel_name")
+            
+            if channel_id and channel_name:
+                if channel_id not in channel_groups:
+                    channel_groups[channel_id] = {
+                        "name": f"{channel_name} Videos",
+                        "channel_name": channel_name,
+                        "feeds": []
+                    }
+                channel_groups[channel_id]["feeds"].append(feed.id)
+        
+        # Create channel-based lists
+        for channel_id, data in channel_groups.items():
+            if len(data["feeds"]) >= 3:
+                # Check if list exists
+                existing_list = db.query(ContentList).filter(
+                    ContentList.source_type == "youtube",
+                    ContentList.source_id == f"channel_{channel_id}"
+                ).first()
+                
+                if not existing_list:
+                    new_list = ContentList(
+                        name=data["name"],
+                        description=f"Videos from {data['channel_name']} YouTube channel",
+                        source_type="youtube",
+                        source_id=f"channel_{channel_id}",
+                        feed_ids=data["feeds"],
+                        is_active=True,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow()
+                    )
+                    db.add(new_list)
+                    list_created += 1
+        
+        db.commit()
+        logger.info(f"Auto-created {list_created} new lists and updated {list_updated} existing lists from YouTube feeds")
+        return {
+            "created": list_created,
+            "updated": list_updated,
+            "total": list_created + list_updated
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error auto-creating lists from feeds: {e}")
+        return {"created": 0, "updated": 0, "total": 0, "error": str(e)}
+
 
 # ------------------ Updated Core Feed Creation Functions ------------------
 
@@ -936,6 +1053,14 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             logger.info(f"Feed already exists for transcript {transcript.transcript_id}, skipping")
             return existing_feed
         
+        # Delete old slides if updating
+        if existing_feed and overwrite:
+            # Delete existing concept relationships
+            db.query(FeedConcept).filter(FeedConcept.feed_id == existing_feed.id).delete()
+            # Delete slides
+            db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
+            db.flush()
+        
         # Get admin categories for classification
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
@@ -1029,25 +1154,25 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
             "updated_at": datetime.utcnow()
         }
         
+        # Get YouTube video ID and channel info
+        youtube_video_id = transcript.video_id
+        
+        # Store video ID in feed
+        if youtube_video_id:
+            feed_data["youtube_video_id"] = youtube_video_id
+        
         if existing_feed and overwrite:
-            # UPDATE existing feed
-            # Clear existing concept relationships
-            db.query(FeedConcept).filter(FeedConcept.feed_id == existing_feed.id).delete()
-            
-            # Update feed attributes
+            # Update existing feed attributes
             for key, value in feed_data.items():
                 setattr(existing_feed, key, value)
             
-            # Delete old slides
-            db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
-            db.flush()
-            
             feed = existing_feed
         else:
-            # CREATE new feed
+            # Create new feed
             feed = Feed(**feed_data)
             db.add(feed)
-            db.flush()
+        
+        db.flush()  # Get feed ID
         
         # Link concepts to feed
         for concept in concept_objects:
@@ -1077,34 +1202,90 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
         # Create or update source (YouTube channel)
         channel_info = get_youtube_channel_info(transcript.video_id)
         channel_name = channel_info.get("channel_name", "YouTube Creator")
+        channel_id = channel_info.get("channel_id")
+        
+        # Store channel info in feed metadata
+        if channel_id:
+            # Update the feed with channel info
+            if not feed.youtube_channel_id:
+                feed.youtube_channel_id = channel_id
+            if not feed.youtube_channel_name:
+                feed.youtube_channel_name = channel_name
         
         if channel_name != "YouTube Creator":
             source = db.query(Source).filter(
-                Source.name == channel_name,
+                or_(
+                    Source.name == channel_name,
+                    Source.website.like(f"%{channel_id}%") if channel_id else None
+                ),
                 Source.source_type == "youtube"
             ).first()
             
             if not source:
-                website = f"https://www.youtube.com/channel/{channel_info.get('channel_id', '')}" if channel_info.get('channel_id') else "https://www.youtube.com"
+                website = f"https://www.youtube.com/channel/{channel_id}" if channel_id else "https://www.youtube.com"
                 source = Source(
                     name=channel_name,
                     website=website,
                     source_type="youtube",
-                    is_active=True
+                    is_active=True,
+                    metadata=channel_info
                 )
                 db.add(source)
                 db.flush()
             
             # Update source popularity
             source.feed_count = db.query(Feed).filter(
-                Feed.source_type == "youtube"
-            ).join(Transcript, Feed.transcript_id == Transcript.transcript_id).filter(
-                Transcript.video_id == transcript.video_id
+                Feed.source_type == "youtube",
+                Feed.youtube_channel_id == channel_id
             ).count()
         
-        # Create content list if this is from a playlist
+        # CREATE OR UPDATE CONTENT LIST IF THIS IS FROM A PLAYLIST
         if transcript.playlist_id:
-            create_or_update_content_list(transcript.playlist_id, feed.id, db)
+            # Find existing content list for this playlist
+            content_list = db.query(ContentList).filter(
+                ContentList.source_type == "youtube",
+                ContentList.source_id == transcript.playlist_id
+            ).first()
+            
+            if content_list:
+                # Add feed_id to existing list if not already present
+                current_feed_ids = content_list.feed_ids or []
+                if feed.id not in current_feed_ids:
+                    content_list.feed_ids = current_feed_ids + [feed.id]
+                    content_list.updated_at = datetime.utcnow()
+                    logger.info(f"Updated list '{content_list.name}' with feed {feed.id}")
+            else:
+                # Try to get playlist info from transcript job
+                playlist_name = f"YouTube Playlist {transcript.playlist_id}"
+                
+                # Try to get playlist name from transcript job
+                if transcript.job_id:
+                    job = db.query(TranscriptJob).filter(
+                        TranscriptJob.id == transcript.job_id
+                    ).first()
+                    if job and job.playlists:
+                        try:
+                            playlists = json.loads(job.playlists)
+                            for pl in playlists:
+                                if pl.get("id") == transcript.playlist_id:
+                                    playlist_name = pl.get("name", playlist_name)
+                                    break
+                        except json.JSONDecodeError:
+                            pass
+                
+                # Create new list
+                content_list = ContentList(
+                    name=playlist_name,
+                    description=f"Auto-generated from YouTube playlist: {playlist_name}",
+                    source_type="youtube",
+                    source_id=transcript.playlist_id,
+                    feed_ids=[feed.id],
+                    is_active=True,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(content_list)
+                logger.info(f"Created new list '{playlist_name}' for playlist {transcript.playlist_id} with feed {feed.id}")
         
         db.commit()
         db.refresh(feed)
@@ -2096,3 +2277,111 @@ def get_feeds_by_job_id(
             status_code=500,
             detail=f"Failed to fetch feeds: {str(e)}"
         )
+@router.get("/debug/youtube-lists")
+def debug_youtube_lists(db: Session = Depends(get_db)):
+    """Debug endpoint to check YouTube feeds and their playlist status."""
+    
+    # Get all YouTube feeds
+    youtube_feeds = db.query(Feed).filter(
+        Feed.source_type == "youtube",
+        Feed.status == "ready"
+    ).all()
+    
+    feed_info = []
+    for feed in youtube_feeds:
+        transcript = None
+        playlist_id = None
+        
+        if feed.transcript_id:
+            transcript = db.query(Transcript).filter(
+                Transcript.transcript_id == feed.transcript_id
+            ).first()
+            if transcript:
+                playlist_id = transcript.playlist_id
+        
+        feed_info.append({
+            "feed_id": feed.id,
+            "title": feed.title,
+            "transcript_id": feed.transcript_id,
+            "playlist_id": playlist_id,
+            "has_transcript": transcript is not None,
+            "has_playlist": bool(playlist_id)
+        })
+    
+    # Check existing ContentList entries
+    content_lists = db.query(ContentList).filter(
+        ContentList.source_type == "youtube"
+    ).all()
+    
+    list_info = []
+    for clist in content_lists:
+        list_info.append({
+            "id": clist.id,
+            "name": clist.name,
+            "source_id": clist.source_id,
+            "feed_count": len(clist.feed_ids) if clist.feed_ids else 0,
+            "is_active": clist.is_active
+        })
+    
+    # Find feeds with playlist_id but no ContentList
+    feeds_with_playlists = [f for f in feed_info if f["has_playlist"]]
+    missing_lists = []
+    
+    for feed in feeds_with_playlists:
+        playlist_id = feed["playlist_id"]
+        # Check if list exists for this playlist
+        existing_list = db.query(ContentList).filter(
+            ContentList.source_type == "youtube",
+            ContentList.source_id == playlist_id
+        ).first()
+        
+        if not existing_list:
+            missing_lists.append({
+                "feed_id": feed["feed_id"],
+                "playlist_id": playlist_id,
+                "title": feed["title"]
+            })
+    
+    return {
+        "total_youtube_feeds": len(youtube_feeds),
+        "feeds_with_playlists": len(feeds_with_playlists),
+        "existing_content_lists": len(content_lists),
+        "missing_lists_count": len(missing_lists),
+        "missing_lists": missing_lists[:10],  # First 10
+        "feeds_sample": feed_info[:5],
+        "lists_sample": list_info[:5]
+    }
+
+@router.post("/create-missing-lists")
+def create_missing_youtube_lists(db: Session = Depends(get_db)):
+    """Endpoint to create missing ContentList entries from YouTube feeds."""
+    result = auto_create_lists_from_existing_youtube_feeds(db)
+    return {
+        "message": "Auto-creation completed",
+        "result": result
+    }
+
+@router.get("/trigger-list-creation")
+def trigger_list_creation(
+    source_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Manually trigger ContentList creation from existing feeds."""
+    try:
+        if source_type == "youtube" or not source_type:
+            result = auto_create_lists_from_existing_youtube_feeds(db)
+            return {
+                "status": "success",
+                "message": f"Created {result.get('created', 0)} new lists and updated {result.get('updated', 0)} from YouTube feeds",
+                "details": result
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Unsupported source type: {source_type}"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to create lists: {str(e)}"
+        }
