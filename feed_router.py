@@ -14,6 +14,8 @@ from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
 from sqlalchemy import or_, String
 import requests
 from enum import Enum
+from sqlalchemy import func
+from models import Domain, Concept, FeedConcept, DomainConcept, ContentList
 
 router = APIRouter(prefix="/get", tags=["Feeds"])
 
@@ -183,7 +185,7 @@ def handle_openai_error(e: Exception) -> None:
     retry_error_callback=lambda retry_state: handle_openai_error(retry_state.outcome.exception())
 )
 def categorize_content_with_openai(content: str, admin_categories: list) -> tuple:
-    """Categorize content using OpenAI and extract skills, tools, roles."""
+    """Categorize content using OpenAI and extract skills, tools, roles, and concepts."""
     try:
         validate_openai_client()
         
@@ -200,6 +202,8 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
                     3. Extract tools/technologies mentioned  
                     4. Extract relevant job roles
                     5. Determine content type (Blog, Video, Podcast, Webinar)
+                    6. Extract key CONCEPTS discussed (3-5 main concepts)
+                    7. Suggest 1-2 DOMAINS this belongs to (from: Technology, Business, Science, Arts, Health, Education, etc.)
                     
                     Return JSON with this structure:
                     {
@@ -207,12 +211,14 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
                         "skills": ["skill1", "skill2"],
                         "tools": ["tool1", "tool2"],
                         "roles": ["role1", "role2"],
-                        "content_type": "Blog/Video/Podcast/Webinar"
+                        "content_type": "Blog/Video/Podcast/Webinar",
+                        "concepts": ["concept1", "concept2", "concept3"],
+                        "domains": ["domain1", "domain2"]
                     }"""
                 },
                 {
                     "role": "user",
-                    "content": f"Available categories: {', '.join(admin_categories)}.\n\nContent:\n{truncated_content}\n\nReturn JSON with categories, skills, tools, roles, and content_type."
+                    "content": f"Available categories: {', '.join(admin_categories)}.\n\nContent:\n{truncated_content}\n\nReturn JSON with categories, skills, tools, roles, content_type, concepts, and domains."
                 }
             ],
             temperature=0.1,
@@ -222,8 +228,15 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
         
         analysis = json.loads(response.choices[0].message.content.strip())
         
-        # Validate categories
+        # Extract all components
         categories = analysis.get("categories", [])
+        skills = analysis.get("skills", [])
+        tools = analysis.get("tools", [])
+        roles = analysis.get("roles", [])
+        concepts = analysis.get("concepts", [])
+        domains = analysis.get("domains", [])
+        
+        # Validate and process categories
         matched_categories = []
         for item in categories:
             for category in admin_categories:
@@ -233,7 +246,7 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
                     matched_categories.append(category)
                     break
         
-        # Remove duplicates and limit
+        # Remove duplicates
         seen = set()
         unique_categories = []
         for cat in matched_categories:
@@ -242,17 +255,11 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
                 unique_categories.append(cat)
         
         if not unique_categories:
-            # Use first available category as fallback
             unique_categories = [admin_categories[0]] if admin_categories else ["Uncategorized"]
-        
-        # Extract other metadata
-        skills = list(set(analysis.get("skills", [])))[:10]
-        tools = list(set(analysis.get("tools", [])))[:10]
-        roles = list(set(analysis.get("roles", [])))[:10]
         
         # Determine content type
         content_type_str = analysis.get("content_type", "Blog")
-        content_type = ContentType.BLOG  # default
+        content_type = ContentType.BLOG
         
         if "video" in content_type_str.lower() or "youtube" in content_type_str.lower():
             content_type = ContentType.VIDEO
@@ -261,10 +268,16 @@ def categorize_content_with_openai(content: str, admin_categories: list) -> tupl
         elif "webinar" in content_type_str.lower():
             content_type = ContentType.WEBINAR
         
-        return unique_categories[:3], skills, tools, roles, content_type
+        return (
+            unique_categories[:3], 
+            skills[:10], 
+            tools[:10], 
+            roles[:10], 
+            content_type,
+            concepts[:5],  # Limit to 5 concepts
+            domains[:2]   # Limit to 2 domains
+        )
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"OpenAI categorization error: {e}")
         handle_openai_error(e)
@@ -582,60 +595,238 @@ def generate_feed_background_color(title: str, content_type: str, categories: Li
     logger.info(f"Generated predefined distinct color: {color_hex} for '{title}'")
     return color_hex
 
-# ------------------ Core Feed Creation Functions ------------------
+# ------------------ Helper Functions for New Models ------------------
+
+# ------------------ Enhanced Helper Functions ------------------
+
+def extract_clean_source_name(website_url: str) -> str:
+    """Extract clean source name using OpenAI or basic parsing."""
+    try:
+        if not website_url or website_url in ["Unknown", "#"]:
+            return "Unknown Source"
+        
+        # Basic cleaning
+        clean_url = website_url.replace("https://", "").replace("http://", "").split("/")[0]
+        
+        # Try OpenAI for better naming
+        if client:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a naming expert. Extract a clean, professional source name from a domain.
+                        Return ONLY the name, no explanations.
+                        Examples:
+                        - "blog.hubspot.com" -> "HubSpot Blog"
+                        - "news.ycombinator.com" -> "Hacker News" 
+                        - "techcrunch.com" -> "TechCrunch"
+                        - "medium.com" -> "Medium"
+                        - "towardsdatascience.com" -> "Towards Data Science"
+                        - If unsure, return the main domain name without TLD."""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Extract a clean source name from: {clean_url}"
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=50
+            )
+            
+            source_name = response.choices[0].message.content.strip()
+            source_name = source_name.replace('"', '').replace("'", "").strip()
+            
+            if source_name and len(source_name) > 2:
+                return source_name
+        
+        # Fallback to basic domain extraction
+        parts = clean_url.split('.')
+        if len(parts) > 2:
+            # Remove www and TLD
+            return parts[1].title() if parts[0] == 'www' else parts[0].title()
+        elif len(parts) == 2:
+            return parts[0].title()
+        else:
+            return clean_url
+            
+    except Exception as e:
+        logger.error(f"Source name extraction failed for {website_url}: {e}")
+        # Fallback to basic domain extraction
+        clean_url = website_url.replace("https://", "").replace("http://", "").split("/")[0]
+        return clean_url
+
+
+def get_or_create_concepts(db: Session, concept_names: List[str]) -> List[Concept]:
+    """Get or create concept objects."""
+    concepts = []
+    for name in concept_names:
+        if not name or len(name.strip()) < 2:
+            continue
+            
+        concept = db.query(Concept).filter(
+            func.lower(Concept.name) == func.lower(name.strip())
+        ).first()
+        
+        if not concept:
+            concept = Concept(
+                name=name.strip(),
+                description=f"Concept for {name.strip()}",
+                is_active=True
+            )
+            db.add(concept)
+            db.flush()
+        
+        concepts.append(concept)
+    
+    return concepts
+
+def get_or_create_domains(db: Session, domain_names: List[str]) -> List[Domain]:
+    """Get or create domain objects."""
+    domains = []
+    for name in domain_names:
+        if not name or len(name.strip()) < 2:
+            continue
+            
+        domain = db.query(Domain).filter(
+            func.lower(Domain.name) == func.lower(name.strip())
+        ).first()
+        
+        if not domain:
+            domain = Domain(
+                name=name.strip(),
+                description=f"Domain for {name.strip()}",
+                is_active=True
+            )
+            db.add(domain)
+            db.flush()
+        
+        domains.append(domain)
+    
+    return domains
+
+def get_or_assign_category(db: Session, categories: List[str]) -> tuple:
+    """Get or assign category and subcategory."""
+    category_obj = None
+    subcategory_obj = None
+    
+    if categories and len(categories) > 0:
+        # Get the first category
+        category_name = categories[0]
+        category_obj = db.query(Category).filter(
+            Category.name.ilike(f"%{category_name}%")
+        ).first()
+        
+        # If category found, get its first subcategory
+        if category_obj:
+            subcategory_obj = db.query(SubCategory).filter(
+                SubCategory.category_id == category_obj.id
+            ).first()
+    
+    return category_obj, subcategory_obj
+
+def create_or_update_content_list(playlist_id: str, feed_id: int, db: Session):
+    """Create or update content list for YouTube playlist."""
+    # Find existing content list for this playlist
+    content_list = db.query(ContentList).filter(
+        ContentList.source_type == "youtube_playlist",
+        ContentList.source_id == playlist_id
+    ).first()
+    
+    if content_list:
+        # Add feed_id to existing list if not already present
+        if feed_id not in (content_list.feed_ids or []):
+            content_list.feed_ids = (content_list.feed_ids or []) + [feed_id]
+            content_list.updated_at = datetime.utcnow()
+    else:
+        # Get playlist info from YouTube API (you'll need to implement this)
+        # For now, create with basic info
+        content_list = ContentList(
+            name=f"YouTube Playlist {playlist_id}",
+            description="Auto-generated from YouTube playlist",
+            source_type="youtube_playlist",
+            source_id=playlist_id,
+            feed_ids=[feed_id],
+            is_active=True
+        )
+        db.add(content_list)
+    
+    db.flush()
+
+# ------------------ Updated Core Feed Creation Functions ------------------
 
 def create_feed_from_blog(db: Session, blog: Blog):
-    """Generate feed and slides from a blog using AI."""
+    """Generate feed and slides from a blog using AI with full metadata."""
     try:
         # Check if feed already exists for this blog
         existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
+        
+        # Delete old slides if updating
         if existing_feed:
+            # Delete existing concept relationships
+            db.query(FeedConcept).filter(FeedConcept.feed_id == existing_feed.id).delete()
+            # Delete slides
             db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
             db.flush()
         
-        # Create new feed with enhanced metadata
+        # Get admin categories for classification
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
-            # Use fallback categories
             admin_categories = ["Uncategorized"]
         
         try:
-            categories, skills, tools, roles, content_type = categorize_content_with_openai(blog.content, admin_categories)
+            # Enhanced categorization with concepts and domains
+            categories, skills, tools, roles, content_type, concepts, domains = categorize_content_with_openai(
+                blog.content, admin_categories
+            )
             
-            # NEW: Get or assign category and subcategory
-            category_obj = None
-            subcategory_obj = None
+            # Get or assign category and subcategory
+            category_obj, subcategory_obj = get_or_assign_category(db, categories)
             
-            if categories and len(categories) > 0:
-                # Get the first category
-                category_name = categories[0]
-                category_obj = db.query(Category).filter(
-                    Category.name.ilike(f"%{category_name}%")
-                ).first()
-                
-                # If category found, get its first subcategory
-                if category_obj:
-                    subcategory_obj = db.query(SubCategory).filter(
-                        SubCategory.category_id == category_obj.id
+            # Get or create concepts
+            concept_objects = get_or_create_concepts(db, concepts)
+            
+            # Get or create domains
+            domain_objects = get_or_create_domains(db, domains)
+            
+            # Link concepts to domains
+            for concept in concept_objects:
+                for domain in domain_objects:
+                    # Check if relationship already exists
+                    existing_link = db.query(DomainConcept).filter(
+                        DomainConcept.domain_id == domain.id,
+                        DomainConcept.concept_id == concept.id
                     ).first()
+                    
+                    if not existing_link:
+                        domain_concept = DomainConcept(
+                            domain_id=domain.id,
+                            concept_id=concept.id,
+                            relevance_score=1.0
+                        )
+                        db.add(domain_concept)
             
+            # Generate AI content
             ai_generated_content = generate_feed_content_with_ai(blog.title, blog.content, categories, "blog")
             slides_data = generate_slides_with_ai(blog.title, blog.content, ai_generated_content, categories, "blog")
             
             feed_title = ai_generated_content.get("title", blog.title)
             status = "ready"
+            
         except HTTPException as e:
-            # If OpenAI fails, create minimal feed
+            # Fallback minimal feed
             logger.warning(f"OpenAI failed for blog {blog.id}, creating minimal feed: {e.detail}")
             categories = ["Uncategorized"]
             skills = []
             tools = []
             roles = []
+            concepts = []
+            domains = []
             content_type = ContentType.BLOG
-            
-            # NEW: Set category and subcategory to None for fallback
             category_obj = None
             subcategory_obj = None
+            concept_objects = []
+            domain_objects = []
             
             ai_generated_content = {
                 "title": blog.title,
@@ -647,27 +838,47 @@ def create_feed_from_blog(db: Session, blog: Blog):
             feed_title = blog.title
             status = "partial"
         
-        feed = Feed(
-            blog_id=blog.id, 
-            title=feed_title,
-            categories=categories, 
-            skills=skills,
-            tools=tools,
-            roles=roles,
-            content_type=content_type,
-            status=status,
-            ai_generated_content=ai_generated_content,
-            image_generation_enabled=False,
-            source_type="blog",
-            # NEW: Add category and subcategory references
-            category_id=category_obj.id if category_obj else None,
-            subcategory_id=subcategory_obj.id if subcategory_obj else None,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(feed)
-        db.flush()
+        # Create feed data
+        feed_data = {
+            "blog_id": blog.id, 
+            "title": feed_title,
+            "categories": categories, 
+            "skills": skills,
+            "tools": tools,
+            "roles": roles,
+            "content_type": content_type,
+            "status": status,
+            "ai_generated_content": ai_generated_content,
+            "image_generation_enabled": False,
+            "source_type": "blog",
+            "category_id": category_obj.id if category_obj else None,
+            "subcategory_id": subcategory_obj.id if subcategory_obj else None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
         
+        if existing_feed:
+            # Update existing feed
+            for key, value in feed_data.items():
+                setattr(existing_feed, key, value)
+            feed = existing_feed
+        else:
+            # Create new feed
+            feed = Feed(**feed_data)
+            db.add(feed)
+        
+        db.flush()  # Get feed ID
+        
+        # Link concepts to feed
+        for concept in concept_objects:
+            feed_concept = FeedConcept(
+                feed_id=feed.id,
+                concept_id=concept.id,
+                confidence_score=0.8  # Default confidence
+            )
+            db.add(feed_concept)
+        
+        # Create slides
         for slide_data in slides_data:
             slide = Slide(
                 feed_id=feed.id,
@@ -683,15 +894,33 @@ def create_feed_from_blog(db: Session, blog: Blog):
             )
             db.add(slide)
         
+        # Create or update source
+        if blog.website:
+            source_name = extract_clean_source_name(blog.website)
+            source = db.query(Source).filter(
+                Source.website == blog.website,
+                Source.source_type == "blog"
+            ).first()
+            
+            if not source:
+                source = Source(
+                    name=source_name,
+                    website=blog.website,
+                    source_type="blog",
+                    is_active=True
+                )
+                db.add(source)
+                db.flush()
+            
+            # Update source popularity
+            source.feed_count = db.query(Feed).join(Blog).filter(
+                Blog.website == blog.website
+            ).count()
+        
         db.commit()
         db.refresh(feed)
-        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id}")
+        logger.info(f"Successfully created AI-generated feed {feed.id} for blog {blog.id} with {len(concept_objects)} concepts")
         return feed
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error creating AI-generated feed for blog {blog.id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create feed for blog: {str(e)}")
         
     except Exception as e:
         db.rollback()
@@ -699,55 +928,75 @@ def create_feed_from_blog(db: Session, blog: Blog):
         raise HTTPException(status_code=500, detail=f"Failed to create feed for blog: {str(e)}")
 
 def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: bool = False):
-    """Generate feed and slides from a YouTube transcript using AI."""
+    """Generate feed and slides from a YouTube transcript using AI with full metadata."""
     try:
         existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
         
         if existing_feed and not overwrite:
             logger.info(f"Feed already exists for transcript {transcript.transcript_id}, skipping")
             return existing_feed
-            
+        
+        # Get admin categories for classification
         admin_categories = [c.name for c in db.query(Category).filter(Category.is_active == True).all()]
         if not admin_categories:
             admin_categories = ["Uncategorized"]
         
         try:
-            categories, skills, tools, roles, content_type = categorize_content_with_openai(transcript.transcript_text, admin_categories)
+            # Enhanced categorization with concepts and domains
+            categories, skills, tools, roles, content_type, concepts, domains = categorize_content_with_openai(
+                transcript.transcript_text, admin_categories
+            )
             
-            # NEW: Get or assign category and subcategory
-            category_obj = None
-            subcategory_obj = None
+            # Get or assign category and subcategory
+            category_obj, subcategory_obj = get_or_assign_category(db, categories)
             
-            if categories and len(categories) > 0:
-                # Get the first category
-                category_name = categories[0]
-                category_obj = db.query(Category).filter(
-                    Category.name.ilike(f"%{category_name}%")
-                ).first()
-                
-                # If category found, get its first subcategory
-                if category_obj:
-                    subcategory_obj = db.query(SubCategory).filter(
-                        SubCategory.category_id == category_obj.id
+            # Get or create concepts
+            concept_objects = get_or_create_concepts(db, concepts)
+            
+            # Get or create domains
+            domain_objects = get_or_create_domains(db, domains)
+            
+            # Link concepts to domains
+            for concept in concept_objects:
+                for domain in domain_objects:
+                    existing_link = db.query(DomainConcept).filter(
+                        DomainConcept.domain_id == domain.id,
+                        DomainConcept.concept_id == concept.id
                     ).first()
+                    
+                    if not existing_link:
+                        domain_concept = DomainConcept(
+                            domain_id=domain.id,
+                            concept_id=concept.id,
+                            relevance_score=1.0
+                        )
+                        db.add(domain_concept)
             
-            ai_generated_content = generate_feed_content_with_ai(transcript.title, transcript.transcript_text, categories, "transcript")
-            slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
+            # Generate AI content
+            ai_generated_content = generate_feed_content_with_ai(
+                transcript.title, transcript.transcript_text, categories, "transcript"
+            )
+            slides_data = generate_slides_with_ai(
+                transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript"
+            )
             
             feed_title = ai_generated_content.get("title", transcript.title)
             status = "ready"
+            
         except HTTPException as e:
-            # If OpenAI fails, create minimal feed
+            # Fallback minimal feed
             logger.warning(f"OpenAI failed for transcript {transcript.transcript_id}, creating minimal feed: {e.detail}")
             categories = ["Uncategorized"]
             skills = []
             tools = []
             roles = []
+            concepts = []
+            domains = []
             content_type = ContentType.VIDEO
-            
-            # NEW: Set category and subcategory to None for fallback
             category_obj = None
             subcategory_obj = None
+            concept_objects = []
+            domain_objects = []
             
             ai_generated_content = {
                 "title": transcript.title,
@@ -755,91 +1004,114 @@ def create_feed_from_transcript(db: Session, transcript: Transcript, overwrite: 
                 "key_points": ["AI processing not available"],
                 "conclusion": "Unable to generate content summary due to API limitations."
             }
-            slides_data = generate_slides_with_ai(transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript")
+            slides_data = generate_slides_with_ai(
+                transcript.title, transcript.transcript_text, ai_generated_content, categories, "transcript"
+            )
             feed_title = transcript.title
             status = "partial"
         
+        # Prepare feed data
+        feed_data = {
+            "transcript_id": transcript.transcript_id,
+            "title": feed_title,
+            "categories": categories,
+            "skills": skills,
+            "tools": tools,
+            "roles": roles,
+            "content_type": content_type,
+            "status": status,
+            "ai_generated_content": ai_generated_content,
+            "image_generation_enabled": False,
+            "source_type": "youtube",
+            "category_id": category_obj.id if category_obj else None,
+            "subcategory_id": subcategory_obj.id if subcategory_obj else None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
         if existing_feed and overwrite:
             # UPDATE existing feed
-            existing_feed.title = feed_title
-            existing_feed.categories = categories
-            existing_feed.skills = skills
-            existing_feed.tools = tools
-            existing_feed.roles = roles
-            existing_feed.content_type = content_type
-            existing_feed.status = status
-            existing_feed.ai_generated_content = ai_generated_content
-            existing_feed.category_id = category_obj.id if category_obj else None  # NEW
-            existing_feed.subcategory_id = subcategory_obj.id if subcategory_obj else None  # NEW
-            existing_feed.updated_at = datetime.utcnow()
+            # Clear existing concept relationships
+            db.query(FeedConcept).filter(FeedConcept.feed_id == existing_feed.id).delete()
+            
+            # Update feed attributes
+            for key, value in feed_data.items():
+                setattr(existing_feed, key, value)
             
             # Delete old slides
             db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
             db.flush()
             
-            # Create new slides
-            for slide_data in slides_data:
-                slide = Slide(
-                    feed_id=existing_feed.id,
-                    order=slide_data["order"],
-                    title=slide_data["title"],
-                    body=slide_data["body"],
-                    bullets=slide_data.get("bullets"),
-                    background_color=slide_data.get("background_color", "#FFFFFF"),
-                    source_refs=slide_data.get("source_refs", []),
-                    render_markdown=int(slide_data.get("render_markdown", True)),
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                db.add(slide)
-            
-            db.commit()
-            db.refresh(existing_feed)
-            logger.info(f"Successfully UPDATED AI-generated feed {existing_feed.id} for transcript {transcript.transcript_id}")
-            return existing_feed
+            feed = existing_feed
         else:
             # CREATE new feed
-            feed = Feed(
-                transcript_id=transcript.transcript_id,
-                title=feed_title,
-                categories=categories,
-                skills=skills,
-                tools=tools,
-                roles=roles,
-                content_type=content_type,
-                status=status,
-                ai_generated_content=ai_generated_content,
-                image_generation_enabled=False,
-                source_type="youtube",
-                # NEW: Add category and subcategory references
-                category_id=category_obj.id if category_obj else None,
-                subcategory_id=subcategory_obj.id if subcategory_obj else None,
+            feed = Feed(**feed_data)
+            db.add(feed)
+            db.flush()
+        
+        # Link concepts to feed
+        for concept in concept_objects:
+            feed_concept = FeedConcept(
+                feed_id=feed.id,
+                concept_id=concept.id,
+                confidence_score=0.8
+            )
+            db.add(feed_concept)
+        
+        # Create slides
+        for slide_data in slides_data:
+            slide = Slide(
+                feed_id=feed.id,
+                order=slide_data["order"],
+                title=slide_data["title"],
+                body=slide_data["body"],
+                bullets=slide_data.get("bullets"),
+                background_color=slide_data.get("background_color", "#FFFFFF"),
+                source_refs=slide_data.get("source_refs", []),
+                render_markdown=int(slide_data.get("render_markdown", True)),
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
-            db.add(feed)
-            db.flush()
+            db.add(slide)
+        
+        # Create or update source (YouTube channel)
+        channel_info = get_youtube_channel_info(transcript.video_id)
+        channel_name = channel_info.get("channel_name", "YouTube Creator")
+        
+        if channel_name != "YouTube Creator":
+            source = db.query(Source).filter(
+                Source.name == channel_name,
+                Source.source_type == "youtube"
+            ).first()
             
-            # Create slides
-            for slide_data in slides_data:
-                slide = Slide(
-                    feed_id=feed.id,
-                    order=slide_data["order"],
-                    title=slide_data["title"],
-                    body=slide_data["body"],
-                    bullets=slide_data.get("bullets"),
-                    background_color=slide_data.get("background_color", "#FFFFFF"),
-                    source_refs=slide_data.get("source_refs", []),
-                    render_markdown=int(slide_data.get("render_markdown", True)),
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
+            if not source:
+                website = f"https://www.youtube.com/channel/{channel_info.get('channel_id', '')}" if channel_info.get('channel_id') else "https://www.youtube.com"
+                source = Source(
+                    name=channel_name,
+                    website=website,
+                    source_type="youtube",
+                    is_active=True
                 )
-                db.add(slide)
+                db.add(source)
+                db.flush()
             
-            db.commit()
-            db.refresh(feed)
-            logger.info(f"Successfully CREATED AI-generated feed {feed.id} for transcript {transcript.transcript_id}")
-            return feed
+            # Update source popularity
+            source.feed_count = db.query(Feed).filter(
+                Feed.source_type == "youtube"
+            ).join(Transcript, Feed.transcript_id == Transcript.transcript_id).filter(
+                Transcript.video_id == transcript.video_id
+            ).count()
+        
+        # Create content list if this is from a playlist
+        if transcript.playlist_id:
+            create_or_update_content_list(transcript.playlist_id, feed.id, db)
+        
+        db.commit()
+        db.refresh(feed)
+        
+        action = "UPDATED" if existing_feed and overwrite else "CREATED"
+        logger.info(f"Successfully {action} AI-generated feed {feed.id} for transcript {transcript.transcript_id}")
+        return feed
         
     except Exception as e:
         db.rollback()
@@ -880,31 +1152,40 @@ def get_website_favicon(website_url: str) -> str:
         # Fallback to a generic favicon
         return "https://www.google.com/s2/favicons?domain=" + (website_url.split('//')[-1].split('/')[0] if '//' in website_url else website_url)
 
+
 def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
     """Extract proper metadata for feeds including YouTube channel names, correct URLs, and favicons."""
-    if feed.source_type == "youtube":
+    if feed.source_type == "youtube" and feed.transcript_id:
         # Get the transcript to access YouTube-specific data
-        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        transcript = db.query(Transcript).filter(
+            Transcript.transcript_id == feed.transcript_id
+        ).first()
         
         if transcript:
-            # Extract video ID from transcript data
             video_id = getattr(transcript, 'video_id', None)
             if not video_id:
-                # Try to extract from transcript_id or other fields
-                video_id = getattr(transcript, 'youtube_video_id', feed.transcript_id)
+                video_id = feed.transcript_id
             
-            # Get original title from transcript
             original_title = transcript.title if transcript else feed.title
             
             # Get channel information from YouTube API
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
             
-            # Construct proper YouTube URL
             source_url = f"https://www.youtube.com/watch?v={video_id}"
             
             # Use YouTube favicon
             favicon = "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico"
+            
+            # Get concepts for this feed
+            concepts = []
+            if hasattr(feed, 'concepts') and feed.concepts:
+                for concept in feed.concepts:
+                    concepts.append({
+                        "id": concept.id,
+                        "name": concept.name,
+                        "description": concept.description
+                    })
             
             return {
                 "title": feed.title,
@@ -916,96 +1197,91 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "channel_id": channel_info.get("channel_id"),
                 "video_id": video_id,
                 "favicon": favicon,
-                "channel_info": channel_info
-            }
-        else:
-            # Fallback if transcript not found
-            video_id = feed.transcript_id
-            channel_info = get_youtube_channel_info(video_id)
-            channel_name = channel_info.get("channel_name", "YouTube Creator")
-            
-            return {
-                "title": feed.title,
-                "original_title": feed.title,
-                "author": channel_name,
-                "source_url": f"https://www.youtube.com/watch?v={video_id}",
-                "source_type": "youtube",
-                "channel_name": channel_name,
-                "channel_id": channel_info.get("channel_id"),
-                "video_id": video_id,
-                "favicon": "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico",
-                "channel_info": channel_info
+                "channel_info": channel_info,
+                "concepts": concepts  # Add concepts to metadata
             }
     
-    else:  # blog source type
+    # For blogs
+    if feed.source_type == "blog" and feed.blog:
         blog = feed.blog
-        if blog:
-            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
-            author = getattr(blog, 'author', 'Admin') or 'Admin'
-            
-            # Get favicon URL
-            favicon = get_website_favicon(blog.website)
-            
-            return {
-                "title": feed.title,
-                "original_title": blog.title,
-                "author": author,
-                "source_url": blog.url,
-                "source_type": "blog",
-                "website_name": website_name,
-                "website": blog.website,
-                "favicon": favicon
-            }
-        else:
-            # Fallback if blog not found
-            return {
-                "title": feed.title,
-                "original_title": "Unknown",
-                "author": "Admin",
-                "source_url": "#",
-                "source_type": "blog",
-                "website_name": "Unknown",
-                "website": "Unknown",
-                "favicon": get_website_favicon("Unknown")
-            }
+        website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+        author = getattr(blog, 'author', 'Admin') or 'Admin'
+        
+        # Get favicon URL
+        favicon = get_website_favicon(blog.website)
+        
+        # Get concepts for this feed
+        concepts = []
+        if hasattr(feed, 'concepts') and feed.concepts:
+            for concept in feed.concepts:
+                concepts.append({
+                    "id": concept.id,
+                    "name": concept.name,
+                    "description": concept.description
+                })
+        
+        return {
+            "title": feed.title,
+            "original_title": blog.title,
+            "author": author,
+            "source_url": blog.url,
+            "source_type": "blog",
+            "website_name": website_name,
+            "website": blog.website,
+            "favicon": favicon,
+            "concepts": concepts  # Add concepts to metadata
+        }
+    
+    # Fallback
+    return {
+        "title": feed.title,
+        "original_title": feed.title,
+        "author": "Unknown",
+        "source_url": "#",
+        "source_type": feed.source_type or "blog",
+        "website_name": "Unknown",
+        "website": "Unknown",
+        "favicon": get_website_favicon("Unknown"),
+        "concepts": []  # Empty concepts array for fallback
+    }
 
-def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool = False, use_ai: bool = True):
-    """Background task to process blog feed creation."""
+
+def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool = False):
+    """Enhanced background task to process blog feed creation with full metadata."""
     from database import SessionLocal
     db = SessionLocal()
     try:
         created_count = 0
+        updated_count = 0
         skipped_count = 0
         error_count = 0
         openai_error_count = 0
         error_messages = []
-        openai_errors = []
         
         for blog in blogs:
             try:
                 existing_feed = db.query(Feed).filter(Feed.blog_id == blog.id).first()
+                
                 if existing_feed and not overwrite:
                     skipped_count += 1
                     continue
                 
-                if existing_feed and overwrite:
-                    # Delete existing slides to regenerate
-                    db.query(Slide).filter(Slide.feed_id == existing_feed.id).delete()
-                    db.flush()
-                
-                # Create feed with AI
+                # Create or update feed with full metadata
                 feed = create_feed_from_blog(db, blog)
                 
                 if feed:
-                    created_count += 1
+                    if existing_feed and overwrite:
+                        updated_count += 1
+                    else:
+                        created_count += 1
+                    
                     if feed.status == "partial":
                         openai_error_count += 1
-                        openai_errors.append(f"Blog {blog.id}: OpenAI quota/configuration issue")
                     
             except HTTPException as e:
                 if "quota" in str(e.detail).lower() or "OpenAI" in str(e.detail):
                     openai_error_count += 1
-                    openai_errors.append(f"Blog {blog.id}: {e.detail}")
+                    error_messages.append(f"Blog {blog.id}: {e.detail}")
                 else:
                     error_count += 1
                     error_messages.append(f"Blog {blog.id}: {e.detail}")
@@ -1017,7 +1293,7 @@ def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool
                 logger.error(f"Error processing blog {blog.id}: {e}")
                 continue
         
-        summary = f"Completed blog feed creation for {website}: {created_count} created"
+        summary = f"Completed blog feed creation for {website}: {created_count} created, {updated_count} updated"
         if openai_error_count > 0:
             summary += f", {openai_error_count} with OpenAI issues"
         if error_count > 0:
@@ -1027,45 +1303,49 @@ def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool
         
         logger.info(summary)
         
-        # Log errors for debugging
-        if openai_errors:
-            logger.warning(f"OpenAI errors for {website}: {openai_errors[:5]}")  # Log first 5
+        # Log first 5 errors for debugging
+        if error_messages:
+            logger.warning(f"Errors for {website}: {error_messages[:5]}")
             
     finally:
         db.close()
 
-def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str, overwrite: bool = False, use_ai: bool = True):
-    """Background task to process transcript feed creation."""
+def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str, overwrite: bool = False):
+    """Enhanced background task to process transcript feed creation with full metadata."""
     from database import SessionLocal
     db = SessionLocal()
     try:
         created_count = 0
+        updated_count = 0
         skipped_count = 0
         error_count = 0
         openai_error_count = 0
         error_messages = []
-        openai_errors = []
         
         for transcript in transcripts:
             try:
                 existing_feed = db.query(Feed).filter(Feed.transcript_id == transcript.transcript_id).first()
+                
                 if existing_feed and not overwrite:
                     skipped_count += 1
                     continue
                 
-                # Create feed with AI
+                # Create or update feed with full metadata
                 feed = create_feed_from_transcript(db, transcript, overwrite)
                 
                 if feed:
-                    created_count += 1
+                    if existing_feed and overwrite:
+                        updated_count += 1
+                    else:
+                        created_count += 1
+                    
                     if feed.status == "partial":
                         openai_error_count += 1
-                        openai_errors.append(f"Transcript {transcript.transcript_id}: OpenAI quota/configuration issue")
                     
             except HTTPException as e:
                 if "quota" in str(e.detail).lower() or "OpenAI" in str(e.detail):
                     openai_error_count += 1
-                    openai_errors.append(f"Transcript {transcript.transcript_id}: {e.detail}")
+                    error_messages.append(f"Transcript {transcript.transcript_id}: {e.detail}")
                 else:
                     error_count += 1
                     error_messages.append(f"Transcript {transcript.transcript_id}: {e.detail}")
@@ -1077,7 +1357,7 @@ def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str
                 logger.error(f"Error processing transcript {transcript.transcript_id}: {e}")
                 continue
         
-        summary = f"Completed transcript feed creation for job {job_id}: {created_count} created"
+        summary = f"Completed transcript feed creation for job {job_id}: {created_count} created, {updated_count} updated"
         if openai_error_count > 0:
             summary += f", {openai_error_count} with OpenAI issues"
         if error_count > 0:
@@ -1087,9 +1367,9 @@ def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str
         
         logger.info(summary)
         
-        # Log errors for debugging
-        if openai_errors:
-            logger.warning(f"OpenAI errors for job {job_id}: {openai_errors[:5]}")  # Log first 5
+        # Log first 5 errors for debugging
+        if error_messages:
+            logger.warning(f"Errors for job {job_id}: {error_messages[:5]}")
             
     finally:
         db.close()

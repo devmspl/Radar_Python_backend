@@ -5,6 +5,10 @@ import uuid
 from database import Base
 import enum
 from datetime import datetime
+from sqlalchemy.types import TypeDecorator, TEXT
+import json
+
+
 def generate_uuid():
     return str(uuid.uuid4())
 
@@ -218,8 +222,6 @@ class ScrapeJob(Base):
     status = Column(String, default="inprocess")   # inprocess / done / failed
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-from sqlalchemy.types import TypeDecorator, TEXT
-import json
 
 class JSONEncodedList(TypeDecorator):
     impl = TEXT
@@ -263,7 +265,7 @@ class Feed(Base):
     # Relationships
     category = relationship("Category", back_populates="feeds")
     subcategory = relationship("SubCategory", back_populates="feeds")
-
+    concepts = relationship("Concept", secondary="feed_concepts", backref="feeds")
 class Slide(Base):
     __tablename__ = "slides"
     
@@ -489,3 +491,66 @@ class SubCategory(Base):
     
     # Relationship to feeds
     feeds = relationship("Feed", back_populates="subcategory")
+
+
+
+# Add to your models.py
+
+class Domain(Base):
+    __tablename__ = "domains"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(Text, nullable=True)
+    parent_domain_id = Column(Integer, ForeignKey('domains.id'), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    parent = relationship("Domain", remote_side=[id], backref="subdomains")
+    concepts = relationship("Concept", secondary="domain_concepts", backref="domains")
+
+class Concept(Base):
+    __tablename__ = "concepts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(Text, nullable=True)
+    related_concepts = Column(JSON, default=list)  # Array of related concept names
+    popularity_score = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ContentList(Base):
+    __tablename__ = "content_lists"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    source_type = Column(String)  # 'youtube_playlist' or 'custom'
+    source_id = Column(String)  # playlist_id for YouTube, custom_id for manual lists
+    feed_ids = Column(JSON, default=list)  # Array of feed IDs in this list
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# Association tables for many-to-many relationships
+class DomainConcept(Base):
+    __tablename__ = "domain_concepts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
+    concept_id = Column(Integer, ForeignKey('concepts.id'), nullable=False)
+    relevance_score = Column(Float, default=1.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class FeedConcept(Base):
+    __tablename__ = "feed_concepts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    feed_id = Column(Integer, ForeignKey('feeds.id'), nullable=False)
+    concept_id = Column(Integer, ForeignKey('concepts.id'), nullable=False)
+    confidence_score = Column(Float, default=1.0)  # How confident LLM is about this concept
+    created_at = Column(DateTime, default=datetime.utcnow)

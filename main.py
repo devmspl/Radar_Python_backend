@@ -23,6 +23,7 @@ from quiz_router import router as quiz_router
 from onboarding_router import router as onboarding_router
 from bookmark_router import bookmark_router as bookmark_router
 from Subcategory_router import router as subcategory_router
+from Enhanced_Search import router as Enhanced_Search
 import traceback
 import sys
 import logging
@@ -700,7 +701,6 @@ async def update_user_profile(
                     detail="Invalid JSON format for interested_roles"
                 )
         
-        # Get or create onboarding data - NOTE: Changed from OnboardingData to UserOnboarding
         onboarding_data = db.query(models.UserOnboarding).filter(
             models.UserOnboarding.user_id == current_user.id
         ).first()
@@ -761,6 +761,8 @@ app.include_router(search_router)
 app.include_router(publish_router)
 app.include_router(quiz_router)
 app.include_router(bookmark_router)
+app.include_router(Enhanced_Search)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7878)

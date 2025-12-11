@@ -1,333 +1,681 @@
+# update_all_feeds.py
+"""
+Complete script to update ALL existing feeds with enhanced metadata for search functionality.
+This script will process all feeds and extract concepts, domains, and sources.
+"""
+
 import sys
-import os
-import json
-from pathlib import Path
-
-# Add the project root to the Python path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-import asyncio
-from datetime import datetime
-from typing import List, Tuple, Optional
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from openai import OpenAI
 import logging
-from dotenv import load_dotenv
+import time
+from datetime import datetime
+from typing import List, Dict, Any
+import json
 
-# Load environment variables
-load_dotenv()
+# Add your project to path
+sys.path.append('.')
+
+from sqlalchemy import create_engine, func, text
+from sqlalchemy.orm import sessionmaker
+from models import (
+    Feed, Blog, Transcript, Category, SubCategory,
+    Domain, Concept, FeedConcept, DomainConcept, Source, ContentList
+)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('feed_update.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
-from database import Base, get_db
-from models import Blog, Category, SubCategory, Feed, Transcript
-
-# Initialize OpenAI client
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found in environment variables")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-class FeedCategoryMigrator:
-    """Migrator to fill missing category and subcategory IDs in existing feeds."""
-    
-    def __init__(self, db_session: Session):
-        self.db = db_session
-        self.openai_client = client
-        self.stats = {
-            "total_feeds": 0,
-            "processed": 0,
-            "updated": 0,
-            "skipped": 0,
-            "errors": 0,
-            "no_content": 0
-        }
-    
-    def get_feed_content(self, feed: Feed) -> Optional[str]:
-        """Extract content from feed based on source type."""
+class AllFeedUpdater:
+    def __init__(self, database_url: str = None):
+        """Initialize the feed updater."""
         try:
-            if feed.source_type == "blog" and feed.blog_id:
-                blog = self.db.query(Blog).filter(Blog.id == feed.blog_id).first()
-                if blog:
-                    return blog.content
+            if database_url:
+                self.engine = create_engine(database_url)
+            else:
+                # Try to import from config
+                try:
+                    from config import settings
+                    self.engine = create_engine(settings.DATABASE_URL)
+                except ImportError:
+                    # Default database URL
+                    self.engine = create_engine('sqlite:///./test.db')
             
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+            self.db = SessionLocal()
+            
+            logger.info("[OK] Database connection established")
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to initialize: {str(e)}")
+            raise
+    
+    def count_all_feeds(self) -> Dict[str, int]:
+        """Count all feeds by status and source type."""
+        try:
+            total = self.db.query(Feed).count()
+            ready = self.db.query(Feed).filter(Feed.status == "ready").count()
+            youtube = self.db.query(Feed).filter(Feed.source_type == "youtube").count()
+            blog = self.db.query(Feed).filter(Feed.source_type == "blog").count()
+            
+            return {
+                "total": total,
+                "ready": ready,
+                "youtube": youtube,
+                "blog": blog
+            }
+        except Exception as e:
+            logger.error(f"Error counting feeds: {str(e)}")
+            return {}
+    
+    def check_dependencies(self) -> bool:
+        """Check if required functions are available."""
+        try:
+            # Try to import required functions
+            from feed_router import (
+                categorize_content_with_openai,
+                get_or_create_concepts,
+                get_or_create_domains,
+                get_or_assign_category,
+                extract_clean_source_name,
+                get_youtube_channel_info
+            )
+            
+            self.categorize_content_with_openai = categorize_content_with_openai
+            self.get_or_create_concepts = get_or_create_concepts
+            self.get_or_create_domains = get_or_create_domains
+            self.get_or_assign_category = get_or_assign_category
+            self.extract_clean_source_name = extract_clean_source_name
+            self.get_youtube_channel_info = get_youtube_channel_info
+            
+            # Check OpenAI client
+            from feed_router import client
+            if not client:
+                logger.warning("OpenAI client not configured - AI features will be limited")
+                return False
+            
+            logger.info("[OK] All dependencies loaded successfully")
+            return True
+            
+        except ImportError as e:
+            logger.error(f"[ERROR] Missing dependencies: {str(e)}")
+            logger.info("Creating fallback functions...")
+            self._create_fallback_functions()
+            return False
+    
+    def _create_fallback_functions(self):
+        """Create fallback functions if OpenAI is not available."""
+        def fallback_categorize(content, categories):
+            """Fallback categorization without OpenAI."""
+            import random
+            
+            # Simple keyword-based categorization
+            keywords = {
+                "technology": ["tech", "software", "code", "programming", "ai", "machine learning"],
+                "business": ["business", "marketing", "sales", "revenue", "strategy"],
+                "education": ["learn", "education", "tutorial", "course", "training"],
+                "health": ["health", "medical", "fitness", "wellness", "medicine"]
+            }
+            
+            content_lower = content.lower()
+            matched_categories = []
+            
+            for category, keyword_list in keywords.items():
+                for keyword in keyword_list:
+                    if keyword in content_lower:
+                        matched_categories.append(category)
+                        break
+            
+            if not matched_categories:
+                matched_categories = ["General"]
+            
+            return (
+                matched_categories[:3],  # categories
+                [],  # skills
+                [],  # tools
+                [],  # roles
+                "Blog",  # content_type
+                ["General Topic"],  # concepts
+                ["General"]  # domains
+            )
+        
+        def fallback_create_concepts(db, concepts):
+            """Fallback concept creation."""
+            concept_objects = []
+            for name in concepts:
+                concept = db.query(Concept).filter(func.lower(Concept.name) == func.lower(name)).first()
+                if not concept:
+                    concept = Concept(name=name, description=f"Concept: {name}", is_active=True)
+                    db.add(concept)
+                    db.flush()
+                concept_objects.append(concept)
+            return concept_objects
+        
+        def fallback_create_domains(db, domains):
+            """Fallback domain creation."""
+            domain_objects = []
+            for name in domains:
+                domain = db.query(Domain).filter(func.lower(Domain.name) == func.lower(name)).first()
+                if not domain:
+                    domain = Domain(name=name, description=f"Domain: {name}", is_active=True)
+                    db.add(domain)
+                    db.flush()
+                domain_objects.append(domain)
+            return domain_objects
+        
+        self.categorize_content_with_openai = fallback_categorize
+        self.get_or_create_concepts = fallback_create_concepts
+        self.get_or_create_domains = fallback_create_domains
+        
+        # Simple fallbacks for other functions
+        self.get_or_assign_category = lambda db, categories: (None, None)
+        self.extract_clean_source_name = lambda url: url.split('//')[-1].split('/')[0] if '//' in url else url
+        self.get_youtube_channel_info = lambda video_id: {"channel_name": "YouTube Creator", "available": False}
+        
+        logger.info("[OK] Fallback functions created")
+    
+    def process_all_feeds(self, batch_size: int = 10, delay: float = 1.0):
+        """Process all ready feeds in batches."""
+        try:
+            # Get all ready feeds
+            feeds = self.db.query(Feed).filter(Feed.status == "ready").order_by(Feed.id).all()
+            total_feeds = len(feeds)
+            
+            logger.info(f"Found {total_feeds} ready feeds to process")
+            
+            stats = {
+                "total": total_feeds,
+                "processed": 0,
+                "success": 0,
+                "skipped": 0,
+                "failed": 0,
+                "concepts_created": 0,
+                "domains_created": 0,
+                "sources_created": 0
+            }
+            
+            start_time = time.time()
+            
+            # Process in batches
+            for i in range(0, total_feeds, batch_size):
+                batch = feeds[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
+                total_batches = (total_feeds + batch_size - 1) // batch_size
+                
+                logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} feeds)")
+                
+                batch_stats = self._process_batch(batch, stats)
+                stats.update(batch_stats)
+                
+                # Show progress
+                progress = (i + len(batch)) / total_feeds * 100
+                elapsed = time.time() - start_time
+                estimated_total = elapsed / (progress / 100) if progress > 0 else 0
+                remaining = estimated_total - elapsed
+                
+                logger.info(f"Progress: {progress:.1f}% | "
+                          f"Success: {stats['success']} | "
+                          f"Failed: {stats['failed']} | "
+                          f"ETA: {remaining/60:.1f} min")
+                
+                # Add delay between batches
+                if i + batch_size < total_feeds and delay > 0:
+                    time.sleep(delay)
+            
+            # Final commit
+            self.db.commit()
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"\n{'='*60}")
+            logger.info(f"UPDATE COMPLETED")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total time: {elapsed_time/60:.1f} minutes")
+            logger.info(f"Total feeds: {stats['total']}")
+            logger.info(f"Successfully processed: {stats['success']}")
+            logger.info(f"Skipped (no content): {stats['skipped']}")
+            logger.info(f"Failed: {stats['failed']}")
+            logger.info(f"Concepts created: {stats['concepts_created']}")
+            logger.info(f"Domains created: {stats['domains_created']}")
+            logger.info(f"Sources created: {stats['sources_created']}")
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error in process_all_feeds: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    def _process_batch(self, batch: List[Feed], stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a batch of feeds."""
+        batch_stats = stats.copy()
+        
+        for feed in batch:
+            try:
+                batch_stats['processed'] += 1
+                feed_id = feed.id
+                feed_title = feed.title[:50] + "..." if len(feed.title) > 50 else feed.title
+                
+                logger.info(f"  Processing feed {batch_stats['processed']}/{stats['total']}: "
+                          f"ID={feed_id}, Title='{feed_title}'")
+                
+                # Check if already has concepts
+                existing_concepts = self.db.query(FeedConcept).filter(
+                    FeedConcept.feed_id == feed.id
+                ).count()
+                
+                if existing_concepts > 0:
+                    logger.info(f"    [SKIP] Already has {existing_concepts} concepts, skipping")
+                    batch_stats['skipped'] += 1
+                    continue
+                
+                # Process the feed
+                result = self._process_single_feed(feed)
+                
+                if result['success']:
+                    batch_stats['success'] += 1
+                    batch_stats['concepts_created'] += result.get('concepts_created', 0)
+                    batch_stats['domains_created'] += result.get('domains_created', 0)
+                    batch_stats['sources_created'] += result.get('sources_created', 0)
+                    
+                    logger.info(f"    [OK] Success: {result.get('concepts_created', 0)} concepts, "
+                              f"{result.get('domains_created', 0)} domains")
+                else:
+                    batch_stats['failed'] += 1
+                    logger.warning(f"    [FAIL] Failed: {result.get('error', 'Unknown error')}")
+                
+            except Exception as e:
+                batch_stats['failed'] += 1
+                logger.error(f"    [ERROR] Error processing feed {feed.id}: {str(e)}")
+                continue
+        
+        # Commit the batch
+        try:
+            self.db.commit()
+            logger.info(f"    [SAVE] Batch committed successfully")
+        except Exception as e:
+            logger.error(f"    [ERROR] Batch commit failed: {str(e)}")
+            self.db.rollback()
+        
+        return batch_stats
+    
+    def _process_single_feed(self, feed: Feed) -> Dict[str, Any]:
+        """Process a single feed."""
+        try:
+            # Get content
+            content = ""
+            if feed.source_type == "blog" and feed.blog:
+                content = feed.blog.content
             elif feed.source_type == "youtube" and feed.transcript_id:
                 transcript = self.db.query(Transcript).filter(
                     Transcript.transcript_id == feed.transcript_id
                 ).first()
                 if transcript:
-                    return transcript.transcript_text
+                    content = transcript.transcript_text
             
-            return None
-        except Exception as e:
-            logger.error(f"Error getting content for feed {feed.id}: {e}")
-            return None
-    
-    def get_all_admin_categories(self) -> List[str]:
-        """Get all active categories from database."""
-        categories = self.db.query(Category).filter(Category.is_active == True).all()
-        return [category.name for category in categories]
-    
-    def categorize_with_openai(self, content: str, admin_categories: List[str]) -> Tuple[List[str], str, str]:
-        """
-        Categorize content using OpenAI and return:
-        - Matched categories list
-        - Primary category name (for category_id lookup)
-        - Content type
-        """
-        try:
-            truncated_content = content[:4000] + "..." if len(content) > 4000 else content
+            if not content or len(content.strip()) < 50:
+                return {
+                    "success": False,
+                    "error": "No content or content too short",
+                    "feed_id": feed.id
+                }
             
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": """You are a content analysis assistant. Analyze the content and:
-                        1. Categorize it into the provided categories
-                        2. Determine content type (Blog, Video, Podcast, Webinar)
-                        
-                        Return JSON with this structure:
-                        {
-                            "categories": ["category1", "category2"],
-                            "content_type": "Blog/Video/Podcast/Webinar"
-                        }"""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Available categories: {', '.join(admin_categories)}.\n\nContent:\n{truncated_content}\n\nReturn JSON with categories and content_type."
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=300,
-                response_format={ "type": "json_object" }
-            )
-            
-            analysis = json.loads(response.choices[0].message.content.strip())
-            
-            # Validate categories
-            categories = analysis.get("categories", [])
-            matched_categories = []
-            for item in categories:
-                for category in admin_categories:
-                    if (item.lower() == category.lower() or 
-                        item.lower() in category.lower() or 
-                        category.lower() in item.lower()):
-                        matched_categories.append(category)
-                        break
-            
-            # Remove duplicates and limit
-            seen = set()
-            unique_categories = []
-            for cat in matched_categories:
-                if cat not in seen:
-                    seen.add(cat)
-                    unique_categories.append(cat)
-            
-            if not unique_categories:
-                unique_categories = [admin_categories[0]] if admin_categories else ["Uncategorized"]
-            
-            # Determine content type
-            content_type_str = analysis.get("content_type", "Blog")
-            
-            # Return first category as primary, all categories, and content type
-            primary_category = unique_categories[0] if unique_categories else None
-            return unique_categories[:3], primary_category, content_type_str
-            
-        except Exception as e:
-            logger.error(f"OpenAI categorization error: {e}")
-            return [], None, "Blog"
-    
-    def find_category_and_subcategory(self, category_name: str) -> Tuple[Optional[int], Optional[str]]:
-        """Find category and subcategory IDs based on category name."""
-        try:
-            # Find category
-            category = self.db.query(Category).filter(
-                Category.name.ilike(f"%{category_name}%"),
+            # Get categories for classification
+            admin_categories = [c.name for c in self.db.query(Category).filter(
                 Category.is_active == True
-            ).first()
+            ).all()]
             
-            if not category:
-                logger.warning(f"Category not found for name: {category_name}")
-                return None, None
+            if not admin_categories:
+                admin_categories = ["Uncategorized"]
             
-            category_id = category.id
+            # Categorize content
+            categories, skills, tools, roles, content_type, concepts, domains = \
+                self.categorize_content_with_openai(content, admin_categories)
             
-            # Find first subcategory for this category
-            subcategory = self.db.query(SubCategory).filter(
-                SubCategory.category_id == category_id
-            ).first()
+            # Create concepts and domains
+            concept_objects = self.get_or_create_concepts(self.db, concepts)
+            domain_objects = self.get_or_create_domains(self.db, domains)
             
-            subcategory_id = subcategory.id if subcategory else None
+            # Link concepts to domains
+            domain_concept_count = 0
+            for concept in concept_objects:
+                for domain in domain_objects:
+                    existing = self.db.query(DomainConcept).filter(
+                        DomainConcept.domain_id == domain.id,
+                        DomainConcept.concept_id == concept.id
+                    ).first()
+                    if not existing:
+                        self.db.add(DomainConcept(
+                            domain_id=domain.id,
+                            concept_id=concept.id,
+                            relevance_score=1.0
+                        ))
+                        domain_concept_count += 1
             
-            return category_id, subcategory_id
+            # Link concepts to feed
+            feed_concept_count = 0
+            for concept in concept_objects:
+                existing = self.db.query(FeedConcept).filter(
+                    FeedConcept.feed_id == feed.id,
+                    FeedConcept.concept_id == concept.id
+                ).first()
+                if not existing:
+                    self.db.add(FeedConcept(
+                        feed_id=feed.id,
+                        concept_id=concept.id,
+                        confidence_score=0.8
+                    ))
+                    feed_concept_count += 1
+            
+            # Create or update source
+            source_created = 0
+            if feed.source_type == "blog" and feed.blog:
+                source_created = self._create_blog_source(feed.blog)
+            elif feed.source_type == "youtube" and feed.transcript_id:
+                transcript = self.db.query(Transcript).filter(
+                    Transcript.transcript_id == feed.transcript_id
+                ).first()
+                if transcript:
+                    source_created = self._create_youtube_source(transcript)
+            
+            # Update feed timestamp
+            feed.updated_at = datetime.utcnow()
+            
+            return {
+                "success": True,
+                "feed_id": feed.id,
+                "concepts_created": len(concept_objects),
+                "domains_created": len(domain_objects),
+                "feed_concepts_linked": feed_concept_count,
+                "domain_concepts_linked": domain_concept_count,
+                "sources_created": source_created
+            }
             
         except Exception as e:
-            logger.error(f"Error finding category/subcategory for '{category_name}': {e}")
-            return None, None
+            return {
+                "success": False,
+                "error": str(e),
+                "feed_id": feed.id
+            }
     
-    def migrate_single_feed(self, feed: Feed) -> bool:
-        """Migrate a single feed by filling missing category/subcategory."""
+    def _create_blog_source(self, blog: Blog) -> int:
+        """Create or update blog source."""
         try:
-            # Check if feed already has category_id and subcategory_id
-            if feed.category_id is not None and feed.subcategory_id is not None:
-                logger.info(f"Feed {feed.id} already has category_id={feed.category_id}, subcategory_id={feed.subcategory_id} - skipping")
-                self.stats["skipped"] += 1
-                return True
+            if not blog.website:
+                return 0
             
-            # Get content for categorization
-            content = self.get_feed_content(feed)
-            if not content:
-                logger.warning(f"No content found for feed {feed.id} - skipping")
-                self.stats["no_content"] += 1
-                return False
+            source_name = self.extract_clean_source_name(blog.website)
             
-            # Get admin categories
-            admin_categories = self.get_all_admin_categories()
-            if not admin_categories:
-                logger.error("No admin categories found in database")
-                return False
+            source = self.db.query(Source).filter(
+                Source.website == blog.website,
+                Source.source_type == "blog"
+            ).first()
             
-            # Categorize using OpenAI
-            logger.info(f"Categorizing feed {feed.id} with OpenAI...")
-            categories, primary_category, content_type = self.categorize_with_openai(content, admin_categories)
+            if not source:
+                source = Source(
+                    name=source_name,
+                    website=blog.website,
+                    source_type="blog",
+                    is_active=True
+                )
+                self.db.add(source)
+                self.db.flush()
+                return 1
+            return 0
             
-            if not primary_category:
-                logger.warning(f"No primary category found for feed {feed.id}")
-                return False
+        except Exception as e:
+            logger.error(f"Error creating blog source: {str(e)}")
+            return 0
+    
+    def _create_youtube_source(self, transcript: Transcript) -> int:
+        """Create or update YouTube source."""
+        try:
+            channel_info = self.get_youtube_channel_info(transcript.video_id)
+            channel_name = channel_info.get("channel_name", "YouTube Creator")
             
-            # Find category and subcategory IDs
-            category_id, subcategory_id = self.find_category_and_subcategory(primary_category)
+            if channel_name == "YouTube Creator":
+                return 0
             
-            if not category_id:
-                logger.warning(f"Could not find category ID for '{primary_category}'")
-                return False
+            source = self.db.query(Source).filter(
+                Source.name == channel_name,
+                Source.source_type == "youtube"
+            ).first()
             
-            # Update feed with new values
-            logger.info(f"Updating feed {feed.id}: category_id={category_id}, subcategory_id={subcategory_id}")
+            if not source:
+                website = f"https://www.youtube.com/channel/{channel_info.get('channel_id', '')}" \
+                         if channel_info.get('channel_id') else "https://www.youtube.com"
+                source = Source(
+                    name=channel_name,
+                    website=website,
+                    source_type="youtube",
+                    is_active=True
+                )
+                self.db.add(source)
+                self.db.flush()
+                return 1
+            return 0
             
-            # Update the feed
-            feed.category_id = category_id
-            feed.subcategory_id = subcategory_id
+        except Exception as e:
+            logger.error(f"Error creating YouTube source: {str(e)}")
+            return 0
+    
+    def show_statistics(self):
+        """Show current database statistics."""
+        try:
+            logger.info("\nCURRENT DATABASE STATISTICS")
+            logger.info("=" * 50)
             
-            # Also update categories array if needed
-            if categories and not feed.categories:
-                feed.categories = categories
+            # Feed statistics
+            feed_counts = self.count_all_feeds()
+            logger.info(f"Feeds:")
+            logger.info(f"  Total: {feed_counts.get('total', 0)}")
+            logger.info(f"  Ready: {feed_counts.get('ready', 0)}")
+            logger.info(f"  YouTube: {feed_counts.get('youtube', 0)}")
+            logger.info(f"  Blog: {feed_counts.get('blog', 0)}")
             
-            # Update content_type if needed
-            if content_type and not feed.content_type:
-                # Convert to appropriate enum value
-                content_type_lower = content_type.lower()
-                if "video" in content_type_lower:
-                    feed.content_type = "Video"
-                elif "podcast" in content_type_lower:
-                    feed.content_type = "Podcast"
-                elif "webinar" in content_type_lower:
-                    feed.content_type = "Webinar"
-                else:
-                    feed.content_type = "Blog"
+            # Concept statistics
+            concept_count = self.db.query(Concept).count()
+            concepts_with_feeds = self.db.query(Concept).join(FeedConcept).distinct().count()
+            logger.info(f"\nConcepts:")
+            logger.info(f"  Total: {concept_count}")
+            logger.info(f"  Linked to feeds: {concepts_with_feeds}")
+            
+            # Domain statistics
+            domain_count = self.db.query(Domain).count()
+            logger.info(f"\nDomains:")
+            logger.info(f"  Total: {domain_count}")
+            
+            # Source statistics
+            source_count = self.db.query(Source).count()
+            logger.info(f"\nSources:")
+            logger.info(f"  Total: {source_count}")
+            
+            # Feed-Concept relationships
+            feed_concept_count = self.db.query(FeedConcept).count()
+            feeds_with_concepts = self.db.query(Feed).join(FeedConcept).distinct().count()
+            logger.info(f"\nRelationships:")
+            logger.info(f"  Feed-Concept links: {feed_concept_count}")
+            logger.info(f"  Feeds with concepts: {feeds_with_concepts}")
+            
+            # Top concepts
+            top_concepts = self.db.query(
+                Concept.name,
+                func.count(FeedConcept.id).label('count')
+            ).join(FeedConcept).group_by(Concept.id).order_by(
+                func.count(FeedConcept.id).desc()
+            ).limit(5).all()
+            
+            if top_concepts:
+                logger.info(f"\nTop 5 Concepts:")
+                for i, (name, count) in enumerate(top_concepts, 1):
+                    logger.info(f"  {i}. {name}: {count} feeds")
+            
+        except Exception as e:
+            logger.error(f"Error showing statistics: {str(e)}")
+    
+    def cleanup(self):
+        """Clean up orphaned data."""
+        try:
+            logger.info("\nCleaning up orphaned data...")
+            
+            # Find and delete orphaned concepts
+            orphaned_concepts = self.db.query(Concept).filter(
+                ~Concept.id.in_(self.db.query(FeedConcept.concept_id).distinct())
+            ).all()
+            
+            # Find and delete orphaned domains
+            orphaned_domains = self.db.query(Domain).filter(
+                ~Domain.id.in_(self.db.query(DomainConcept.domain_id).distinct())
+            ).all()
+            
+            concept_count = len(orphaned_concepts)
+            domain_count = len(orphaned_domains)
+            
+            for concept in orphaned_concepts:
+                self.db.delete(concept)
+            
+            for domain in orphaned_domains:
+                self.db.delete(domain)
             
             self.db.commit()
-            self.stats["updated"] += 1
-            return True
+            
+            logger.info(f"  Deleted {concept_count} orphaned concepts")
+            logger.info(f"  Deleted {domain_count} orphaned domains")
             
         except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
             self.db.rollback()
-            logger.error(f"Error migrating feed {feed.id}: {e}")
-            self.stats["errors"] += 1
-            return False
     
-    def migrate_all_feeds(self, batch_size: int = 50, limit: Optional[int] = None):
-        """Migrate all feeds with missing category/subcategory."""
+    def close(self):
+        """Close database connection."""
         try:
-            # Query feeds with missing category_id or subcategory_id
-            query = self.db.query(Feed).filter(
-                (Feed.category_id.is_(None)) | (Feed.subcategory_id.is_(None))
-            ).order_by(Feed.id)
-            
-            if limit:
-                query = query.limit(limit)
-            
-            feeds = query.all()
-            self.stats["total_feeds"] = len(feeds)
-            
-            logger.info(f"Found {self.stats['total_feeds']} feeds with missing category/subcategory")
-            
-            if not feeds:
-                logger.info("No feeds need migration")
-                return
-            
-            # Process in batches
-            for i in range(0, len(feeds), batch_size):
-                batch = feeds[i:i + batch_size]
-                logger.info(f"Processing batch {i//batch_size + 1}/{(len(feeds)-1)//batch_size + 1}")
-                
-                for feed in batch:
-                    self.stats["processed"] += 1
-                    self.migrate_single_feed(feed)
-                    
-                    # Log progress
-                    if self.stats["processed"] % 10 == 0:
-                        logger.info(f"Progress: {self.stats['processed']}/{self.stats['total_feeds']} feeds processed")
-            
-            # Log final statistics
-            logger.info("\n" + "="*50)
-            logger.info("MIGRATION COMPLETE - STATISTICS")
-            logger.info("="*50)
-            logger.info(f"Total feeds with missing data: {self.stats['total_feeds']}")
-            logger.info(f"Feeds processed: {self.stats['processed']}")
-            logger.info(f"Feeds updated: {self.stats['updated']}")
-            logger.info(f"Feeds skipped (already have data): {self.stats['skipped']}")
-            logger.info(f"Feeds with no content: {self.stats['no_content']}")
-            logger.info(f"Errors: {self.stats['errors']}")
-            logger.info("="*50)
-            
-        except Exception as e:
-            logger.error(f"Error in migrate_all_feeds: {e}")
-            raise
-
+            self.db.close()
+            logger.info("Database connection closed")
+        except:
+            pass
 
 def main():
-    """Main function to run the migration."""
-    # Database connection
-    DATABASE_URL = os.getenv("DATABASE_URL")
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL not found in environment variables")
+    """Main function to run the updater."""
+    import argparse
     
-    engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    parser = argparse.ArgumentParser(description="Update ALL feeds with enhanced metadata for search")
+    parser.add_argument("--batch-size", type=int, default=10, help="Number of feeds per batch")
+    parser.add_argument("--delay", type=float, default=1.0, help="Delay between batches in seconds")
+    parser.add_argument("--stats", action="store_true", help="Show statistics only")
+    parser.add_argument("--cleanup", action="store_true", help="Clean up orphaned data only")
+    parser.add_argument("--test", action="store_true", help="Test mode - process only first 5 feeds")
     
+    args = parser.parse_args()
+    
+    updater = None
     try:
-        # Create a session
-        db = SessionLocal()
+        print("\n" + "="*60)
+        print("FEED UPDATER - Enhancing all feeds for search")
+        print("="*60 + "\n")
         
-        logger.info("Starting feed category migration...")
+        updater = AllFeedUpdater()
         
-        # Initialize migrator
-        migrator = FeedCategoryMigrator(db)
+        # Check dependencies
+        if not updater.check_dependencies():
+            print("[WARNING] OpenAI not configured. Using fallback functions.")
+            print("          Search quality will be limited.")
+            response = input("Continue anyway? (y/n): ")
+            if response.lower() != 'y':
+                print("Exiting...")
+                return
         
-        # Run migration
-        migrator.migrate_all_feeds(batch_size=20)
+        # Show current statistics
+        updater.show_statistics()
         
-        logger.info("Migration completed successfully!")
+        if args.stats:
+            # Just show statistics and exit
+            updater.close()
+            return
         
+        if args.cleanup:
+            # Just cleanup and exit
+            updater.cleanup()
+            updater.close()
+            return
+        
+        # Confirm before processing
+        feed_counts = updater.count_all_feeds()
+        ready_feeds = feed_counts.get('ready', 0)
+        
+        if ready_feeds == 0:
+            print("[ERROR] No ready feeds found to process!")
+            updater.close()
+            return
+        
+        if args.test:
+            print(f"\n[TEST MODE] Will process only first 5 feeds")
+            ready_feeds = 5
+        else:
+            print(f"\nREADY TO PROCESS {ready_feeds} FEEDS")
+        
+        print(f"Batch size: {args.batch_size}")
+        print(f"Delay between batches: {args.delay} seconds")
+        
+        if not args.test:
+            response = input("\nContinue with update? (y/n): ")
+            if response.lower() != 'y':
+                print("Update cancelled.")
+                updater.close()
+                return
+        
+        # Process feeds
+        print("\n" + "="*60)
+        print("STARTING FEED UPDATE PROCESS")
+        print("="*60 + "\n")
+        
+        if args.test:
+            # Test mode - process limited feeds
+            feeds = updater.db.query(Feed).filter(Feed.status == "ready").order_by(Feed.id).limit(5).all()
+            batch_stats = updater._process_batch(feeds, {"total": 5, "processed": 0, "success": 0, "skipped": 0, "failed": 0})
+            updater.db.commit()
+            print(f"\n[OK] TEST COMPLETED")
+            print(f"Processed: {batch_stats.get('processed', 0)}")
+            print(f"Success: {batch_stats.get('success', 0)}")
+            print(f"Failed: {batch_stats.get('failed', 0)}")
+        else:
+            # Full processing
+            stats = updater.process_all_feeds(
+                batch_size=args.batch_size,
+                delay=args.delay
+            )
+            
+            # Show final statistics
+            print("\n" + "="*60)
+            print("FINAL STATISTICS")
+            print("="*60)
+            updater.show_statistics()
+            
+            # Cleanup orphaned data
+            print("\n" + "="*60)
+            print("CLEANING UP ORPHANED DATA")
+            print("="*60)
+            updater.cleanup()
+        
+        print("\n" + "="*60)
+        print("[OK] UPDATE PROCESS COMPLETED SUCCESSFULLY")
+        print("="*60)
+        
+    except KeyboardInterrupt:
+        print("\n\n[WARNING] Update interrupted by user")
+        if updater:
+            updater.db.rollback()
     except Exception as e:
-        logger.error(f"Migration failed: {e}")
-        raise
+        print(f"\n[ERROR] {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
-        if 'db' in locals():
-            db.close()
-
+        if updater:
+            updater.close()
 
 if __name__ == "__main__":
     main()
