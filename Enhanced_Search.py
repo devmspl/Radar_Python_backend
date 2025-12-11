@@ -303,43 +303,6 @@ def search_content(
     }
 
 # ------------------ Tab 2: Lists Search ------------------
-@router.get("/debug/youtube-playlists")
-def debug_youtube_playlists(db: Session = Depends(get_db)):
-    """Debug endpoint to check YouTube playlist jobs."""
-    
-    playlist_jobs = db.query(TranscriptJob).filter(
-        TranscriptJob.type == "playlist"
-    ).all()
-    
-    job_info = []
-    for job in playlist_jobs:
-        transcript_count = db.query(Transcript).filter(
-            Transcript.job_id == job.id
-        ).count()
-        
-        # Parse playlists
-        playlists = []
-        if job.playlists:
-            try:
-                playlists = json.loads(job.playlists)
-            except json.JSONDecodeError:
-                pass
-        
-        job_info.append({
-            "job_id": job.job_id,
-            "url": job.url,
-            "content_name": job.content_name,
-            "status": job.status.value,
-            "transcript_count": transcript_count,
-            "playlists": playlists,
-            "created_at": job.created_at
-        })
-    
-    return {
-        "total_playlist_jobs": len(playlist_jobs),
-        "completed_jobs": len([j for j in playlist_jobs if j.status.value == "completed"]),
-        "jobs": job_info
-    }
 
 
 @router.get("/lists", response_model=Dict[str, Any])
@@ -492,32 +455,7 @@ def search_lists(
         }
     }
 
-@router.get("/debug/lists")
-def debug_lists(
-    db: Session = Depends(get_db)
-):
-    """
-    Debug endpoint to check list data.
-    """
-    lists = db.query(ContentList).all()
-    
-    debug_info = []
-    for clist in lists:
-        debug_info.append({
-            "id": clist.id,
-            "name": clist.name,
-            "description": clist.description,
-            "source_type": clist.source_type,
-            "is_active": clist.is_active,
-            "feed_ids": clist.feed_ids if hasattr(clist, 'feed_ids') else None,
-            "feed_count": len(clist.feed_ids) if clist.feed_ids else 0,
-            "created_at": clist.created_at
-        })
-    
-    return {
-        "total_lists": len(lists),
-        "lists": debug_info
-    }
+
 # ------------------ Tab 3: Topics Search ------------------
 
 @router.get("/topics", response_model=Dict[str, Any])
