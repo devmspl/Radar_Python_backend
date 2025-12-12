@@ -11,9 +11,15 @@ from database import get_db
 from models import (
     Feed, Blog, Transcript, Topic, Source, Concept, Domain, 
     ContentList, UserTopicFollow, UserSourceFollow, Bookmark,
-    Category, SubCategory, FeedConcept, DomainConcept
+    Category, SubCategory, FeedConcept, DomainConcept,Topic
 )
 from feed_router import get_feed_metadata
+import os
+import re
+import requests
+
+
+
 
 router = APIRouter(prefix="/search", tags=["Search"])
 logger = logging.getLogger(__name__)
@@ -190,7 +196,204 @@ def auto_create_lists_from_youtube(db: Session):
         logger.error(f"Error auto-creating lists: {str(e)}")
         return 0
 
+# Make sure YOUTUBE_API_KEY is defined globally or passed to this function
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
+def get_source_metadata(source: Source, db: Session) -> Dict[str, Any]:
+    """Get metadata for a source."""
+    # Initialize metadata with basic info
+    metadata = {
+        "name": source.name,
+        "website": source.website,
+        "source_type": source.source_type,
+        "description": getattr(source, 'description', ''),
+        "favicon": None,
+        "thumbnail": None,
+        "channel_info": None,
+        "top_feeds": []
+    }
+    
+    # Get sample feeds for description and content analysis
+    if source.source_type == "blog":
+        sample_feeds = db.query(Feed).join(Blog).filter(
+            Blog.website == source.website,
+            Feed.status == "ready"
+        ).order_by(Feed.created_at.desc()).limit(5).all()
+    else:
+        # For YouTube, get recent feeds from this source type
+        sample_feeds = db.query(Feed).filter(
+            Feed.source_type == "youtube",
+            Feed.status == "ready"
+        ).order_by(Feed.created_at.desc()).limit(5).all()
+    
+    # Generate description if empty
+    if not metadata["description"] and sample_feeds:
+        from collections import Counter
+        all_topics = []
+        for feed in sample_feeds:
+            if feed.categories:
+                all_topics.extend(feed.categories)
+        
+        if all_topics:
+            topic_counter = Counter(all_topics)
+            top_topics = topic_counter.most_common(3)
+            
+            if source.source_type == "youtube":
+                metadata["description"] = f"YouTube channel covering {', '.join([topic for topic, _ in top_topics])}"
+            else:
+                metadata["description"] = f"Website covering {', '.join([topic for topic, _ in top_topics])}"
+        else:
+            metadata["description"] = f"YouTube channel {source.name}" if source.source_type == "youtube" else f"Website: {source.name}"
+    
+    # Handle YouTube-specific metadata
+    if source.source_type == "youtube":
+        # Extract Channel ID from the website URL
+        channel_id = None
+        
+        # Pattern for standard channel URLs
+        pattern = r'youtube\.com/channel/([a-zA-Z0-9_-]{24})'
+        match = re.search(pattern, source.website)
+        
+        if match:
+            channel_id = match.group(1)
+            logger.info(f"Extracted channel ID: {channel_id} from URL: {source.website}")
+        else:
+            # Check if it's a custom URL format
+            patterns = [
+                r'youtube\.com/c/([a-zA-Z0-9_-]+)',
+                r'youtube\.com/user/([a-zA-Z0-9_-]+)',
+                r'youtube\.com/@([a-zA-Z0-9_-]+)'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, source.website)
+                if match:
+                    # For custom URLs, we need to search for the channel
+                    custom_name = match.group(1)
+                    logger.info(f"Found custom YouTube URL: {custom_name}")
+                    # You could implement search by custom name here
+                    break
+        
+        # Call YouTube Data API with the extracted Channel ID
+        if channel_id and YOUTUBE_API_KEY:
+            try:
+                api_url = "https://www.googleapis.com/youtube/v3/channels"
+                params = {
+                    'key': YOUTUBE_API_KEY,
+                    'id': channel_id,
+                    'part': 'snippet,statistics,brandingSettings'
+                }
+                
+                logger.info(f"Calling YouTube API for channel ID: {channel_id}")
+                response = requests.get(api_url, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    logger.info(f"YouTube API response: {data}")
+                    
+                    if data.get('items') and len(data['items']) > 0:
+                        channel_data = data['items'][0]
+                        snippet = channel_data.get('snippet', {})
+                        stats = channel_data.get('statistics', {})
+                        branding = channel_data.get('brandingSettings', {}).get('image', {})
+                        
+                        # Get the highest quality thumbnail
+                        thumbnails = snippet.get('thumbnails', {})
+                        thumbnail_url = None
+                        for res in ['high', 'medium', 'default']:
+                            if thumbnails.get(res):
+                                thumbnail_url = thumbnails[res]['url']
+                                break
+                        
+                        # Get banner image if available
+                        banner_url = None
+                        if branding.get('bannerExternalUrl'):
+                            banner_url = branding['bannerExternalUrl']
+                        
+                        metadata.update({
+                            "favicon": "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico",
+                            "thumbnail": thumbnail_url,
+                            "banner": banner_url,
+                            "channel_info": {
+                                "channel_id": channel_id,
+                                "title": snippet.get('title', source.name),
+                                "description": snippet.get('description', ''),
+                                "published_at": snippet.get('publishedAt'),
+                                "country": snippet.get('country'),
+                                "subscriber_count": stats.get('subscriberCount'),
+                                "video_count": stats.get('videoCount'),
+                                "view_count": stats.get('viewCount'),
+                                "available": True
+                            }
+                        })
+                        logger.info(f"Successfully fetched channel info for {source.name}")
+                    else:
+                        logger.warning(f"No channel data found for ID: {channel_id}")
+                        metadata["channel_info"] = {"available": False, "error": "Channel not found"}
+                else:
+                    logger.error(f"YouTube API error: {response.status_code} - {response.text}")
+                    metadata["channel_info"] = {"available": False, "error": f"API error {response.status_code}"}
+                    
+            except Exception as e:
+                logger.error(f"Failed to fetch YouTube channel info for {source.website}: {e}")
+                metadata["channel_info"] = {"available": False, "error": str(e)}
+        else:
+            if not channel_id:
+                logger.warning(f"Could not extract channel ID from URL: {source.website}")
+            if not YOUTUBE_API_KEY:
+                logger.warning("YOUTUBE_API_KEY not configured")
+            metadata["channel_info"] = {"available": False, "error": "Missing channel ID or API key"}
+    
+    # Handle blog sources
+    elif source.source_type == "blog":
+        # Get website favicon
+        try:
+            from urllib.parse import urlparse
+            website_url = source.website
+            if not website_url.startswith(('http://', 'https://')):
+                website_url = f"https://{website_url}"
+            
+            parsed_url = urlparse(website_url)
+            domain = parsed_url.netloc or parsed_url.path.split('/')[0]
+            metadata["favicon"] = f"https://www.google.com/s2/favicons?domain={domain}&sz=64"
+        except Exception as e:
+            logger.error(f"Failed to generate favicon URL for {source.website}: {e}")
+            metadata["favicon"] = None
+    
+    # Get top feeds for display (for both YouTube and blog)
+    for feed in sample_feeds[:3]:  # Only first 3
+        try:
+            # Get feed metadata
+            feed_meta = get_feed_metadata(feed, db)
+            
+            # Extract summary
+            summary = ""
+            if feed.ai_generated_content and "summary" in feed.ai_generated_content:
+                summary = feed.ai_generated_content["summary"]
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+            elif feed.slides and len(feed.slides) > 0:
+                summary = feed.slides[0].body
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+            
+            # Get thumbnail
+            thumbnail = None
+            if source.source_type == "youtube":
+                thumbnail = feed_meta.get("thumbnail_url") or feed_meta.get("channel_thumbnail")
+            else:
+                thumbnail = feed_meta.get("favicon")
+            
+            metadata["top_feeds"].append({
+                "id": feed.id,
+                "title": feed.title,
+                "summary": summary,
+                "thumbnail": thumbnail
+            })
+        except Exception as e:
+            logger.error(f"Error processing feed {feed.id} for source metadata: {e}")
+    
+    return metadata
 # ------------------ Tab 1: Content Search ------------------
 
 @router.get("/content", response_model=Dict[str, Any])
@@ -471,7 +674,7 @@ def search_topics(
     Search topics extracted from content via LLM.
     
     This is for Tab 3: Topics
-    Topics cannot be followed or bookmarked
+    Topics can be followed via topic_id
     """
     # Get all unique topics from feed categories
     all_feeds = db.query(Feed).filter(
@@ -483,18 +686,71 @@ def search_topics(
     topics_dict = {}
     for feed in all_feeds:
         if feed.categories:
-            for category in feed.categories:
-                if category not in topics_dict:
+            for category_name in feed.categories:
+                if category_name not in topics_dict:
                     # Count feeds for this topic
                     feed_count = db.query(Feed).filter(
-                        Feed.categories.contains([category]),
+                        Feed.categories.contains([category_name]),
                         Feed.status == "ready"
                     ).count()
                     
-                    topics_dict[category] = {
-                        "name": category,
+                    # Get or create Topic in database
+                    topic = db.query(Topic).filter(
+                        Topic.name == category_name
+                    ).first()
+                    
+                    # If topic doesn't exist in Topic table, create it
+                    if not topic:
+                        topic = Topic(
+                            name=category_name,
+                            description=f"Content related to {category_name}",
+                            follower_count=0,
+                            is_active=True,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow()
+                        )
+                        db.add(topic)
+                        db.commit()
+                        db.refresh(topic)
+                    
+                    # Get follower count from Topic table
+                    follower_count = topic.follower_count
+                    
+                    # Get unique sources for this topic
+                    topic_feeds = db.query(Feed).filter(
+                        Feed.categories.contains([category_name]),
+                        Feed.status == "ready"
+                    ).all()
+                    
+                    unique_sources = set()
+                    for topic_feed in topic_feeds:
+                        if topic_feed.source_type == "youtube":
+                            meta = get_feed_metadata(topic_feed, db)
+                            channel_name = meta.get("channel_name")
+                            if channel_name:
+                                unique_sources.add(channel_name)
+                        elif topic_feed.source_type == "blog" and topic_feed.blog:
+                            unique_sources.add(topic_feed.blog.website)
+                    
+                    # Check if current user is following this topic
+                    is_following = False
+                    if user_id and topic:
+                        user_follow = db.query(UserTopicFollow).filter(
+                            UserTopicFollow.user_id == user_id,
+                            UserTopicFollow.topic_id == topic.id
+                        ).first()
+                        is_following = user_follow is not None
+                    
+                    topics_dict[category_name] = {
+                        "id": topic.id,
+                        "name": category_name,
+                        "description": topic.description,
                         "feed_count": feed_count,
-                        "popularity": feed_count
+                        "follower_count": follower_count,
+                        "source_count": len(unique_sources),
+                        "is_following": is_following,
+                        "popularity": feed_count + (follower_count * 2),  # Weight followers more
+                        "sources": list(unique_sources)[:5]  # Top 5 sources
                     }
     
     # Convert to list and filter
@@ -586,8 +842,10 @@ def search_sources(
     if source_type:
         query_obj = query_obj.filter(Source.source_type == source_type)
     
-    # Get all sources
-    all_sources = query_obj.all()
+    # Count and paginate
+    total = query_obj.count()
+    query_obj = query_obj.order_by(Source.created_at.desc())
+    sources = query_obj.offset((page - 1) * limit).limit(limit).all()
     
     # Check follow status
     followed_source_ids = []
@@ -599,7 +857,7 @@ def search_sources(
     
     # Format results
     items = []
-    for source in all_sources:
+    for source in sources:
         # Get feed count
         if source.source_type == "blog":
             feed_count = db.query(Feed).join(Blog).filter(
@@ -628,16 +886,27 @@ def search_sources(
         
         top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         
+        # Get source metadata
+        metadata = get_source_metadata(source, db)
+        
+        # Use metadata description if source description is empty
+        source_description = getattr(source, 'description', '')
+        if not source_description and metadata.get("description"):
+            source_description = metadata["description"]
+        
         items.append({
             "id": source.id,
             "name": source.name,
             "website": source.website,
             "source_type": source.source_type,
+            "description": source_description,
             "feed_count": feed_count,
             "follower_count": source.follower_count,
             "top_topics": [topic for topic, count in top_topics],
             "is_following": source.id in followed_source_ids,
-            "created_at": source.created_at.isoformat() if source.created_at else None
+            "created_at": source.created_at.isoformat() if source.created_at else None,
+            "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+            "metadata": metadata
         })
     
     # Apply additional filters
@@ -679,9 +948,11 @@ def search_sources(
         # Filter by topic
         filtered_items = [item for item in filtered_items if topic in item["top_topics"]]
     
-    # Sort and paginate
+    # Sort by feed count (most feeds first)
     filtered_items.sort(key=lambda x: x["feed_count"], reverse=True)
     total = len(filtered_items)
+    
+    # Return only paginated items
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     paginated_items = filtered_items[start_idx:end_idx]
@@ -881,4 +1152,132 @@ def unified_search(
         "results": results,
         "page": page,
         "limit_per_tab": limit_per_tab
+    }
+
+@router.get("/concept/{concept_id}", response_model=Dict[str, Any])
+def get_concept_by_id(
+    concept_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    user_id: Optional[int] = Query(None, description="User ID for personalization"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get concept by ID with all associated feeds.
+    """
+    # Get the concept
+    concept = db.query(Concept).filter(
+        Concept.id == concept_id,
+        Concept.is_active == True
+    ).first()
+    
+    if not concept:
+        raise HTTPException(status_code=404, detail="Concept not found")
+    
+    # Get all feeds associated with this concept
+    feed_ids_query = db.query(FeedConcept.feed_id).filter(
+        FeedConcept.concept_id == concept_id
+    )
+    
+    # Get feeds with their relationships
+    query_obj = db.query(Feed).options(
+        joinedload(Feed.blog),
+        joinedload(Feed.slides),
+        joinedload(Feed.category),
+        joinedload(Feed.subcategory),
+        joinedload(Feed.concepts)
+    ).filter(
+        Feed.id.in_(feed_ids_query),
+        Feed.status == "ready"
+    )
+    
+    # Count and paginate
+    total = query_obj.count()
+    query_obj = query_obj.order_by(Feed.created_at.desc())
+    feeds = query_obj.offset((page - 1) * limit).limit(limit).all()
+    
+    # Format feeds
+    formatted_feeds = []
+    for feed in feeds:
+        formatted_feeds.append(format_feed_for_search(feed, db, user_id))
+    
+    # Get related concepts
+    related_concepts = []
+    if concept.related_concepts:
+        related_concept_names = concept.related_concepts[:5]
+        related_concept_objs = db.query(Concept).filter(
+            Concept.name.in_(related_concept_names)
+        ).all()
+        related_concepts = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "description": c.description,
+                "feed_count": len(c.feeds) if hasattr(c, 'feeds') else 0
+            }
+            for c in related_concept_objs
+        ]
+    
+    # Get domains for this concept
+    domains = []
+    domain_concepts = db.query(DomainConcept).filter(
+        DomainConcept.concept_id == concept_id
+    ).all()
+    
+    for dc in domain_concepts:
+        domain = db.query(Domain).filter(Domain.id == dc.domain_id).first()
+        if domain:
+            domains.append({
+                "id": domain.id,
+                "name": domain.name,
+                "description": domain.description,
+                "relevance_score": dc.relevance_score
+            })
+    
+    # Get concept statistics
+    feed_count = total
+    unique_topics = set()
+    unique_sources = set()
+    
+    for feed in feeds:
+        # Collect unique topics from categories
+        if feed.categories:
+            for category in feed.categories:
+                unique_topics.add(category)
+        
+        # Collect unique sources
+        if feed.source_type == "youtube":
+            meta = get_feed_metadata(feed, db)
+            channel_name = meta.get("channel_name")
+            if channel_name:
+                unique_sources.add(channel_name)
+        elif feed.source_type == "blog" and feed.blog:
+            unique_sources.add(feed.blog.website)
+    
+    return {
+        "concept": {
+            "id": concept.id,
+            "name": concept.name,
+            "description": concept.description,
+            "created_at": concept.created_at.isoformat() if concept.created_at else None,
+            "updated_at": concept.updated_at.isoformat() if concept.updated_at else None,
+            "popularity_score": concept.popularity_score,
+            "is_active": concept.is_active
+        },
+        "statistics": {
+            "feed_count": feed_count,
+            "unique_topics": len(unique_topics),
+            "unique_sources": len(unique_sources),
+            "top_topics": list(unique_topics)[:10],
+            "top_sources": list(unique_sources)[:10]
+        },
+        "domains": domains,
+        "related_concepts": related_concepts,
+        "feeds": {
+            "items": formatted_feeds,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total
+        }
     }

@@ -7,7 +7,7 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from database import get_db
-from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory,ScrapeJob
+from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory,ScrapeJob,Topic
 from openai import OpenAI, APIError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
@@ -725,6 +725,44 @@ def get_or_assign_category(db: Session, categories: List[str]) -> tuple:
     
     return category_obj, subcategory_obj
 
+
+def get_topic_descriptions(categories: List[str], db: Session) -> List[Dict[str, Any]]:
+    """Get topic descriptions for given categories."""
+    topic_descriptions = []
+    
+    for category_name in categories:
+        topic = db.query(Topic).filter(
+            Topic.name == category_name,
+            Topic.is_active == True
+        ).first()
+        
+        if topic:
+            # Count feeds for this topic
+            feed_count = db.query(Feed).filter(
+                Feed.status == "ready",
+                Feed.categories.isnot(None),
+                Feed.categories.contains([category_name])
+            ).count()
+            
+            topic_descriptions.append({
+                "name": topic.name,
+                "description": topic.description,
+                "id": topic.id,
+                "feed_count": feed_count,
+                "follower_count": topic.follower_count
+            })
+        else:
+            # Create a basic description if topic doesn't exist
+            topic_descriptions.append({
+                "name": category_name,
+                "description": f"Content related to {category_name}",
+                "id": None,
+                "feed_count": 0,
+                "follower_count": 0
+            })
+    
+    return topic_descriptions
+
 def create_or_update_content_list(playlist_id: str, feed_id: int, db: Session):
     """Create or update content list for YouTube playlist."""
     # Find existing content list for this playlist
@@ -1335,7 +1373,20 @@ def get_website_favicon(website_url: str) -> str:
 
 
 def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
-    """Extract proper metadata for feeds including YouTube channel names, correct URLs, and favicons."""
+    """Extract proper metadata for feeds including YouTube channel names, correct URLs, favicons, and topic descriptions."""
+    # Initialize base metadata
+    base_meta = {}
+    concepts = []
+    
+    # Get concepts for this feed
+    if hasattr(feed, 'concepts') and feed.concepts:
+        for concept in feed.concepts:
+            concepts.append({
+                "id": concept.id,
+                "name": concept.name,
+                "description": concept.description
+            })
+    
     if feed.source_type == "youtube" and feed.transcript_id:
         # Get the transcript to access YouTube-specific data
         transcript = db.query(Transcript).filter(
@@ -1358,17 +1409,7 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
             # Use YouTube favicon
             favicon = "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico"
             
-            # Get concepts for this feed
-            concepts = []
-            if hasattr(feed, 'concepts') and feed.concepts:
-                for concept in feed.concepts:
-                    concepts.append({
-                        "id": concept.id,
-                        "name": concept.name,
-                        "description": concept.description
-                    })
-            
-            return {
+            base_meta = {
                 "title": feed.title,
                 "original_title": original_title,
                 "author": channel_name,
@@ -1379,11 +1420,11 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "video_id": video_id,
                 "favicon": favicon,
                 "channel_info": channel_info,
-                "concepts": concepts  # Add concepts to metadata
+                "concepts": concepts
             }
     
     # For blogs
-    if feed.source_type == "blog" and feed.blog:
+    elif feed.source_type == "blog" and feed.blog:
         blog = feed.blog
         website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
         author = getattr(blog, 'author', 'Admin') or 'Admin'
@@ -1391,17 +1432,7 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
         # Get favicon URL
         favicon = get_website_favicon(blog.website)
         
-        # Get concepts for this feed
-        concepts = []
-        if hasattr(feed, 'concepts') and feed.concepts:
-            for concept in feed.concepts:
-                concepts.append({
-                    "id": concept.id,
-                    "name": concept.name,
-                    "description": concept.description
-                })
-        
-        return {
+        base_meta = {
             "title": feed.title,
             "original_title": blog.title,
             "author": author,
@@ -1410,21 +1441,50 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
             "website_name": website_name,
             "website": blog.website,
             "favicon": favicon,
-            "concepts": concepts  # Add concepts to metadata
+            "concepts": concepts
         }
     
-    # Fallback
-    return {
-        "title": feed.title,
-        "original_title": feed.title,
-        "author": "Unknown",
-        "source_url": "#",
-        "source_type": feed.source_type or "blog",
-        "website_name": "Unknown",
-        "website": "Unknown",
-        "favicon": get_website_favicon("Unknown"),
-        "concepts": []  # Empty concepts array for fallback
-    }
+    else:
+        # Fallback
+        base_meta = {
+            "title": feed.title,
+            "original_title": feed.title,
+            "author": "Unknown",
+            "source_url": "#",
+            "source_type": feed.source_type or "blog",
+            "website_name": "Unknown",
+            "website": "Unknown",
+            "favicon": get_website_favicon("Unknown"),
+            "concepts": concepts
+        }
+    
+    # ADD TOPIC DESCRIPTIONS if feed has categories
+    if feed.categories:
+        topics = []
+        for category_name in feed.categories:
+            # Get topic from database
+            topic = db.query(Topic).filter(
+                Topic.name == category_name,
+                Topic.is_active == True
+            ).first()
+            
+            if topic:
+                topics.append({
+                    "name": topic.name,
+                    "description": topic.description,
+                    "id": topic.id
+                })
+            else:
+                # If topic doesn't exist, create a basic one
+                topics.append({
+                    "name": category_name,
+                    "description": f"Content related to {category_name}",
+                    "id": None
+                })
+        
+        base_meta["topics"] = topics
+    
+    return base_meta
 
 
 def process_blog_feeds_creation(blogs: List[Blog], website: str, overwrite: bool = False):
@@ -1707,8 +1767,8 @@ def get_all_feeds(
     # Update query to include category and subcategory
     query = db.query(Feed).options(
         joinedload(Feed.blog),
-        joinedload(Feed.category),  # NEW
-        joinedload(Feed.subcategory)  # NEW
+        joinedload(Feed.category),
+        joinedload(Feed.subcategory)
     )
     
     if category:
@@ -1747,6 +1807,11 @@ def get_all_feeds(
         # Get metadata for each feed
         meta = get_feed_metadata(feed, db)
         
+        # Get topic descriptions
+        topic_descriptions = []
+        if feed.categories:
+            topic_descriptions = get_topic_descriptions(feed.categories, db)
+        
         # NEW: Get category and subcategory names
         category_name = feed.category.name if feed.category else None
         subcategory_name = feed.subcategory.name if feed.subcategory else None
@@ -1774,7 +1839,8 @@ def get_all_feeds(
             "category_id": feed.category_id,
             "subcategory_id": feed.subcategory_id,
             "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
-            "meta": meta
+            "meta": meta,
+            "topics": topic_descriptions  # NEW: Add topic descriptions
         })
 
     has_more = (page * limit) < total
@@ -1799,8 +1865,9 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         joinedload(Feed.blog), 
         joinedload(Feed.slides),
         joinedload(Feed.published_feed),
-        joinedload(Feed.category),  # NEW: Join category
-        joinedload(Feed.subcategory)  # NEW: Join subcategory
+        joinedload(Feed.category),
+        joinedload(Feed.subcategory),
+        joinedload(Feed.concepts)  # Load concepts
     ).filter(Feed.id == feed_id).first()
     
     if not feed:
@@ -1813,6 +1880,11 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
     
     # Get proper metadata
     meta = get_feed_metadata(feed, db)
+    
+    # Get topic descriptions
+    topic_descriptions = []
+    if feed.categories:
+        topic_descriptions = get_topic_descriptions(feed.categories, db)
     
     # NEW: Get category and subcategory names
     category_name = feed.category.name if feed.category else None
@@ -1830,6 +1902,7 @@ def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
         "is_published": is_published,
         "published_at": feed.published_feed.published_at.isoformat() if is_published else None,
         "meta": meta,
+        "topics": topic_descriptions,  # NEW: Add topic descriptions
         # NEW: Add category and subcategory info
         "category_name": category_name,
         "subcategory_name": subcategory_name,
@@ -2385,3 +2458,4 @@ def trigger_list_creation(
             "status": "error",
             "message": f"Failed to create lists: {str(e)}"
         }
+
