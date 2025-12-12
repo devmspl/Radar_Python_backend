@@ -101,17 +101,21 @@ def extract_website_description(website_url: str) -> str:
         if not website_url or website_url in ["Unknown", "#"]:
             return "No description available"
         
+        # Add protocol if missing for fetching
+        fetch_url = website_url
+        if not fetch_url.startswith(('http://', 'https://')):
+            fetch_url = f"https://{fetch_url}"
+        
         # First try to fetch the website and extract meta description
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
-            response = requests.get(website_url, headers=headers, timeout=10)
+            response = requests.get(fetch_url, headers=headers, timeout=10)
             
             # Look for meta description tag
             if response.status_code == 200:
                 content = response.text
-                import re
                 
                 # Try to find meta description
                 meta_desc_pattern = r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']+)["\'][^>]*>'
@@ -143,10 +147,11 @@ def extract_website_description(website_url: str) -> str:
                     "content": """You are a content analyst. Generate a brief, professional description for a website based on its domain name.
                     Return ONLY a 1-2 sentence description, no explanations.
                     Examples:
-                    - "techcrunch.com" -> "Technology news and analysis platform covering startups, gadgets, and Silicon Valley trends."
-                    - "towardsdatascience.com" -> "Community platform for data scientists and AI enthusiasts to share insights and tutorials."
-                    - "blog.hubspot.com" -> "Official blog of HubSpot featuring marketing, sales, and customer service insights." 
-                    - "news.ycombinator.com" -> "Social news website for technology entrepreneurs and startup enthusiasts."
+                    - "blog.hubspot.com" -> "HubSpot Blog"
+                    - "news.ycombinator.com" -> "Hacker News" 
+                    - "techcrunch.com" -> "TechCrunch"
+                    - "medium.com" -> "Medium"
+                    - "towardsdatascience.com" -> "Towards Data Science"
                     - If unsure, create a generic description based on the domain name."""
                 },
                 {
@@ -170,7 +175,6 @@ def extract_website_description(website_url: str) -> str:
             domain = website_url.replace("https://", "").replace("http://", "").split("/")[0]
             return f"Website at {domain} featuring content on various topics."
         return "No description available"
-
 
 # Add these helper functions for images and favicons
 def get_youtube_channel_thumbnail(channel_id: str) -> str:
@@ -200,98 +204,118 @@ def get_youtube_channel_thumbnail(channel_id: str) -> str:
     return None
 
 def get_website_favicon(website_url: str) -> str:
-    """Get website favicon URL."""
+    """Get favicon URL for a website."""
     try:
-        if not website_url or website_url in ["Unknown", "#"]:
-            return None
+        # Clean and format the URL
+        if not website_url.startswith(('http://', 'https://')):
+            website_url = f"https://{website_url}"
         
-        # Try common favicon locations
+        # Extract domain
+        from urllib.parse import urlparse
         parsed_url = urlparse(website_url)
-        base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        domain = parsed_url.netloc
         
+        if not domain:
+            # If parsing failed, try to extract domain manually
+            domain = website_url.replace('https://', '').replace('http://', '').split('/')[0]
+        
+        # Common favicon locations
         favicon_urls = [
-            f"{base_domain}/favicon.ico",
-            f"{base_domain}/favicon.png",
-            f"{base_domain}/apple-touch-icon.png"
+            f"https://{domain}/favicon.ico",
+            f"https://{domain}/favicon.png",
+            f"https://www.{domain}/favicon.ico",
+            f"https://www.{domain}/favicon.png",
+            f"https://{domain}/apple-touch-icon.png",
+            f"https://www.{domain}/apple-touch-icon.png"
         ]
         
-        # Test each URL to see which one exists
-        for favicon_url in favicon_urls:
-            try:
-                response = requests.head(favicon_url, timeout=5)
-                if response.status_code == 200:
-                    return favicon_url
-            except:
-                continue
+        # Try to check if favicon exists (optional)
+        # For simplicity, we'll just return the most likely URL
+        return favicon_urls[0]
         
-        # Fallback to Google favicon service
-        domain = parsed_url.netloc
-        return f"https://www.google.com/s2/favicons?domain={domain}&sz=64"
-        
-    except Exception as e:
-        logger.error(f"Error fetching favicon for {website_url}: {e}")
-        return None
+    except Exception:
+        # Fallback to a generic favicon
+        return "https://www.google.com/s2/favicons?domain=" + (website_url.split('//')[-1].split('/')[0] if '//' in website_url else website_url)
 
 
-def get_youtube_channel_info(video_id: str) -> Dict[str, str]:
-    """Get channel information from YouTube API using video ID."""
-    if not youtube_service or not video_id:
-        return {"channel_name": "YouTube Creator", "channel_id": None, "channel_description": ""}
+def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
+    """Get YouTube channel information using YouTube Data API (requests version)."""
+    if not YOUTUBE_API_KEY:
+        logger.warning("YouTube API key not found. Using fallback channel info.")
+        return {
+            "channel_name": "YouTube Creator",
+            "channel_id": None,
+            "available": False
+        }
     
     try:
-        # Get video details to extract channel ID
-        video_response = youtube_service.videos().list(
-            part="snippet",
-            id=video_id
-        ).execute()
+        # First, get video details to get channel ID
+        video_url = f"https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            "key": YOUTUBE_API_KEY,
+            "id": video_id,
+            "part": "snippet"
+        }
         
-        if not video_response.get('items'):
-            logger.warning(f"No video found for ID: {video_id}")
-            return {"channel_name": "YouTube Creator", "channel_id": None, "channel_description": ""}
+        response = requests.get(video_url, params=params, timeout=10)
+        if response.status_code != 200:
+            logger.warning(f"Failed to get video info: {response.status_code}")
+            return {
+                "channel_name": "YouTube Creator",
+                "channel_id": None,
+                "available": False
+            }
         
-        video_snippet = video_response['items'][0]['snippet']
-        channel_id = video_snippet.get('channelId')
-        channel_title = video_snippet.get('channelTitle', 'YouTube Creator')
+        video_data = response.json()
+        if not video_data.get("items"):
+            return {
+                "channel_name": "YouTube Creator",
+                "channel_id": None,
+                "available": False
+            }
         
-        channel_thumbnail = None
-        channel_description = ""
+        snippet = video_data["items"][0]["snippet"]
+        channel_id = snippet.get("channelId")
+        channel_title = snippet.get("channelTitle", "YouTube Creator")
         
+        # Get channel details
         if channel_id:
-            # Get detailed channel information with thumbnails and description
-            channel_response = youtube_service.channels().list(
-                part="snippet",
-                id=channel_id
-            ).execute()
+            channel_url = f"https://www.googleapis.com/youtube/v3/channels"
+            channel_params = {
+                "key": YOUTUBE_API_KEY,
+                "id": channel_id,
+                "part": "snippet,statistics"
+            }
             
-            if channel_response.get('items'):
-                channel_snippet = channel_response['items'][0]['snippet']
-                channel_title = channel_snippet.get('title', channel_title)
-                channel_description = channel_snippet.get('description', '')
-                
-                thumbnails = channel_snippet.get('thumbnails', {})
-                
-                # Get the highest quality thumbnail available
-                if thumbnails.get('high'):
-                    channel_thumbnail = thumbnails['high']['url']
-                elif thumbnails.get('medium'):
-                    channel_thumbnail = thumbnails['medium']['url']
-                elif thumbnails.get('default'):
-                    channel_thumbnail = thumbnails['default']['url']
+            channel_response = requests.get(channel_url, params=channel_params, timeout=10)
+            if channel_response.status_code == 200:
+                channel_data = channel_response.json()
+                if channel_data.get("items"):
+                    channel_info = channel_data["items"][0]["snippet"]
+                    stats = channel_data["items"][0].get("statistics", {})
+                    
+                    return {
+                        "channel_name": channel_title,
+                        "channel_id": channel_id,
+                        "thumbnail": channel_info.get("thumbnails", {}).get("default", {}).get("url", ""),
+                        "subscriber_count": stats.get("subscriberCount", "0"),
+                        "video_count": stats.get("videoCount", "0"),
+                        "available": True
+                    }
         
         return {
             "channel_name": channel_title,
             "channel_id": channel_id,
-            "channel_description": channel_description[:500] if channel_description else "",  # Limit length
-            "channel_thumbnail": channel_thumbnail
+            "available": True
         }
         
-    except HttpError as e:
-        logger.error(f"YouTube API error for video {video_id}: {e}")
-        return {"channel_name": "YouTube Creator", "channel_id": None, "channel_description": ""}
     except Exception as e:
-        logger.error(f"Unexpected error fetching YouTube channel info for {video_id}: {e}")
-        return {"channel_name": "YouTube Creator", "channel_id": None, "channel_description": ""}
-
+        logger.error(f"Error fetching YouTube channel info: {e}")
+        return {
+            "channel_name": "YouTube Creator",
+            "channel_id": None,
+            "available": False
+        }
 
 def extract_clean_source_name(website_url: str) -> str:
     """Extract clean source name using OpenAI for better naming."""
@@ -339,30 +363,43 @@ def extract_clean_source_name(website_url: str) -> str:
         return clean_url
 
 def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
-    """Extract proper metadata for feeds including images, favicons, and descriptions."""
-    if feed.source_type == "youtube":
+    """Extract proper metadata for feeds including YouTube channel names, correct URLs, favicons, and topic descriptions."""
+    # Initialize base metadata
+    base_meta = {}
+    concepts = []
+    
+    # Get concepts for this feed
+    if hasattr(feed, 'concepts') and feed.concepts:
+        for concept in feed.concepts:
+            concepts.append({
+                "id": concept.id,
+                "name": concept.name,
+                "description": concept.description
+            })
+    
+    if feed.source_type == "youtube" and feed.transcript_id:
         # Get the transcript to access YouTube-specific data
-        transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+        transcript = db.query(Transcript).filter(
+            Transcript.transcript_id == feed.transcript_id
+        ).first()
         
         if transcript:
-            # Extract video ID from transcript data
             video_id = getattr(transcript, 'video_id', None)
             if not video_id:
                 video_id = feed.transcript_id
             
-            # Get original title from transcript
             original_title = transcript.title if transcript else feed.title
             
-            # Get channel information from YouTube API with description
+            # Get channel information from YouTube API
             channel_info = get_youtube_channel_info(video_id)
             channel_name = channel_info.get("channel_name", "YouTube Creator")
-            channel_thumbnail = channel_info.get("channel_thumbnail")
-            channel_description = channel_info.get("channel_description", "")
             
-            # Construct proper YouTube URL
             source_url = f"https://www.youtube.com/watch?v={video_id}"
             
-            return {
+            # Use YouTube favicon
+            favicon = "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico"
+            
+            base_meta = {
                 "title": feed.title,
                 "original_title": original_title,
                 "author": channel_name,
@@ -370,74 +407,148 @@ def get_feed_metadata(feed: Feed, db: Session) -> Dict[str, Any]:
                 "source_type": "youtube",
                 "channel_name": channel_name,
                 "channel_id": channel_info.get("channel_id"),
-                "channel_description": channel_description,
                 "video_id": video_id,
-                "channel_thumbnail": channel_thumbnail,
-                "favicon": "https://www.google.com/s2/favicons?domain=youtube.com&sz=64"
-            }
-        else:
-            # Fallback if transcript not found
-            video_id = feed.transcript_id
-            channel_info = get_youtube_channel_info(video_id)
-            channel_name = channel_info.get("channel_name", "YouTube Creator")
-            channel_thumbnail = channel_info.get("channel_thumbnail")
-            channel_description = channel_info.get("channel_description", "")
-            
-            return {
-                "title": feed.title,
-                "original_title": feed.title,
-                "author": channel_name,
-                "source_url": f"https://www.youtube.com/watch?v={video_id}",
-                "source_type": "youtube",
-                "channel_name": channel_name,
-                "channel_id": channel_info.get("channel_id"),
-                "channel_description": channel_description,
-                "video_id": video_id,
-                "channel_thumbnail": channel_thumbnail,
-                "favicon": "https://www.google.com/s2/favicons?domain=youtube.com&sz=64"
+                "favicon": favicon,
+                "channel_info": channel_info,
+                "concepts": concepts
             }
     
-    else:  # blog source type
+    # For blogs
+    elif feed.source_type == "blog" and feed.blog:
         blog = feed.blog
-        if blog:
-            website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
-            author = getattr(blog, 'author', 'Admin') or 'Admin'
-            favicon = get_website_favicon(blog.website)
+        website_name = blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+        author = getattr(blog, 'author', 'Admin') or 'Admin'
+        
+        # Get favicon URL
+        favicon = get_website_favicon(blog.website)
+        
+        base_meta = {
+            "title": feed.title,
+            "original_title": blog.title,
+            "author": author,
+            "source_url": blog.url,
+            "source_type": "blog",
+            "website_name": website_name,
+            "website": blog.website,
+            "favicon": favicon,
+            "concepts": concepts
+        }
+    
+    else:
+        # Fallback
+        base_meta = {
+            "title": feed.title,
+            "original_title": feed.title,
+            "author": "Unknown",
+            "source_url": "#",
+            "source_type": feed.source_type or "blog",
+            "website_name": "Unknown",
+            "website": "Unknown",
+            "favicon": get_website_favicon("Unknown"),
+            "concepts": concepts
+        }
+    
+    # ADD TOPIC DESCRIPTIONS if feed has categories
+    if feed.categories:
+        topics = []
+        for category_name in feed.categories:
+            # Get topic from database
+            topic = db.query(Topic).filter(
+                Topic.name == category_name,
+                Topic.is_active == True
+            ).first()
             
-            # Get website description from blog or generate from website
-            website_description = ""
-            if hasattr(blog, 'description') and blog.description:
-                website_description = blog.description
+            if topic:
+                topics.append({
+                    "name": topic.name,
+                    "description": topic.description,
+                    "id": topic.id
+                })
             else:
-                # Try to extract or generate description
-                website_description = extract_website_description(blog.website)
-            
-            return {
-                "title": feed.title,
-                "original_title": blog.title,
-                "author": author,
-                "source_url": blog.url,
-                "source_type": "blog",
-                "website_name": website_name,
-                "website": blog.website,
-                "website_description": website_description,
-                "favicon": favicon,
-                "channel_thumbnail": None  # Not applicable for blogs
-            }
-        else:
-            return {
-                "title": feed.title,
-                "original_title": "Unknown",
-                "author": "Admin",
-                "source_url": "#",
-                "source_type": "blog",
-                "website_name": "Unknown",
-                "website": "Unknown",
-                "website_description": "No description available",
-                "favicon": None,
-                "channel_thumbnail": None
-            }
+                # If topic doesn't exist, create a basic one
+                topics.append({
+                    "name": category_name,
+                    "description": f"Content related to {category_name}",
+                    "id": None
+                })
+        
+        base_meta["topics"] = topics
+    
+    return base_meta
 
+def get_source_metadata(source: Source) -> Dict[str, Any]:
+    """Get comprehensive metadata for a source."""
+    if source.source_type == "youtube":
+        # Extract channel ID from website URL
+        channel_id = None
+        if source.website and 'youtube.com/channel/' in source.website:
+            # Extract from standard YouTube channel URL
+            import re
+            match = re.search(r'youtube\.com/channel/([a-zA-Z0-9_-]{24})', source.website)
+            if match:
+                channel_id = match.group(1)
+        
+        # Try to get channel ID from external_id attribute if not in URL
+        if not channel_id:
+            channel_id = getattr(source, 'external_id', None)
+        
+        channel_thumbnail = None
+        if channel_id:
+            # Get channel thumbnail using YouTube API
+            try:
+                channel_url = f"https://www.googleapis.com/youtube/v3/channels"
+                params = {
+                    "key": YOUTUBE_API_KEY,
+                    "id": channel_id,
+                    "part": "snippet"
+                }
+                
+                response = requests.get(channel_url, params=params, timeout=10)
+                if response.status_code == 200:
+                    channel_data = response.json()
+                    if channel_data.get("items"):
+                        thumbnails = channel_data["items"][0]["snippet"].get("thumbnails", {})
+                        if thumbnails.get('high'):
+                            channel_thumbnail = thumbnails['high']['url']
+                        elif thumbnails.get('medium'):
+                            channel_thumbnail = thumbnails['medium']['url']
+                        elif thumbnails.get('default'):
+                            channel_thumbnail = thumbnails['default']['url']
+            except Exception as e:
+                logger.error(f"Error fetching channel thumbnail: {e}")
+        
+        return {
+            "type": "youtube",
+            "channel_id": channel_id,
+            "channel_thumbnail": channel_thumbnail,
+            "favicon": "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico",
+            "website_url": source.website,
+            "source_image": channel_thumbnail or "https://www.youtube.com/s/desktop/12d6b690/img/favicon.ico",
+            "verified": getattr(source, 'verified', False),
+            "subscriber_count": getattr(source, 'subscriber_count', None)
+        }
+    else:
+        # For blog sources
+        # Ensure the website has a protocol for favicon fetching
+        website = source.website
+        if not website.startswith(('http://', 'https://')):
+            website = f"https://{website}"
+        
+        favicon = get_website_favicon(website)
+        
+        # Get domain for display
+        domain = source.website.replace("https://", "").replace("http://", "").split("/")[0]
+        
+        return {
+            "type": "blog",
+            "favicon": favicon or f"https://www.google.com/s2/favicons?domain={domain}&sz=64",
+            "website_url": website,
+            "domain": domain,
+            "source_image": favicon or f"https://www.google.com/s2/favicons?domain={domain}&sz=64",
+            "verified": getattr(source, 'verified', False),
+            "rss_feed": getattr(source, 'rss_feed', None),
+            "last_crawled": getattr(source, 'last_crawled', None)
+        }
 # ------------------ Feed-Based Topic & Source Management ------------------
 
 def create_topics_from_feed_categories(db: Session):
@@ -1506,6 +1617,9 @@ def get_feeds_by_source(
     if not source:
         raise HTTPException(status_code=404, detail=f"Source with ID {source_id} not found")
     
+    # Get source metadata (handle missing description field)
+    source_meta = get_source_metadata(source)
+    
     # Build query based on source type
     if source.source_type == "blog":
         # For blog sources, get feeds from blogs with matching website
@@ -1516,10 +1630,12 @@ def get_feeds_by_source(
             Blog.website == source.website,
             Feed.status == "ready"
         ).order_by(Feed.created_at.desc())
+        
+        total = feeds_query.count()
+        feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
     
     else:  # youtube source
         # For YouTube sources, we need to match by channel name
-        # This is more complex - we'll get all YouTube feeds and filter by channel
         feeds_query = db.query(Feed).options(
             joinedload(Feed.blog),
             joinedload(Feed.slides)
@@ -1528,7 +1644,7 @@ def get_feeds_by_source(
             Feed.status == "ready"
         ).order_by(Feed.created_at.desc())
         
-        # We'll filter the results after fetching to match the channel
+        # Filter results to match the channel
         all_feeds = feeds_query.all()
         matching_feeds = []
         
@@ -1542,67 +1658,9 @@ def get_feeds_by_source(
         total = len(matching_feeds)
         start_idx = (page - 1) * limit
         end_idx = start_idx + limit
-        paginated_feeds = matching_feeds[start_idx:end_idx]
-        
-        # Format response for YouTube feeds
-        items = []
-        for feed in paginated_feeds:
-            meta = get_feed_metadata(feed, db)
-            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
-            
-            items.append({
-                "id": feed.id,
-                "blog_id": feed.blog_id,
-                "transcript_id": feed.transcript_id,
-                "title": feed.title,
-                "categories": feed.categories,
-                "status": feed.status,
-                "source_type": feed.source_type or "youtube",
-                "ai_generated_content": feed.ai_generated_content or {},
-                "meta": meta,
-                "slides": [
-                    {
-                        "id": slide.id,
-                        "order": slide.order,
-                        "title": slide.title,
-                        "body": slide.body,
-                        "bullets": slide.bullets or [],
-                        "background_color": slide.background_color,
-                        "background_image_prompt": None,
-                        "source_refs": slide.source_refs or [],
-                        "render_markdown": bool(slide.render_markdown),
-                        "created_at": slide.created_at.isoformat() if slide.created_at else None,
-                        "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
-                    } for slide in sorted_slides
-                ],
-                "slides_count": len(feed.slides),
-                "created_at": feed.created_at.isoformat() if feed.created_at else None,
-                "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
-                "ai_generated": bool(feed.ai_generated_content)
-            })
-        
-        has_more = (page * limit) < total
-        
-        return {
-            "source": {
-                "id": source.id,
-                "name": source.name,
-                "website": source.website,
-                "source_type": source.source_type,
-                "follower_count": source.follower_count
-            },
-            "items": items,
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "has_more": has_more
-        }
+        feeds = matching_feeds[start_idx:end_idx]
     
-    # For blog sources, continue with normal query
-    total = feeds_query.count()
-    feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
-    
-    # Format response for blog feeds
+    # Format response with feeds
     items = []
     for feed in feeds:
         meta = get_feed_metadata(feed, db)
@@ -1641,14 +1699,24 @@ def get_feeds_by_source(
     
     has_more = (page * limit) < total
     
+    # Build source response with safe attribute access
+    source_response = {
+        "id": source.id,
+        "name": source.name,
+        "website": source.website,
+        "source_type": source.source_type,
+        "follower_count": getattr(source, 'follower_count', 0),
+        "created_at": source.created_at.isoformat() if hasattr(source, 'created_at') and source.created_at else None,
+        "updated_at": source.updated_at.isoformat() if hasattr(source, 'updated_at') and source.updated_at else None,
+        "metadata": source_meta
+    }
+    
+    # Add description if it exists
+    if hasattr(source, 'description'):
+        source_response["description"] = source.description
+    
     return {
-        "source": {
-            "id": source.id,
-            "name": source.name,
-            "website": source.website,
-            "source_type": source.source_type,
-            "follower_count": source.follower_count
-        },
+        "source": source_response,
         "items": items,
         "page": page,
         "limit": limit,
@@ -1656,31 +1724,6 @@ def get_feeds_by_source(
         "has_more": has_more
     }
 
-# Add a debug endpoint to see what categories are actually in feeds
-@router.get("/debug/feed-categories", response_model=dict)
-def debug_feed_categories(db: Session = Depends(get_db)):
-    """Debug endpoint to see what categories exist in feeds."""
-    feeds = db.query(Feed).filter(
-        Feed.categories.isnot(None),
-        Feed.status == "ready"
-    ).all()
-    
-    all_categories = {}
-    
-    for feed in feeds:
-        if feed.categories:
-            for category in feed.categories:
-                if category not in all_categories:
-                    all_categories[category] = []
-                all_categories[category].append({
-                    "feed_id": feed.id,
-                    "feed_title": feed.title
-                })
-    
-    return {
-        "total_feeds_with_categories": len(feeds),
-        "categories": all_categories
-    }
 
 @router.get("/source/{source_id}/feeds/summary", response_model=dict)
 def get_feeds_by_source_summary(
@@ -1697,6 +1740,9 @@ def get_feeds_by_source_summary(
     
     if not source:
         raise HTTPException(status_code=404, detail=f"Source with ID {source_id} not found")
+    
+    # Get source metadata
+    source_meta = get_source_metadata(source)
     
     if source.source_type == "blog":
         feeds_query = db.query(Feed).options(joinedload(Feed.blog)).join(Blog).filter(
@@ -1743,20 +1789,132 @@ def get_feeds_by_source_summary(
     
     has_more = (page * limit) < total
     
+    # Build source response with safe attribute access
+    source_response = {
+        "id": source.id,
+        "name": source.name,
+        "website": source.website,
+        "source_type": source.source_type,
+        "follower_count": getattr(source, 'follower_count', 0),
+        "created_at": source.created_at.isoformat() if hasattr(source, 'created_at') and source.created_at else None,
+        "updated_at": source.updated_at.isoformat() if hasattr(source, 'updated_at') and source.updated_at else None,
+        "metadata": source_meta
+    }
+    
+    # Add description if it exists
+    if hasattr(source, 'description'):
+        source_response["description"] = source.description
+    
     return {
-        "source": {
-            "id": source.id,
-            "name": source.name,
-            "website": source.website,
-            "source_type": source.source_type,
-            "follower_count": source.follower_count
-        },
+        "source": source_response,
         "items": items,
         "page": page,
         "limit": limit,
         "total": total,
         "has_more": has_more
     }
+
+# Add a debug endpoint to see what categories are actually in feeds
+@router.get("/debug/feed-categories", response_model=dict)
+def debug_feed_categories(db: Session = Depends(get_db)):
+    """Debug endpoint to see what categories exist in feeds."""
+    feeds = db.query(Feed).filter(
+        Feed.categories.isnot(None),
+        Feed.status == "ready"
+    ).all()
+    
+    all_categories = {}
+    
+    for feed in feeds:
+        if feed.categories:
+            for category in feed.categories:
+                if category not in all_categories:
+                    all_categories[category] = []
+                all_categories[category].append({
+                    "feed_id": feed.id,
+                    "feed_title": feed.title
+                })
+    
+    return {
+        "total_feeds_with_categories": len(feeds),
+        "categories": all_categories
+    }
+
+# @router.get("/source/{source_id}/feeds/summary", response_model=dict)
+# def get_feeds_by_source_summary(
+#     source_id: int,
+#     page: int = 1,
+#     limit: int = 20,
+#     db: Session = Depends(get_db)
+# ):
+#     """Get feed summaries (without slides) for a specific source - faster for listing."""
+#     source = db.query(Source).filter(
+#         Source.id == source_id,
+#         Source.is_active == True
+#     ).first()
+    
+#     if not source:
+#         raise HTTPException(status_code=404, detail=f"Source with ID {source_id} not found")
+    
+#     if source.source_type == "blog":
+#         feeds_query = db.query(Feed).options(joinedload(Feed.blog)).join(Blog).filter(
+#             Blog.website == source.website,
+#             Feed.status == "ready"
+#         ).order_by(Feed.created_at.desc())
+        
+#         total = feeds_query.count()
+#         feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
+    
+#     else:  # youtube
+#         feeds_query = db.query(Feed).options(joinedload(Feed.blog)).filter(
+#             Feed.source_type == "youtube",
+#             Feed.status == "ready"
+#         ).order_by(Feed.created_at.desc())
+        
+#         all_feeds = feeds_query.all()
+#         matching_feeds = []
+        
+#         for feed in all_feeds:
+#             meta = get_feed_metadata(feed, db)
+#             if meta.get("channel_name") == source.name:
+#                 matching_feeds.append(feed)
+        
+#         total = len(matching_feeds)
+#         start_idx = (page - 1) * limit
+#         end_idx = start_idx + limit
+#         feeds = matching_feeds[start_idx:end_idx]
+    
+#     items = []
+#     for feed in feeds:
+#         meta = get_feed_metadata(feed, db)
+        
+#         items.append({
+#             "id": feed.id,
+#             "title": feed.title,
+#             "categories": feed.categories,
+#             "source_type": feed.source_type,
+#             "slides_count": len(feed.slides),
+#             "meta": meta,
+#             "created_at": feed.created_at.isoformat() if feed.created_at else None,
+#             "ai_generated": bool(feed.ai_generated_content)
+#         })
+    
+#     has_more = (page * limit) < total
+    
+#     return {
+#         "source": {
+#             "id": source.id,
+#             "name": source.name,
+#             "website": source.website,
+#             "source_type": source.source_type,
+#             "follower_count": source.follower_count
+#         },
+#         "items": items,
+#         "page": page,
+#         "limit": limit,
+#         "total": total,
+#         "has_more": has_more
+#     }
 
 @router.post("/topics/{topic_name}/update-description", response_model=dict)
 def update_topic_description(

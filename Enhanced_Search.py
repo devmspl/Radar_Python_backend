@@ -8,10 +8,11 @@ from datetime import datetime
 import json  # Add this if not already present
 from models import TranscriptJob, Transcript
 from database import get_db
+from dependencies import get_current_user
 from models import (
     Feed, Blog, Transcript, Topic, Source, Concept, Domain, 
     ContentList, UserTopicFollow, UserSourceFollow, Bookmark,
-    Category, SubCategory, FeedConcept, DomainConcept,Topic
+    Category, SubCategory, FeedConcept, DomainConcept,Topic,User
 )
 from feed_router import get_feed_metadata
 import os
@@ -1281,3 +1282,210 @@ def get_concept_by_id(
             "has_more": (page * limit) < total
         }
     }
+
+@router.get("/user/follows", response_model=Dict[str, Any])
+def get_user_follows(
+    topic_id: Optional[int] = Query(None, description="Check if user follows this specific topic"),
+    source_id: Optional[int] = Query(None, description="Check if user follows this specific source"),
+    include_counts: bool = Query(True, description="Include follower and feed counts"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get user's follow data for topics and sources.
+    
+    Without parameters: Returns all topics and sources the user follows
+    With topic_id or source_id: Returns specific follow status
+    
+    Uses token authentication via get_current_user dependency
+    """
+    try:
+        user_id = current_user.id
+        
+        response_data = {
+            "user_id": user_id,
+            "username": current_user.full_name,
+            "email": current_user.email,
+            "total_following": 0
+        }
+        
+        # CASE 1: Check specific topic follow status
+        if topic_id is not None:
+            topic = db.query(Topic).filter(Topic.id == topic_id, Topic.is_active == True).first()
+            if not topic:
+                raise HTTPException(status_code=404, detail=f"Topic with ID {topic_id} not found")
+            
+            # Check if user follows this topic
+            follow_record = db.query(UserTopicFollow).filter(
+                UserTopicFollow.user_id == user_id,
+                UserTopicFollow.topic_id == topic_id
+            ).first()
+            
+            is_following = follow_record is not None
+            
+            # Get topic details
+            topic_details = {
+                "id": topic.id,
+                "name": topic.name,
+                "description": topic.description,
+                "is_following": is_following,
+                "followed_since": follow_record.created_at.isoformat() if follow_record else None
+            }
+            
+            if include_counts:
+                # Get feed count for this topic
+                feed_count = db.query(Feed).filter(
+                    Feed.status == "ready",
+                    Feed.categories.contains([topic.name])
+                ).count()
+                
+                topic_details.update({
+                    "feed_count": feed_count,
+                    "follower_count": topic.follower_count
+                })
+            
+            return {
+                **response_data,
+                "specific_follow": {
+                    "type": "topic",
+                    "data": topic_details
+                }
+            }
+        
+        # CASE 2: Check specific source follow status
+        if source_id is not None:
+            source = db.query(Source).filter(Source.id == source_id, Source.is_active == True).first()
+            if not source:
+                raise HTTPException(status_code=404, detail=f"Source with ID {source_id} not found")
+            
+            # Check if user follows this source
+            follow_record = db.query(UserSourceFollow).filter(
+                UserSourceFollow.user_id == user_id,
+                UserSourceFollow.source_id == source_id
+            ).first()
+            
+            is_following = follow_record is not None
+            
+            # Get source details
+            source_details = {
+                "id": source.id,
+                "name": source.name,
+                "website": source.website,
+                "source_type": source.source_type,
+                "is_following": is_following,
+                "followed_since": follow_record.created_at.isoformat() if follow_record else None
+            }
+            
+            if include_counts:
+                # Get feed count for this source
+                if source.source_type == "blog":
+                    feed_count = db.query(Feed).join(Blog).filter(
+                        Blog.website == source.website,
+                        Feed.status == "ready"
+                    ).count()
+                else:
+                    feed_count = db.query(Feed).filter(
+                        Feed.source_type == "youtube",
+                        Feed.status == "ready"
+                    ).count()
+                
+                source_details.update({
+                    "feed_count": feed_count,
+                    "follower_count": source.follower_count
+                })
+            
+            return {
+                **response_data,
+                "specific_follow": {
+                    "type": "source",
+                    "data": source_details
+                }
+            }
+        
+        # CASE 3: No specific ID - Return all follows
+        
+        # Get all topics user follows
+        topic_follows = db.query(UserTopicFollow).filter(
+            UserTopicFollow.user_id == user_id
+        ).all()
+        
+        followed_topics = []
+        for follow in topic_follows:
+            topic = db.query(Topic).filter(Topic.id == follow.topic_id).first()
+            if topic and topic.is_active:
+                topic_data = {
+                    "id": topic.id,
+                    "name": topic.name,
+                    "description": topic.description,
+                    "followed_since": follow.created_at.isoformat() if follow.created_at else None,
+                    "follower_count": topic.follower_count
+                }
+                
+                if include_counts:
+                    # Get feed count for this topic
+                    feed_count = db.query(Feed).filter(
+                        Feed.status == "ready",
+                        Feed.categories.contains([topic.name])
+                    ).count()
+                    topic_data["feed_count"] = feed_count
+                
+                followed_topics.append(topic_data)
+        
+        # Get all sources user follows
+        source_follows = db.query(UserSourceFollow).filter(
+            UserSourceFollow.user_id == user_id
+        ).all()
+        
+        followed_sources = []
+        for follow in source_follows:
+            source = db.query(Source).filter(Source.id == follow.source_id).first()
+            if source and source.is_active:
+                source_data = {
+                    "id": source.id,
+                    "name": source.name,
+                    "website": source.website,
+                    "source_type": source.source_type,
+                    "followed_since": follow.created_at.isoformat() if follow.created_at else None,
+                    "follower_count": source.follower_count
+                }
+                
+                if include_counts:
+                    # Get feed count for this source
+                    if source.source_type == "blog":
+                        feed_count = db.query(Feed).join(Blog).filter(
+                            Blog.website == source.website,
+                            Feed.status == "ready"
+                        ).count()
+                    else:
+                        feed_count = db.query(Feed).filter(
+                            Feed.source_type == "youtube",
+                            Feed.status == "ready"
+                        ).count()
+                    
+                    source_data["feed_count"] = feed_count
+                
+                followed_sources.append(source_data)
+        
+        # Sort by followed date (most recent first)
+        followed_topics.sort(key=lambda x: x["followed_since"] or "", reverse=True)
+        followed_sources.sort(key=lambda x: x["followed_since"] or "", reverse=True)
+        
+        response_data.update({
+            "topics": {
+                "count": len(followed_topics),
+                "items": followed_topics
+            },
+            "sources": {
+                "count": len(followed_sources),
+                "items": followed_sources
+            },
+            "total_following": len(followed_topics) + len(followed_sources)
+        })
+        
+        return response_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user follows: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch follow data: {str(e)}")
