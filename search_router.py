@@ -1197,19 +1197,16 @@ def get_personalized_feed(
 
 # ------------------ Follow/Unfollow Endpoints ------------------
 
-@router.post("/topics/{topic_name}/follow", response_model=dict)
+@router.post("/topics/{topic_id}/follow", response_model=dict)
 def follow_topic(
-    topic_name: str,
+    topic_id: int,
     user_id: int,
     db: Session = Depends(get_db)
 ):
-    """Follow a topic."""
-    topic = db.query(Topic).filter(Topic.name == topic_name).first()
+    """Follow a topic by ID."""
+    topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
-        # Create topic if it doesn't exist
-        topic = Topic(name=topic_name, description=f"Topic for {topic_name}")
-        db.add(topic)
-        db.flush()
+        raise HTTPException(status_code=404, detail="Topic not found")
     
     # Check if already following
     existing_follow = db.query(UserTopicFollow).filter(
@@ -1231,21 +1228,21 @@ def follow_topic(
     db.commit()
     
     return {
-        "message": f"Started following topic: {topic_name}",
+        "message": f"Started following topic: {topic.name}",
         "topic_id": topic.id,
         "topic_name": topic.name,
         "follower_count": topic.follower_count,
         "is_following": True
     }
 
-@router.post("/topics/{topic_name}/unfollow", response_model=dict)
+@router.post("/topics/{topic_id}/unfollow", response_model=dict)
 def unfollow_topic(
-    topic_name: str,
+    topic_id: int,
     user_id: int,
     db: Session = Depends(get_db)
 ):
-    """Unfollow a topic."""
-    topic = db.query(Topic).filter(Topic.name == topic_name).first()
+    """Unfollow a topic by ID."""
+    topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
     
@@ -1264,12 +1261,13 @@ def unfollow_topic(
     db.commit()
     
     return {
-        "message": f"Stopped following topic: {topic_name}",
+        "message": f"Stopped following topic: {topic.name}",
         "topic_id": topic.id,
         "topic_name": topic.name,
         "follower_count": topic.follower_count,
         "is_following": False
     }
+
 
 @router.post("/sources/{source_id}/follow", response_model=dict)
 def follow_source(
