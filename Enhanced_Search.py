@@ -668,7 +668,7 @@ def search_topics(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     domain: Optional[str] = Query(None, description="Filter by domain"),
-    user_id: Optional[int] = Query(None, description="User ID"),
+    current_user: User = Depends(get_current_user),  # Changed from user_id
     db: Session = Depends(get_db)
 ):
     """
@@ -677,6 +677,9 @@ def search_topics(
     This is for Tab 3: Topics
     Topics can be followed via topic_id
     """
+    # Extract user_id from current_user
+    user_id = current_user.id if current_user else None
+    
     # Get all unique topics from feed categories
     all_feeds = db.query(Feed).filter(
         Feed.status == "ready",
@@ -717,6 +720,15 @@ def search_topics(
                     # Get follower count from Topic table
                     follower_count = topic.follower_count
                     
+                    # Check if current user is following this topic
+                    is_following = False
+                    if user_id and topic:
+                        user_follow = db.query(UserTopicFollow).filter(
+                            UserTopicFollow.user_id == user_id,
+                            UserTopicFollow.topic_id == topic.id
+                        ).first()
+                        is_following = user_follow is not None
+                    
                     # Get unique sources for this topic
                     topic_feeds = db.query(Feed).filter(
                         Feed.categories.contains([category_name]),
@@ -733,15 +745,6 @@ def search_topics(
                         elif topic_feed.source_type == "blog" and topic_feed.blog:
                             unique_sources.add(topic_feed.blog.website)
                     
-                    # Check if current user is following this topic
-                    is_following = False
-                    if user_id and topic:
-                        user_follow = db.query(UserTopicFollow).filter(
-                            UserTopicFollow.user_id == user_id,
-                            UserTopicFollow.topic_id == topic.id
-                        ).first()
-                        is_following = user_follow is not None
-                    
                     topics_dict[category_name] = {
                         "id": topic.id,
                         "name": category_name,
@@ -750,8 +753,8 @@ def search_topics(
                         "follower_count": follower_count,
                         "source_count": len(unique_sources),
                         "is_following": is_following,
-                        "popularity": feed_count + (follower_count * 2),  # Weight followers more
-                        "sources": list(unique_sources)[:5]  # Top 5 sources
+                        "popularity": feed_count + (follower_count * 2),
+                        "sources": list(unique_sources)[:5]
                     }
     
     # Convert to list and filter
@@ -820,7 +823,7 @@ def search_sources(
     source_type: Optional[str] = Query(None, description="Filter by source type"),
     domain: Optional[str] = Query(None, description="Filter by domain"),
     topic: Optional[str] = Query(None, description="Filter by topic"),
-    user_id: Optional[int] = Query(None, description="User ID for follow status"),
+    current_user: User = Depends(get_current_user),  # Changed from user_id
     db: Session = Depends(get_db)
 ):
     """
@@ -829,6 +832,9 @@ def search_sources(
     This is for Tab 4: Sources
     Sources can be followed
     """
+    # Extract user_id from current_user
+    user_id = current_user.id if current_user else None
+    
     query_obj = db.query(Source).filter(Source.is_active == True)
     
     if query:
@@ -848,7 +854,7 @@ def search_sources(
     query_obj = query_obj.order_by(Source.created_at.desc())
     sources = query_obj.offset((page - 1) * limit).limit(limit).all()
     
-    # Check follow status
+    # Check follow status for all sources
     followed_source_ids = []
     if user_id:
         followed_sources = db.query(UserSourceFollow).filter(
@@ -895,6 +901,9 @@ def search_sources(
         if not source_description and metadata.get("description"):
             source_description = metadata["description"]
         
+        # Check if user is following this specific source
+        is_following = source.id in followed_source_ids
+        
         items.append({
             "id": source.id,
             "name": source.name,
@@ -904,7 +913,7 @@ def search_sources(
             "feed_count": feed_count,
             "follower_count": source.follower_count,
             "top_topics": [topic for topic, count in top_topics],
-            "is_following": source.id in followed_source_ids,
+            "is_following": is_following,
             "created_at": source.created_at.isoformat() if source.created_at else None,
             "updated_at": source.updated_at.isoformat() if source.updated_at else None,
             "metadata": metadata
