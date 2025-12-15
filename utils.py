@@ -32,10 +32,28 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+    # Case 1: explicit expiry passed
+    if expires_delta is not None:
+        expire = datetime.utcnow() + expires_delta
+        to_encode.update({"exp": expire})
+
+    # Case 2: expiry from settings
+    elif settings.ACCESS_TOKEN_EXPIRE_MINUTES is not None:
+        expire = datetime.utcnow() + timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        to_encode.update({"exp": expire})
+
+    # Case 3: NO EXPIRY → do nothing
+
+    encoded_jwt = jwt.encode(
+        to_encode,
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM
+    )
     return encoded_jwt
+
 def generate_otp(length=6):
     return ''.join(random.choices(string.digits, k=length))
 
