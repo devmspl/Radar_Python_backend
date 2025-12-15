@@ -200,6 +200,138 @@ def auto_create_lists_from_youtube(db: Session):
 # Make sure YOUTUBE_API_KEY is defined globally or passed to this function
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
+
+def format_list_details(content_list: ContentList, db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Format detailed information about a content list.
+    """
+    # Get feed details for statistics
+    feed_ids = content_list.feed_ids or []
+    feeds = []
+    
+    if feed_ids:
+        feeds = db.query(Feed).options(
+            joinedload(Feed.blog),
+            joinedload(Feed.slides)
+        ).filter(
+            Feed.id.in_(feed_ids),
+            Feed.status == "ready"
+        ).all()
+    
+    # Calculate statistics
+    total_feeds = len(feed_ids)
+    active_feeds = len(feeds)
+    
+    # Extract unique topics from all feeds
+    all_topics = set()
+    for feed in feeds:
+        if feed.categories:
+            for category in feed.categories:
+                all_topics.add(category)
+    
+    # Extract unique sources
+    unique_sources = set()
+    source_types = set()
+    
+    for feed in feeds:
+        if feed.source_type:
+            source_types.add(feed.source_type)
+            
+            if feed.source_type == "youtube":
+                meta = get_feed_metadata(feed, db)
+                channel_name = meta.get("channel_name")
+                if channel_name:
+                    unique_sources.add(f"YouTube: {channel_name}")
+            elif feed.source_type == "blog" and feed.blog:
+                unique_sources.add(f"Blog: {feed.blog.website}")
+    
+    # Calculate total slides
+    total_slides = sum(len(feed.slides) for feed in feeds)
+    
+    # Get list type based on source
+    list_type = "playlist" if content_list.source_type == "youtube" else "collection"
+    if content_list.source_type == "blog":
+        list_type = "blog_collection"
+    elif content_list.source_type == "manual":
+        list_type = "manual_collection"
+    
+    # Get thumbnail from first feed
+    thumbnail_url = None
+    if feeds:
+        meta = get_feed_metadata(feeds[0], db)
+        thumbnail_url = meta.get("thumbnail_url") or meta.get("favicon")
+    
+    # Get playlist/channel info for YouTube lists
+    youtube_info = None
+    if content_list.source_type == "youtube":
+        # Extract playlist ID from source_id
+        if content_list.source_id and content_list.source_id.startswith("PL"):
+            # It's a playlist
+            youtube_info = {
+                "type": "playlist",
+                "playlist_id": content_list.source_id,
+                "url": f"https://www.youtube.com/playlist?list={content_list.source_id}"
+            }
+        elif content_list.source_id and content_list.source_id.startswith("channel_"):
+            # It's a channel
+            channel_id = content_list.source_id.replace("channel_", "")
+            youtube_info = {
+                "type": "channel",
+                "channel_id": channel_id,
+                "url": f"https://www.youtube.com/channel/{channel_id}"
+            }
+    
+    # Get list creator info (if available)
+    creator_info = None
+    if hasattr(content_list, 'user_id') and content_list.user_id:
+        creator = db.query(User).filter(User.id == content_list.user_id).first()
+        if creator:
+            creator_info = {
+                "id": creator.id,
+                "name": creator.full_name or creator.username,
+                "email": creator.email
+            }
+    
+    # Check if user has bookmarked any feeds in this list
+    user_bookmarked_feeds = []
+    if user_id:
+        bookmarks = db.query(Bookmark).filter(
+            Bookmark.user_id == user_id,
+            Bookmark.feed_id.in_(feed_ids)
+        ).all()
+        user_bookmarked_feeds = [bm.feed_id for bm in bookmarks]
+    
+    return {
+        "id": content_list.id,
+        "name": content_list.name,
+        "description": content_list.description,
+        "source_type": content_list.source_type,
+        "source_id": content_list.source_id,
+        "list_type": list_type,
+        "feed_ids": feed_ids,
+        "is_active": content_list.is_active,
+        "created_at": content_list.created_at.isoformat() if content_list.created_at else None,
+        "updated_at": content_list.updated_at.isoformat() if content_list.updated_at else None,
+        "statistics": {
+            "total_feeds": total_feeds,
+            "active_feeds": active_feeds,
+            "total_slides": total_slides,
+            "unique_topics": len(all_topics),
+            "unique_sources": len(unique_sources),
+            "source_types": list(source_types)
+        },
+        "top_topics": list(all_topics)[:10],  # Top 10 topics
+        "top_sources": list(unique_sources)[:5],  # Top 5 sources
+        "youtube_info": youtube_info,
+        "creator_info": creator_info,
+        "thumbnail_url": thumbnail_url,
+        "user_stats": {
+            "bookmarked_feeds": user_bookmarked_feeds,
+            "bookmarked_count": len(user_bookmarked_feeds)
+        } if user_id else None
+    }
+
+
 def get_source_metadata(source: Source, db: Session) -> Dict[str, Any]:
     """Get metadata for a source."""
     # Initialize metadata with basic info
@@ -1498,3 +1630,265 @@ def get_user_follows(
     except Exception as e:
         logger.error(f"Error fetching user follows: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch follow data: {str(e)}")
+
+
+@router.get("/lists/{list_id}/feeds", response_model=Dict[str, Any])
+def get_list_feeds_with_slides(
+    list_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    include_slides: bool = Query(True, description="Include full slide content"),
+    sort_by: str = Query("created_at", description="Sort by: created_at, title, or slides_count"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
+    current_user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all feeds in a list with full content including slides.
+    
+    Returns complete feed data with all slides for each feed in the list.
+    """
+    # Get the content list
+    content_list = db.query(ContentList).filter(
+        ContentList.id == list_id,
+        ContentList.is_active == True
+    ).first()
+    
+    if not content_list:
+        raise HTTPException(status_code=404, detail=f"List with ID {list_id} not found")
+    
+    # Get user_id for personalization
+    user_id = current_user.id if current_user else None
+    
+    # Get all feed IDs in this list
+    feed_ids = content_list.feed_ids or []
+    
+    if not feed_ids:
+        return {
+            "list": {
+                "id": content_list.id,
+                "name": content_list.name,
+                "description": content_list.description,
+                "source_type": content_list.source_type,
+                "list_type": "playlist" if content_list.source_type == "youtube" else "collection",
+                "feed_count": 0
+            },
+            "feeds": {
+                "items": [],
+                "page": page,
+                "limit": limit,
+                "total": 0,
+                "has_more": False
+            }
+        }
+    
+    # Query for feeds in this list with all relationships
+    query = db.query(Feed).options(
+        joinedload(Feed.blog),
+        joinedload(Feed.slides),
+        joinedload(Feed.category),
+        joinedload(Feed.subcategory),
+        joinedload(Feed.concepts),
+        joinedload(Feed.published_feed)
+    ).filter(
+        Feed.id.in_(feed_ids),
+        Feed.status == "ready"
+    )
+    
+    # Apply sorting
+    if sort_by == "title":
+        if sort_order.lower() == "asc":
+            query = query.order_by(Feed.title.asc())
+        else:
+            query = query.order_by(Feed.title.desc())
+    elif sort_by == "slides_count":
+        # Sort by number of slides
+        query = query.order_by(func.array_length(Feed.slide_ids, 1).desc() if sort_order.lower() == "desc" 
+                             else func.array_length(Feed.slide_ids, 1).asc())
+    else:  # Default: sort by created_at
+        if sort_order.lower() == "asc":
+            query = query.order_by(Feed.created_at.asc())
+        else:
+            query = query.order_by(Feed.created_at.desc())
+    
+    # Count and paginate
+    total = query.count()
+    feeds = query.offset((page - 1) * limit).limit(limit).all()
+    
+    # Format feeds with full content
+    formatted_feeds = []
+    for feed in feeds:
+        # Get metadata
+        meta = get_feed_metadata(feed, db)
+        
+        # Check if bookmarked
+        is_bookmarked = False
+        if user_id:
+            bookmark = db.query(Bookmark).filter(
+                Bookmark.user_id == user_id,
+                Bookmark.feed_id == feed.id
+            ).first()
+            is_bookmarked = bookmark is not None
+        
+        # Get concepts
+        concepts = []
+        if hasattr(feed, 'concepts') and feed.concepts:
+            concepts = [{"id": c.id, "name": c.name} for c in feed.concepts][:5]
+        
+        # Get source info
+        source_info = {}
+        if feed.source_type == "youtube":
+            source_info = {
+                "type": "youtube",
+                "name": meta.get("channel_name", "YouTube"),
+                "url": meta.get("source_url", "#"),
+                "channel_id": meta.get("channel_id"),
+                "channel_thumbnail": meta.get("channel_thumbnail")
+            }
+        elif feed.source_type == "blog" and feed.blog:
+            source_info = {
+                "type": "blog",
+                "name": feed.blog.website,
+                "url": feed.blog.website,
+                "author": getattr(feed.blog, 'author', 'Unknown'),
+                "favicon": meta.get("favicon")
+            }
+        
+        # Check if published
+        is_published = feed.published_feed is not None
+        
+        # Get category and subcategory
+        category_name = feed.category.name if feed.category else None
+        subcategory_name = feed.subcategory.name if feed.subcategory else None
+        
+        # Extract summary from AI content
+        summary = ""
+        if feed.ai_generated_content and "summary" in feed.ai_generated_content:
+            summary = feed.ai_generated_content["summary"]
+        
+        # Get key points
+        key_points = []
+        if feed.ai_generated_content and "key_points" in feed.ai_generated_content:
+            key_points = feed.ai_generated_content["key_points"]
+        
+        # Get conclusion
+        conclusion = ""
+        if feed.ai_generated_content and "conclusion" in feed.ai_generated_content:
+            conclusion = feed.ai_generated_content["conclusion"]
+        
+        # Prepare slides data
+        slides_data = []
+        if include_slides and feed.slides:
+            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+            for slide in sorted_slides:
+                slide_data = {
+                    "id": slide.id,
+                    "order": slide.order,
+                    "title": slide.title,
+                    "body": slide.body,
+                    "bullets": slide.bullets or [],
+                    "background_color": slide.background_color or "#FFFFFF",
+                    # "background_image_prompt": slide.background_image_prompt,
+                    "source_refs": slide.source_refs or [],
+                    "render_markdown": bool(slide.render_markdown),
+                    "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                    "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                }
+                slides_data.append(slide_data)
+        
+        # Format the complete feed
+        feed_data = {
+            "id": feed.id,
+            "title": feed.title,
+            "summary": summary,
+            "key_points": key_points,
+            "conclusion": conclusion,
+            "content_type": feed.content_type.value if feed.content_type else "Video",
+            "source_type": feed.source_type,
+            "source_info": source_info,
+            "categories": feed.categories or [],
+            "concepts": concepts,
+            "skills": getattr(feed, 'skills', []) or [],
+            "tools": getattr(feed, 'tools', []) or [],
+            "roles": getattr(feed, 'roles', []) or [],
+            "status": feed.status,
+            "is_published": is_published,
+            "is_bookmarked": is_bookmarked,
+            "ai_generated": bool(feed.ai_generated_content),
+            "meta": meta,
+            "category": {
+                "id": feed.category_id,
+                "name": category_name
+            } if feed.category_id else None,
+            "subcategory": {
+                "id": feed.subcategory_id,
+                "name": subcategory_name
+            } if feed.subcategory_id else None,
+            "slides": slides_data if include_slides else [],
+            "slides_count": len(feed.slides) if feed.slides else 0,
+            "created_at": feed.created_at.isoformat() if feed.created_at else None,
+            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+            "published_at": feed.published_feed.published_at.isoformat() if is_published and feed.published_feed else None
+        }
+        
+        # Add source-specific IDs
+        if feed.source_type == "blog":
+            feed_data["blog_id"] = feed.blog_id
+            if feed.blog:
+                feed_data["website"] = feed.blog.website
+                feed_data["blog_url"] = feed.blog.url
+        elif feed.source_type == "youtube":
+            feed_data["transcript_id"] = feed.transcript_id
+            # Try to get video_id
+            if feed.transcript_id:
+                transcript = db.query(Transcript).filter(
+                    Transcript.transcript_id == feed.transcript_id
+                ).first()
+                if transcript:
+                    feed_data["video_id"] = transcript.video_id
+                    feed_data["youtube_url"] = f"https://www.youtube.com/watch?v={transcript.video_id}"
+        
+        formatted_feeds.append(feed_data)
+    
+    # Format list details
+    list_details = {
+        "id": content_list.id,
+        "name": content_list.name,
+        "description": content_list.description,
+        "source_type": content_list.source_type,
+        "source_id": content_list.source_id,
+        "list_type": "playlist" if content_list.source_type == "youtube" else "collection",
+        "feed_count": len(feed_ids),
+        "created_at": content_list.created_at.isoformat() if content_list.created_at else None,
+        "updated_at": content_list.updated_at.isoformat() if content_list.updated_at else None
+    }
+    
+    # Add YouTube info for YouTube playlists
+    if content_list.source_type == "youtube" and content_list.source_id:
+        if content_list.source_id.startswith("PL"):
+            list_details["youtube_info"] = {
+                "type": "playlist",
+                "playlist_id": content_list.source_id,
+                "url": f"https://www.youtube.com/playlist?list={content_list.source_id}"
+            }
+        elif content_list.source_id.startswith("channel_"):
+            channel_id = content_list.source_id.replace("channel_", "")
+            list_details["youtube_info"] = {
+                "type": "channel",
+                "channel_id": channel_id,
+                "url": f"https://www.youtube.com/channel/{channel_id}"
+            }
+    
+    return {
+        "list": list_details,
+        "feeds": {
+            "items": formatted_feeds,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": (page * limit) < total,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "include_slides": include_slides
+        }
+    }
