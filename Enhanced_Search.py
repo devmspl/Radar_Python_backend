@@ -1301,11 +1301,12 @@ def get_concept_by_id(
     concept_id: int,
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    include_slides: bool = Query(True, description="Include full slide content"),
     user_id: Optional[int] = Query(None, description="User ID for personalization"),
     db: Session = Depends(get_db)
 ):
     """
-    Get concept by ID with all associated feeds.
+    Get concept by ID with all associated feeds including slides and full metadata.
     """
     # Get the concept
     concept = db.query(Concept).filter(
@@ -1321,13 +1322,14 @@ def get_concept_by_id(
         FeedConcept.concept_id == concept_id
     )
     
-    # Get feeds with their relationships
+    # Get feeds with all relationships including slides
     query_obj = db.query(Feed).options(
         joinedload(Feed.blog),
         joinedload(Feed.slides),
         joinedload(Feed.category),
         joinedload(Feed.subcategory),
-        joinedload(Feed.concepts)
+        joinedload(Feed.concepts),
+        joinedload(Feed.published_feed)
     ).filter(
         Feed.id.in_(feed_ids_query),
         Feed.status == "ready"
@@ -1338,10 +1340,141 @@ def get_concept_by_id(
     query_obj = query_obj.order_by(Feed.created_at.desc())
     feeds = query_obj.offset((page - 1) * limit).limit(limit).all()
     
-    # Format feeds
+    # Format feeds with full content including slides
     formatted_feeds = []
     for feed in feeds:
-        formatted_feeds.append(format_feed_for_search(feed, db, user_id))
+        # Get metadata
+        meta = get_feed_metadata(feed, db)
+        
+        # Check if bookmarked
+        is_bookmarked = False
+        if user_id:
+            bookmark = db.query(Bookmark).filter(
+                Bookmark.user_id == user_id,
+                Bookmark.feed_id == feed.id
+            ).first()
+            is_bookmarked = bookmark is not None
+        
+        # Get other concepts
+        feed_concepts = []
+        if hasattr(feed, 'concepts') and feed.concepts:
+            for c in feed.concepts:
+                if c.id != concept_id:  # Exclude the current concept
+                    feed_concepts.append({"id": c.id, "name": c.name})
+        
+        # Get source info
+        source_info = {}
+        if feed.source_type == "youtube":
+            source_info = {
+                "type": "youtube",
+                "name": meta.get("channel_name", "YouTube"),
+                "url": meta.get("source_url", "#"),
+                "channel_id": meta.get("channel_id"),
+                "channel_thumbnail": meta.get("channel_thumbnail")
+            }
+        elif feed.source_type == "blog" and feed.blog:
+            source_info = {
+                "type": "blog",
+                "name": feed.blog.website,
+                "url": feed.blog.website,
+                "author": getattr(feed.blog, 'author', 'Unknown'),
+                "favicon": meta.get("favicon")
+            }
+        
+        # Check if published
+        is_published = feed.published_feed is not None
+        
+        # Get category and subcategory
+        category_name = feed.category.name if feed.category else None
+        subcategory_name = feed.subcategory.name if feed.subcategory else None
+        
+        # Extract summary from AI content
+        summary = ""
+        if feed.ai_generated_content and "summary" in feed.ai_generated_content:
+            summary = feed.ai_generated_content["summary"]
+        
+        # Get key points
+        key_points = []
+        if feed.ai_generated_content and "key_points" in feed.ai_generated_content:
+            key_points = feed.ai_generated_content["key_points"]
+        
+        # Get conclusion
+        conclusion = ""
+        if feed.ai_generated_content and "conclusion" in feed.ai_generated_content:
+            conclusion = feed.ai_generated_content["conclusion"]
+        
+        # Prepare slides data
+        slides_data = []
+        if include_slides and feed.slides:
+            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+            for slide in sorted_slides:
+                slide_data = {
+                    "id": slide.id,
+                    "order": slide.order,
+                    "title": slide.title,
+                    "body": slide.body,
+                    "bullets": slide.bullets or [],
+                    "background_color": slide.background_color or "#FFFFFF",
+                    "source_refs": slide.source_refs or [],
+                    "render_markdown": bool(slide.render_markdown),
+                    "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                    "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                }
+                slides_data.append(slide_data)
+        
+        # Format the complete feed
+        feed_data = {
+            "id": feed.id,
+            "title": feed.title,
+            "summary": summary,
+            "key_points": key_points,
+            "conclusion": conclusion,
+            "content_type": feed.content_type.value if feed.content_type else "Video",
+            "source_type": feed.source_type,
+            "source_info": source_info,
+            "categories": feed.categories or [],
+            "concepts": feed_concepts,  # Other concepts (excluding current)
+            "skills": getattr(feed, 'skills', []) or [],
+            "tools": getattr(feed, 'tools', []) or [],
+            "roles": getattr(feed, 'roles', []) or [],
+            "status": feed.status,
+            "is_published": is_published,
+            "is_bookmarked": is_bookmarked,
+            "ai_generated": bool(feed.ai_generated_content),
+            "meta": meta,
+            "category": {
+                "id": feed.category_id,
+                "name": category_name
+            } if feed.category_id else None,
+            "subcategory": {
+                "id": feed.subcategory_id,
+                "name": subcategory_name
+            } if feed.subcategory_id else None,
+            "slides": slides_data if include_slides else [],
+            "slides_count": len(feed.slides) if feed.slides else 0,
+            "created_at": feed.created_at.isoformat() if feed.created_at else None,
+            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+            "published_at": feed.published_feed.published_at.isoformat() if is_published and feed.published_feed else None
+        }
+        
+        # Add source-specific IDs
+        if feed.source_type == "blog":
+            feed_data["blog_id"] = feed.blog_id
+            if feed.blog:
+                feed_data["website"] = feed.blog.website
+                feed_data["blog_url"] = feed.blog.url
+        elif feed.source_type == "youtube":
+            feed_data["transcript_id"] = feed.transcript_id
+            # Try to get video_id
+            if feed.transcript_id:
+                transcript = db.query(Transcript).filter(
+                    Transcript.transcript_id == feed.transcript_id
+                ).first()
+                if transcript:
+                    feed_data["video_id"] = transcript.video_id
+                    feed_data["youtube_url"] = f"https://www.youtube.com/watch?v={transcript.video_id}"
+        
+        formatted_feeds.append(feed_data)
     
     # Get related concepts
     related_concepts = []
@@ -1355,7 +1488,8 @@ def get_concept_by_id(
                 "id": c.id,
                 "name": c.name,
                 "description": c.description,
-                "feed_count": len(c.feeds) if hasattr(c, 'feeds') else 0
+                "feed_count": len(c.feeds) if hasattr(c, 'feeds') else 0,
+                "popularity_score": c.popularity_score
             }
             for c in related_concept_objs
         ]
@@ -1376,12 +1510,19 @@ def get_concept_by_id(
                 "relevance_score": dc.relevance_score
             })
     
-    # Get concept statistics
-    feed_count = total
+    # Get concept statistics from all feeds (not just paginated ones)
+    all_feeds_for_concept = db.query(Feed).filter(
+        Feed.id.in_(feed_ids_query),
+        Feed.status == "ready"
+    ).all()
+    
+    feed_count = len(all_feeds_for_concept)
     unique_topics = set()
     unique_sources = set()
+    total_slides = 0
+    content_types = {}
     
-    for feed in feeds:
+    for feed in all_feeds_for_concept:
         # Collect unique topics from categories
         if feed.categories:
             for category in feed.categories:
@@ -1392,9 +1533,26 @@ def get_concept_by_id(
             meta = get_feed_metadata(feed, db)
             channel_name = meta.get("channel_name")
             if channel_name:
-                unique_sources.add(channel_name)
+                unique_sources.add(f"YouTube: {channel_name}")
         elif feed.source_type == "blog" and feed.blog:
-            unique_sources.add(feed.blog.website)
+            unique_sources.add(f"Blog: {feed.blog.website}")
+        
+        # Count slides
+        if feed.slides:
+            total_slides += len(feed.slides)
+        
+        # Count content types
+        content_type = feed.content_type.value if feed.content_type else "Unknown"
+        content_types[content_type] = content_types.get(content_type, 0) + 1
+    
+    # Get most common topic
+    topic_counts = {}
+    for feed in all_feeds_for_concept:
+        if feed.categories:
+            for category in feed.categories:
+                topic_counts[category] = topic_counts.get(category, 0) + 1
+    
+    most_common_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     
     return {
         "concept": {
@@ -1410,7 +1568,12 @@ def get_concept_by_id(
             "feed_count": feed_count,
             "unique_topics": len(unique_topics),
             "unique_sources": len(unique_sources),
-            "top_topics": list(unique_topics)[:10],
+            "total_slides": total_slides,
+            "average_slides_per_feed": round(total_slides / feed_count, 2) if feed_count > 0 else 0,
+            "content_type_distribution": [
+                {"type": ct, "count": count} for ct, count in content_types.items()
+            ],
+            "top_topics": [{"topic": topic, "count": count} for topic, count in most_common_topics],
             "top_sources": list(unique_sources)[:10]
         },
         "domains": domains,
@@ -1420,7 +1583,8 @@ def get_concept_by_id(
             "page": page,
             "limit": limit,
             "total": total,
-            "has_more": (page * limit) < total
+            "has_more": (page * limit) < total,
+            "include_slides": include_slides
         }
     }
 
