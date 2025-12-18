@@ -14,7 +14,7 @@ from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
 from sqlalchemy import or_, String
 import requests
 from enum import Enum
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_, asc, desc
 from models import Domain, Concept, FeedConcept, DomainConcept, ContentList
 
 router = APIRouter(prefix="/get", tags=["Feeds"])
@@ -2459,3 +2459,297 @@ def trigger_list_creation(
             "message": f"Failed to create lists: {str(e)}"
         }
 
+@router.get("/feeds/filtered", response_model=dict)
+def get_filtered_feeds(
+    response: Response,
+    page: int = 1,
+    limit: int = 20,
+    published_status: Optional[str] = None,  # "published", "unpublished", or None for all
+    category_ids: Optional[List[int]] = None,
+    subcategory_ids: Optional[List[int]] = None,
+    search_query: Optional[str] = None,
+    source_type: Optional[str] = None,
+    content_type: Optional[str] = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+    db: Session = Depends(get_db)
+):
+    """
+    Get feeds with advanced filtering:
+    - published_status: filter by published status
+    - category_ids: array of category IDs to filter
+    - subcategory_ids: array of subcategory IDs to filter
+    - search_query: search in title, content, categories, skills, etc.
+    - source_type: "blog" or "youtube"
+    - content_type: "Blog", "Video", "Podcast", "Webinar"
+    - sort_by: "created_at", "updated_at", "title"
+    - sort_order: "asc" or "desc"
+    """
+    try:
+        # Base query with joins for all related data INCLUDING SLIDES
+        query = db.query(Feed).options(
+            joinedload(Feed.blog),
+            joinedload(Feed.slides),  # This loads all slides
+            joinedload(Feed.category),
+            joinedload(Feed.subcategory),
+            joinedload(Feed.concepts)
+        )
+        
+        # Filter by published status
+        if published_status:
+            published_feed_ids = db.query(PublishedFeed.feed_id).filter(
+                PublishedFeed.is_active == True
+            )
+            
+            if published_status.lower() == "published":
+                query = query.filter(Feed.id.in_(published_feed_ids))
+            elif published_status.lower() == "unpublished":
+                query = query.filter(~Feed.id.in_(published_feed_ids))
+        
+        # Filter by category IDs
+        if category_ids:
+            # Convert to list if it's a string
+            if isinstance(category_ids, str):
+                try:
+                    category_ids = [int(id.strip()) for id in category_ids.split(',')]
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid category_ids format. Use comma-separated integers."
+                    )
+            
+            # Filter feeds that belong to any of the specified categories
+            query = query.filter(Feed.category_id.in_(category_ids))
+        
+        # Filter by subcategory IDs
+        if subcategory_ids:
+            # Convert to list if it's a string
+            if isinstance(subcategory_ids, str):
+                try:
+                    subcategory_ids = [int(id.strip()) for id in subcategory_ids.split(',')]
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid subcategory_ids format. Use comma-separated integers."
+                    )
+            
+            query = query.filter(Feed.subcategory_id.in_(subcategory_ids))
+        
+        # Filter by source type
+        if source_type:
+            query = query.filter(Feed.source_type == source_type)
+        
+        # Filter by content type
+        if content_type:
+            try:
+                content_type_enum = FilterType(content_type)
+                query = query.filter(Feed.content_type == content_type_enum)
+            except ValueError:
+                logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        # Search query across multiple fields
+        if search_query:
+            search_terms = search_query.lower().split()
+            
+            # Build OR conditions for each search term
+            or_conditions = []
+            for term in search_terms:
+                if len(term) >= 2:  # Only search for terms with at least 2 characters
+                    term_filter = or_(
+                        Feed.title.ilike(f"%{term}%"),
+                        func.lower(func.cast(Feed.categories, String())).ilike(f"%{term}%"),
+                        func.lower(func.cast(Feed.skills, String())).ilike(f"%{term}%"),
+                        func.lower(func.cast(Feed.tools, String())).ilike(f"%{term}%"),
+                        func.lower(func.cast(Feed.roles, String())).ilike(f"%{term}%"),
+                        # Search in blog content if blog exists
+                        db.query(Blog.content.ilike(f"%{term}%")).where(Blog.id == Feed.blog_id).exists() if Feed.blog_id else False,
+                        # Search in transcript content via transcript ID
+                        db.query(Transcript.transcript_text.ilike(f"%{term}%")).where(
+                            Transcript.transcript_id == Feed.transcript_id
+                        ).exists() if Feed.transcript_id else False,
+                        # Search in concepts
+                        db.query(Concept.name.ilike(f"%{term}%")).where(
+                            Concept.id.in_(
+                                db.query(FeedConcept.concept_id).filter(
+                                    FeedConcept.feed_id == Feed.id
+                                )
+                            )
+                        ).exists()
+                    )
+                    or_conditions.append(term_filter)
+            
+            if or_conditions:
+                # Combine all OR conditions with AND (all terms must match)
+                combined_condition = or_conditions[0]
+                for condition in or_conditions[1:]:
+                    combined_condition = and_(combined_condition, condition)
+                query = query.filter(combined_condition)
+        
+        # Apply sorting
+        sort_column = None
+        if sort_by == "title":
+            sort_column = Feed.title
+        elif sort_by == "updated_at":
+            sort_column = Feed.updated_at
+        else:  # Default to created_at
+            sort_column = Feed.created_at
+        
+        if sort_order.lower() == "asc":
+            query = query.order_by(asc(sort_column))
+        else:
+            query = query.order_by(desc(sort_column))
+        
+        # Get total count before pagination
+        total = query.count()
+        
+        # Apply pagination
+        feeds = query.offset((page - 1) * limit).limit(limit).all()
+        
+        # Format the response
+        feeds_data = []
+        for feed in feeds:
+            # Check if published
+            is_published = db.query(PublishedFeed).filter(
+                PublishedFeed.feed_id == feed.id,
+                PublishedFeed.is_active == True
+            ).first() is not None
+            
+            # Get proper metadata
+            meta = get_feed_metadata(feed, db)
+            
+            # Get topic descriptions
+            topic_descriptions = []
+            if feed.categories:
+                topic_descriptions = get_topic_descriptions(feed.categories, db)
+            
+            # Get category and subcategory names
+            category_name = feed.category.name if feed.category else None
+            subcategory_name = feed.subcategory.name if feed.subcategory else None
+            
+            # Format content type
+            feed_content_type = feed.content_type.value if feed.content_type else FilterType.BLOG.value
+            
+            # Get concepts
+            concepts = []
+            if hasattr(feed, 'concepts') and feed.concepts:
+                for concept in feed.concepts:
+                    concepts.append({
+                        "id": concept.id,
+                        "name": concept.name,
+                        "description": concept.description
+                    })
+            
+            # Get all slides for this feed (already loaded via joinedload)
+            slides_data = []
+            if feed.slides:
+                # Sort slides by order
+                sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+                for slide in sorted_slides:
+                    slides_data.append({
+                        "id": slide.id,
+                        "order": slide.order,
+                        "title": slide.title,
+                        "body": slide.body,
+                        "bullets": slide.bullets or [],
+                        "background_color": slide.background_color,
+                        "source_refs": slide.source_refs or [],
+                        "render_markdown": bool(slide.render_markdown),
+                        "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                        "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                    })
+            
+            # AI generated content
+            ai_content = {}
+            if hasattr(feed, 'ai_generated_content') and feed.ai_generated_content:
+                ai_content = feed.ai_generated_content
+            elif feed.title and feed.slides:
+                # Create basic AI content from existing data
+                ai_content = {
+                    "title": feed.title,
+                    "summary": feed.slides[0].body if feed.slides and feed.slides[0].body else "",
+                    "key_points": [],
+                    "conclusion": feed.slides[-1].body if feed.slides and feed.slides[-1].body else ""
+                }
+            
+            feed_data = {
+                "id": feed.id,
+                "title": feed.title,
+                "categories": feed.categories or [],
+                "content_type": feed_content_type,
+                "skills": getattr(feed, 'skills', []) or [],
+                "tools": getattr(feed, 'tools', []) or [],
+                "roles": getattr(feed, 'roles', []) or [],
+                "status": feed.status,
+                "source_type": feed.source_type or "blog",
+                "is_published": is_published,
+                "slides_count": len(feed.slides) if feed.slides else 0,
+                "slides": slides_data,  # Include all slides data
+                "ai_generated_content": ai_content,
+                "created_at": feed.created_at.isoformat() if feed.created_at else None,
+                "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+                "ai_generated": feed.ai_generated_content is not None,
+                # Category info
+                "category_name": category_name,
+                "subcategory_name": subcategory_name,
+                "category_id": feed.category_id,
+                "subcategory_id": feed.subcategory_id,
+                "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+                "meta": meta,
+                "topics": topic_descriptions,
+                "concepts": concepts
+            }
+            
+            # Add source-specific IDs
+            if feed.source_type == "blog":
+                feed_data["blog_id"] = feed.blog_id
+                if feed.blog:
+                    feed_data["website"] = feed.blog.website
+                    feed_data["author"] = getattr(feed.blog, 'author', 'Unknown')
+            elif feed.source_type == "youtube":
+                feed_data["transcript_id"] = feed.transcript_id
+                if feed.transcript_id:
+                    transcript = db.query(Transcript).filter(
+                        Transcript.transcript_id == feed.transcript_id
+                    ).first()
+                    if transcript:
+                        feed_data["video_id"] = transcript.video_id
+                        # Get channel name from metadata instead
+                        feed_data["channel_name"] = meta.get("channel_name", "YouTube Creator")
+            
+            feeds_data.append(feed_data)
+        
+        # Add response headers
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Page"] = str(page)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Total-Pages"] = str((total + limit - 1) // limit)
+        
+        has_more = (page * limit) < total
+        
+        return {
+            "feeds": feeds_data,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "total_pages": (total + limit - 1) // limit,
+                "has_more": has_more
+            },
+            "filters_applied": {
+                "published_status": published_status,
+                "category_ids": category_ids,
+                "subcategory_ids": subcategory_ids,
+                "search_query": search_query,
+                "source_type": source_type,
+                "content_type": content_type,
+                "sort_by": sort_by,
+                "sort_order": sort_order
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching filtered feeds: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch filtered feeds: {str(e)}"
+        )
