@@ -140,6 +140,21 @@ class CategoryUpdateWithSubcategories(BaseModel):
     subcategories_to_remove: Optional[List[str]] = None  # List of subcategory IDs to remove
     subcategories_to_update: Optional[List[SubCategoryUpdate]] = None
 
+class FilterFeedsRequest(BaseModel):
+    page: int = 1
+    limit: int = 20
+    published_status: Optional[str] = None  # "published", "unpublished", or None for all
+    category_ids: Optional[List[int]] = None
+    subcategory_ids: Optional[List[int]] = None
+    search_query: Optional[str] = None
+    source_type: Optional[str] = None
+    content_type: Optional[str] = None
+    sort_by: str = "created_at"  # "created_at", "updated_at", "title"
+    sort_order: str = "desc"  # "asc" or "desc"
+    date_field: str = "created_at"  # "created_at" or "updated_at" - which date field to filter on
+    from_date: Optional[str] = None  # Start date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
+    to_date: Optional[str] = None  # End date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
+
 # Response for subcategory operations
 class SubCategoryListResponse(BaseModel):
     subcategories: List[SubCategoryResponse]

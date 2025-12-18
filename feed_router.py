@@ -10,7 +10,7 @@ from database import get_db
 from models import Blog, Category, Feed, Slide, Transcript, TranscriptJob, Source, PublishedFeed, FilterType,SubCategory,ScrapeJob,Topic
 from openai import OpenAI, APIError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential
-from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest
+from schemas import FeedRequest, DeleteSlideRequest, YouTubeFeedRequest,FilterFeedsRequest
 from sqlalchemy import or_, String
 import requests
 from enum import Enum
@@ -2459,14 +2459,14 @@ def trigger_list_creation(
             "message": f"Failed to create lists: {str(e)}"
         }
 
-@router.get("/feeds/filtered", response_model=dict)
-def get_filtered_feeds(
+@router.post("/feeds/filtered", response_model=dict)
+def get_filtered_feeds_post(
     response: Response,
     page: int = 1,
     limit: int = 20,
     published_status: Optional[str] = None,  # "published", "unpublished", or None for all
-    category_ids: Optional[List[int]] = None,
-    subcategory_ids: Optional[List[int]] = None,
+    category_ids: Optional[str] = None,  # Comma-separated string of category IDs
+    subcategory_ids: Optional[str] = None,  # Comma-separated string of subcategory IDs
     search_query: Optional[str] = None,
     source_type: Optional[str] = None,
     content_type: Optional[str] = None,
@@ -2478,10 +2478,10 @@ def get_filtered_feeds(
     db: Session = Depends(get_db)
 ):
     """
-    Get feeds with advanced filtering:
+    Get feeds with advanced filtering using POST method with query parameters:
     - published_status: filter by published status
-    - category_ids: array of category IDs to filter
-    - subcategory_ids: array of subcategory IDs to filter
+    - category_ids: comma-separated string of category IDs to filter
+    - subcategory_ids: comma-separated string of subcategory IDs to filter
     - search_query: search in title, content, categories, skills, etc.
     - source_type: "blog" or "youtube"
     - content_type: "Blog", "Video", "Podcast", "Webinar"
@@ -2492,6 +2492,27 @@ def get_filtered_feeds(
     - to_date: End date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
     """
     try:
+        # Parse comma-separated IDs to lists
+        category_ids_list = []
+        if category_ids:
+            try:
+                category_ids_list = [int(id.strip()) for id in category_ids.split(',') if id.strip().isdigit()]
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid category_ids format. Use comma-separated integers."
+                )
+        
+        subcategory_ids_list = []
+        if subcategory_ids:
+            try:
+                subcategory_ids_list = [int(id.strip()) for id in subcategory_ids.split(',') if id.strip().isdigit()]
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid subcategory_ids format. Use comma-separated integers."
+                )
+        
         # Base query with joins for all related data INCLUDING SLIDES
         query = db.query(Feed).options(
             joinedload(Feed.blog),
@@ -2513,33 +2534,12 @@ def get_filtered_feeds(
                 query = query.filter(~Feed.id.in_(published_feed_ids))
         
         # Filter by category IDs
-        if category_ids:
-            # Convert to list if it's a string
-            if isinstance(category_ids, str):
-                try:
-                    category_ids = [int(id.strip()) for id in category_ids.split(',')]
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid category_ids format. Use comma-separated integers."
-                    )
-            
-            # Filter feeds that belong to any of the specified categories
-            query = query.filter(Feed.category_id.in_(category_ids))
+        if category_ids_list:
+            query = query.filter(Feed.category_id.in_(category_ids_list))
         
         # Filter by subcategory IDs
-        if subcategory_ids:
-            # Convert to list if it's a string
-            if isinstance(subcategory_ids, str):
-                try:
-                    subcategory_ids = [int(id.strip()) for id in subcategory_ids.split(',')]
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid subcategory_ids format. Use comma-separated integers."
-                    )
-            
-            query = query.filter(Feed.subcategory_id.in_(subcategory_ids))
+        if subcategory_ids_list:
+            query = query.filter(Feed.subcategory_id.in_(subcategory_ids_list))
         
         # Filter by source type
         if source_type:
