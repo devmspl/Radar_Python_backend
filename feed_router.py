@@ -2470,8 +2470,11 @@ def get_filtered_feeds(
     search_query: Optional[str] = None,
     source_type: Optional[str] = None,
     content_type: Optional[str] = None,
-    sort_by: str = "created_at",
-    sort_order: str = "desc",
+    sort_by: str = "created_at",  # "created_at", "updated_at", "title"
+    sort_order: str = "desc",  # "asc" or "desc"
+    date_field: str = "created_at",  # "created_at" or "updated_at" - which date field to filter on
+    from_date: Optional[str] = None,  # Start date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
+    to_date: Optional[str] = None,  # End date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
     db: Session = Depends(get_db)
 ):
     """
@@ -2484,6 +2487,9 @@ def get_filtered_feeds(
     - content_type: "Blog", "Video", "Podcast", "Webinar"
     - sort_by: "created_at", "updated_at", "title"
     - sort_order: "asc" or "desc"
+    - date_field: "created_at" or "updated_at" - which date field to use for date range filtering
+    - from_date: Start date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+    - to_date: End date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
     """
     try:
         # Base query with joins for all related data INCLUDING SLIDES
@@ -2546,6 +2552,49 @@ def get_filtered_feeds(
                 query = query.filter(Feed.content_type == content_type_enum)
             except ValueError:
                 logger.warning(f"Invalid content_type provided: {content_type}")
+        
+        # DATE RANGE FILTERING
+        if from_date or to_date:
+            # Determine which date field to use
+            date_column = None
+            if date_field == "updated_at":
+                date_column = Feed.updated_at
+            else:  # Default to created_at
+                date_column = Feed.created_at
+            
+            # Parse from_date
+            if from_date:
+                try:
+                    # Try parsing with time first
+                    from_datetime = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+                except ValueError:
+                    try:
+                        # Try parsing as date only (YYYY-MM-DD)
+                        from_datetime = datetime.strptime(from_date, "%Y-%m-%d")
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid from_date format: {from_date}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS"
+                        )
+                query = query.filter(date_column >= from_datetime)
+            
+            # Parse to_date
+            if to_date:
+                try:
+                    # Try parsing with time first
+                    to_datetime = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+                except ValueError:
+                    try:
+                        # Try parsing as date only (YYYY-MM-DD)
+                        to_datetime = datetime.strptime(to_date, "%Y-%m-%d")
+                        # Add one day to include the entire day
+                        to_datetime = to_datetime.replace(hour=23, minute=59, second=59)
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid to_date format: {to_date}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS"
+                        )
+                query = query.filter(date_column <= to_datetime)
         
         # Search query across multiple fields
         if search_query:
@@ -2743,7 +2792,10 @@ def get_filtered_feeds(
                 "source_type": source_type,
                 "content_type": content_type,
                 "sort_by": sort_by,
-                "sort_order": sort_order
+                "sort_order": sort_order,
+                "date_field": date_field,
+                "from_date": from_date,
+                "to_date": to_date
             }
         }
         
