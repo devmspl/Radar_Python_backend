@@ -10,9 +10,10 @@ from database import get_db
 from models import SubCategory, Category
 from schemas import (
     SubCategoryCreate, SubCategoryUpdate, SubCategoryResponse,
-    SubCategoryListResponse, BulkSubCategoryCreate
+    SubCategoryListResponse, BulkSubCategoryCreate,CategoriesListResponse
 )
-
+from dependencies import get_current_admin
+import models
 
 class CRUDSubCategory:
     def get_by_id(self, db: Session, subcategory_id: int) -> Optional[SubCategory]:
@@ -258,7 +259,100 @@ def create_bulk_subcategories(
         "failed": failed,
         "total": len(bulk_data.subcategories)
     }
-
+# Place the search endpoint BEFORE parameterized routes
+@router.get("/search", response_model=SubCategoryListResponse)
+def search_subcategories(
+    q: str = Query(..., min_length=1, description="Search query"),
+    category_id: Optional[int] = Query(None, description="Filter by category ID"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    include_inactive: bool = False,
+    sort_by: Optional[str] = Query(None, description="Sort by field: name, created_at, category_name, etc."),
+    sort_order: str = Query("asc", description="Sort order: asc or desc"),
+    db: Session = Depends(get_db)
+):
+    """Search subcategories by name or description with advanced filtering"""
+    try:
+        from sqlalchemy import case
+        
+        # Base query
+        query = db.query(SubCategory)
+        
+        # Filter by active status if needed
+        if not include_inactive:
+            query = query.filter(SubCategory.is_active == True)
+        
+        # Filter by category if specified
+        if category_id:
+            query = query.filter(SubCategory.category_id == category_id)
+        
+        # Search functionality
+        search_term = f"%{q}%"
+        query = query.filter(
+            or_(
+                SubCategory.name.ilike(search_term),
+                SubCategory.description.ilike(search_term)
+            )
+        )
+        
+        # Sorting
+        if sort_by:
+            if sort_by == "name":
+                sort_field = SubCategory.name
+            elif sort_by == "created_at":
+                sort_field = SubCategory.created_at
+            elif sort_by == "updated_at":
+                sort_field = SubCategory.updated_at
+            elif sort_by == "category_name":
+                # Sort by category name - need to join
+                query = query.join(Category)
+                sort_field = Category.name
+            else:
+                sort_field = SubCategory.created_at
+            
+            if sort_order.lower() == "desc":
+                query = query.order_by(sort_field.desc())
+            else:
+                query = query.order_by(sort_field.asc())
+        else:
+            # SQLite compatible default sorting
+            query = query.order_by(
+                case(
+                    (SubCategory.name.like(f"{q}%"), 0),  # Exact start matches
+                    (SubCategory.name.like(f"%{q}%"), 1),  # Contains
+                    else_=2
+                ),
+                SubCategory.name.asc(),
+                SubCategory.created_at.desc()
+            )
+        
+        # Get total count before pagination
+        total = query.count()
+        
+        # Apply pagination
+        subcategories = query.offset(skip).limit(limit).all()
+        
+        # Calculate if there are more results
+        has_more = skip + limit < total
+        
+        # Calculate page number
+        page = (skip // limit) + 1 if limit > 0 else 1
+        
+        return {
+            "subcategories": subcategories,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": has_more,
+            "search_query": q,
+            "category_id": category_id
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error searching subcategories: {str(e)}"
+        )
 
 @router.get("/", response_model=SubCategoryListResponse)
 def get_subcategories(
