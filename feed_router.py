@@ -2464,32 +2464,21 @@ def get_filtered_feeds_post(
     response: Response,
     page: int = 1,
     limit: int = 20,
-    published_status: Optional[str] = None,  # "published", "unpublished", or None for all
-    category_ids: Optional[str] = None,  # Comma-separated string of category IDs
-    subcategory_ids: Optional[str] = None,  # Comma-separated string of subcategory IDs
+    published_status: Optional[str] = None,
+    category_ids: Optional[str] = None,
+    subcategory_ids: Optional[str] = None,
     search_query: Optional[str] = None,
     source_type: Optional[str] = None,
     content_type: Optional[str] = None,
-    sort_by: str = "created_at",  # "created_at", "updated_at", "title"
-    sort_order: str = "desc",  # "asc" or "desc"
-    date_field: str = "created_at",  # "created_at" or "updated_at" - which date field to filter on
-    from_date: Optional[str] = None,  # Start date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
-    to_date: Optional[str] = None,  # End date in YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+    date_field: str = "created_at",
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
-    Get feeds with advanced filtering using POST method with query parameters:
-    - published_status: filter by published status
-    - category_ids: comma-separated string of category IDs to filter
-    - subcategory_ids: comma-separated string of subcategory IDs to filter
-    - search_query: search in title, content, categories, skills, etc.
-    - source_type: "blog" or "youtube"
-    - content_type: "Blog", "Video", "Podcast", "Webinar"
-    - sort_by: "created_at", "updated_at", "title"
-    - sort_order: "asc" or "desc"
-    - date_field: "created_at" or "updated_at" - which date field to use for date range filtering
-    - from_date: Start date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
-    - to_date: End date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+    Get feeds with advanced filtering using POST method with query parameters.
     """
     try:
         # Parse comma-separated IDs to lists
@@ -2513,10 +2502,10 @@ def get_filtered_feeds_post(
                     detail="Invalid subcategory_ids format. Use comma-separated integers."
                 )
         
-        # Base query with joins for all related data INCLUDING SLIDES
+        # Base query with joins for all related data
         query = db.query(Feed).options(
             joinedload(Feed.blog),
-            joinedload(Feed.slides),  # This loads all slides
+            joinedload(Feed.slides),
             joinedload(Feed.category),
             joinedload(Feed.subcategory),
             joinedload(Feed.concepts)
@@ -2555,21 +2544,13 @@ def get_filtered_feeds_post(
         
         # DATE RANGE FILTERING
         if from_date or to_date:
-            # Determine which date field to use
-            date_column = None
-            if date_field == "updated_at":
-                date_column = Feed.updated_at
-            else:  # Default to created_at
-                date_column = Feed.created_at
+            date_column = Feed.updated_at if date_field == "updated_at" else Feed.created_at
             
-            # Parse from_date
             if from_date:
                 try:
-                    # Try parsing with time first
                     from_datetime = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
                 except ValueError:
                     try:
-                        # Try parsing as date only (YYYY-MM-DD)
                         from_datetime = datetime.strptime(from_date, "%Y-%m-%d")
                     except ValueError:
                         raise HTTPException(
@@ -2578,16 +2559,12 @@ def get_filtered_feeds_post(
                         )
                 query = query.filter(date_column >= from_datetime)
             
-            # Parse to_date
             if to_date:
                 try:
-                    # Try parsing with time first
                     to_datetime = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
                 except ValueError:
                     try:
-                        # Try parsing as date only (YYYY-MM-DD)
                         to_datetime = datetime.strptime(to_date, "%Y-%m-%d")
-                        # Add one day to include the entire day
                         to_datetime = to_datetime.replace(hour=23, minute=59, second=59)
                     except ValueError:
                         raise HTTPException(
@@ -2596,51 +2573,97 @@ def get_filtered_feeds_post(
                         )
                 query = query.filter(date_column <= to_datetime)
         
-        # Search query across multiple fields
-        if search_query:
-            search_terms = search_query.lower().split()
+        # **FIXED SEARCH LOGIC**
+        if search_query and len(search_query.strip()) >= 2:
+            search_term = f"%{search_query.strip().lower()}%"
             
-            # Build OR conditions for each search term
-            or_conditions = []
-            for term in search_terms:
-                if len(term) >= 2:  # Only search for terms with at least 2 characters
-                    term_filter = or_(
-                        Feed.title.ilike(f"%{term}%"),
-                        func.lower(func.cast(Feed.categories, String())).ilike(f"%{term}%"),
-                        func.lower(func.cast(Feed.skills, String())).ilike(f"%{term}%"),
-                        func.lower(func.cast(Feed.tools, String())).ilike(f"%{term}%"),
-                        func.lower(func.cast(Feed.roles, String())).ilike(f"%{term}%"),
-                        # Search in blog content if blog exists
-                        db.query(Blog.content.ilike(f"%{term}%")).where(Blog.id == Feed.blog_id).exists() if Feed.blog_id else False,
-                        # Search in transcript content via transcript ID
-                        db.query(Transcript.transcript_text.ilike(f"%{term}%")).where(
-                            Transcript.transcript_id == Feed.transcript_id
-                        ).exists() if Feed.transcript_id else False,
-                        # Search in concepts
-                        db.query(Concept.name.ilike(f"%{term}%")).where(
-                            Concept.id.in_(
-                                db.query(FeedConcept.concept_id).filter(
-                                    FeedConcept.feed_id == Feed.id
-                                )
-                            )
-                        ).exists()
-                    )
-                    or_conditions.append(term_filter)
+            # Create a subquery for feeds that match the search criteria
+            search_subquery = db.query(Feed.id).distinct()
             
-            if or_conditions:
-                # Combine all OR conditions with AND (all terms must match)
-                combined_condition = or_conditions[0]
-                for condition in or_conditions[1:]:
-                    combined_condition = and_(combined_condition, condition)
-                query = query.filter(combined_condition)
+            # Apply search filters to the subquery
+            search_filters = []
+            
+            # 1. Search in Feed table fields
+            search_filters.extend([
+                Feed.title.ilike(search_term),
+                Feed.status.ilike(search_term),
+            ])
+            
+            # 2. Search in JSON arrays (categories, skills, tools, roles)
+            # For PostgreSQL JSONB fields, we need to use different approach
+            # Assuming your database is PostgreSQL with JSONB columns
+            search_filters.extend([
+                Feed.categories.cast(String).ilike(search_term),
+                Feed.skills.cast(String).ilike(search_term),
+                Feed.tools.cast(String).ilike(search_term),
+                Feed.roles.cast(String).ilike(search_term),
+            ])
+            
+            # 3. Search in related Blog content
+            search_filters.append(
+                db.query(Blog.id).filter(
+                    Blog.id == Feed.blog_id,
+                    Blog.content.ilike(search_term)
+                ).exists()
+            )
+            
+            # 4. Search in related Transcript content
+            search_filters.append(
+                db.query(Transcript.id).filter(
+                    Transcript.transcript_id == Feed.transcript_id,
+                    Transcript.transcript_text.ilike(search_term)
+                ).exists()
+            )
+            
+            # 5. Search in related Concepts
+            search_filters.append(
+                db.query(Concept.id).join(FeedConcept).filter(
+                    FeedConcept.feed_id == Feed.id,
+                    Concept.name.ilike(search_term)
+                ).exists()
+            )
+            
+            # Apply all OR conditions to the subquery
+            search_subquery = search_subquery.filter(or_(*search_filters))
+            
+            # Get the feed IDs that match the search
+            matching_feed_ids = [row[0] for row in search_subquery.all()]
+            
+            # If no matches found, return empty result early
+            if not matching_feed_ids:
+                return {
+                    "feeds": [],
+                    "pagination": {
+                        "page": page,
+                        "limit": limit,
+                        "total": 0,
+                        "total_pages": 0,
+                        "has_more": False
+                    },
+                    "filters_applied": {
+                        "search_query": search_query,
+                        "published_status": published_status,
+                        "category_ids": category_ids,
+                        "subcategory_ids": subcategory_ids,
+                        "source_type": source_type,
+                        "content_type": content_type,
+                        "sort_by": sort_by,
+                        "sort_order": sort_order,
+                        "date_field": date_field,
+                        "from_date": from_date,
+                        "to_date": to_date
+                    }
+                }
+            
+            # Filter the main query to only include feeds that match the search
+            query = query.filter(Feed.id.in_(matching_feed_ids))
         
         # Apply sorting
-        sort_column = None
         if sort_by == "title":
             sort_column = Feed.title
         elif sort_by == "updated_at":
             sort_column = Feed.updated_at
-        else:  # Default to created_at
+        else:
             sort_column = Feed.created_at
         
         if sort_order.lower() == "asc":
@@ -2688,10 +2711,9 @@ def get_filtered_feeds_post(
                         "description": concept.description
                     })
             
-            # Get all slides for this feed (already loaded via joinedload)
+            # Get all slides for this feed
             slides_data = []
             if feed.slides:
-                # Sort slides by order
                 sorted_slides = sorted(feed.slides, key=lambda x: x.order)
                 for slide in sorted_slides:
                     slides_data.append({
@@ -2712,7 +2734,6 @@ def get_filtered_feeds_post(
             if hasattr(feed, 'ai_generated_content') and feed.ai_generated_content:
                 ai_content = feed.ai_generated_content
             elif feed.title and feed.slides:
-                # Create basic AI content from existing data
                 ai_content = {
                     "title": feed.title,
                     "summary": feed.slides[0].body if feed.slides and feed.slides[0].body else "",
@@ -2732,12 +2753,11 @@ def get_filtered_feeds_post(
                 "source_type": feed.source_type or "blog",
                 "is_published": is_published,
                 "slides_count": len(feed.slides) if feed.slides else 0,
-                "slides": slides_data,  # Include all slides data
+                "slides": slides_data,
                 "ai_generated_content": ai_content,
                 "created_at": feed.created_at.isoformat() if feed.created_at else None,
                 "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
                 "ai_generated": feed.ai_generated_content is not None,
-                # Category info
                 "category_name": category_name,
                 "subcategory_name": subcategory_name,
                 "category_id": feed.category_id,
@@ -2762,7 +2782,6 @@ def get_filtered_feeds_post(
                     ).first()
                     if transcript:
                         feed_data["video_id"] = transcript.video_id
-                        # Get channel name from metadata instead
                         feed_data["channel_name"] = meta.get("channel_name", "YouTube Creator")
             
             feeds_data.append(feed_data)
@@ -2805,3 +2824,196 @@ def get_filtered_feeds_post(
             status_code=500,
             detail=f"Failed to fetch filtered feeds: {str(e)}"
         )
+
+@router.delete("/{feed_id}", response_model=dict)
+def delete_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
+    """
+    Delete a feed by its ID along with all related data.
+    This will delete:
+    1. The feed record itself
+    2. All slides associated with the feed
+    3. Feed-Concept relationships
+    4. PublishedFeed entry (if exists)
+    5. ContentList associations (removes feed ID from lists)
+    """
+    try:
+        # Start a transaction
+        db.begin()
+        
+        # First, check if the feed exists
+        feed = db.query(Feed).filter(Feed.id == feed_id).first()
+        if not feed:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Feed with ID {feed_id} not found"
+            )
+        
+        logger.info(f"Starting deletion of feed ID {feed_id} - Title: '{feed.title}'")
+        
+        # 1. Delete feed-concept relationships first
+        concept_deleted = db.query(FeedConcept).filter(
+            FeedConcept.feed_id == feed_id
+        ).delete(synchronize_session=False)
+        logger.info(f"Deleted {concept_deleted} concept relationships for feed {feed_id}")
+        
+        # 2. Delete all slides associated with this feed
+        slides_deleted = db.query(Slide).filter(
+            Slide.feed_id == feed_id
+        ).delete(synchronize_session=False)
+        logger.info(f"Deleted {slides_deleted} slides for feed {feed_id}")
+        
+        # 3. Delete published feed entry if exists
+        published_feed_deleted = db.query(PublishedFeed).filter(
+            PublishedFeed.feed_id == feed_id
+        ).delete(synchronize_session=False)
+        if published_feed_deleted:
+            logger.info(f"Deleted published feed entry for feed {feed_id}")
+        
+        # 4. Remove this feed from any ContentLists it's part of
+        content_lists = db.query(ContentList).filter(
+            ContentList.feed_ids.isnot(None),
+            ContentList.feed_ids.contains([feed_id])
+        ).all()
+        
+        lists_updated = 0
+        for content_list in content_lists:
+            if content_list.feed_ids and feed_id in content_list.feed_ids:
+                # Remove the feed ID from the list
+                updated_feed_ids = [fid for fid in content_list.feed_ids if fid != feed_id]
+                content_list.feed_ids = updated_feed_ids
+                content_list.updated_at = datetime.utcnow()
+                lists_updated += 1
+                logger.info(f"Removed feed {feed_id} from content list '{content_list.name}'")
+        
+        # 5. Store feed info for logging before deletion
+        feed_info = {
+            "id": feed.id,
+            "title": feed.title,
+            "source_type": feed.source_type,
+            "created_at": feed.created_at,
+            "status": feed.status
+        }
+        
+        # 6. Finally, delete the feed itself
+        db.delete(feed)
+        
+        # Commit the transaction
+        db.commit()
+        
+        logger.info(f"Successfully deleted feed ID {feed_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Feed '{feed_info['title']}' (ID: {feed_id}) has been deleted",
+            "details": {
+                "feed_id": feed_info["id"],
+                "title": feed_info["title"],
+                "slides_deleted": slides_deleted,
+                "concept_relationships_deleted": concept_deleted,
+                "published_feed_deleted": bool(published_feed_deleted),
+                "content_lists_updated": lists_updated,
+                "source_type": feed_info["source_type"],
+                "deleted_at": datetime.utcnow().isoformat()
+            }
+        }
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting feed {feed_id}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete feed: {str(e)}"
+        )
+@router.post("/delete/batch", response_model=dict)
+def delete_feeds_in_batch(
+    feed_ids: List[int],
+    soft_delete: bool = False,
+    db: Session = Depends(get_db)
+):
+    """
+    Delete multiple feeds at once.
+    
+    Args:
+        feed_ids: List of feed IDs to delete
+        soft_delete: If True, marks feeds as deleted instead of hard delete
+    """
+    if not feed_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="No feed IDs provided"
+        )
+    
+    results = {
+        "successful": [],
+        "failed": [],
+        "not_found": []
+    }
+    
+    try:
+        for feed_id in feed_ids:
+            try:
+                if soft_delete:
+                    # Soft delete logic
+                    feed = db.query(Feed).filter(Feed.id == feed_id).first()
+                    if feed:
+                        feed.status = "deleted"
+                        feed.is_deleted = True
+                        feed.deleted_at = datetime.utcnow()
+                        results["successful"].append(feed_id)
+                    else:
+                        results["not_found"].append(feed_id)
+                else:
+                    # Hard delete logic
+                    feed = db.query(Feed).filter(Feed.id == feed_id).first()
+                    if feed:
+                        # Delete related data
+                        db.query(FeedConcept).filter(
+                            FeedConcept.feed_id == feed_id
+                        ).delete(synchronize_session=False)
+                        
+                        db.query(Slide).filter(
+                            Slide.feed_id == feed_id
+                        ).delete(synchronize_session=False)
+                        
+                        db.query(PublishedFeed).filter(
+                            PublishedFeed.feed_id == feed_id
+                        ).delete(synchronize_session=False)
+                        
+                        # Delete the feed
+                        db.delete(feed)
+                        results["successful"].append(feed_id)
+                    else:
+                        results["not_found"].append(feed_id)
+                        
+            except Exception as e:
+                logger.error(f"Error deleting feed {feed_id}: {e}")
+                results["failed"].append({
+                    "feed_id": feed_id,
+                    "error": str(e)
+                })
+        
+        db.commit()
+        
+        return {
+            "status": "partial_success" if results["failed"] else "success",
+            "message": f"Processed {len(feed_ids)} feeds",
+            "results": results,
+            "summary": {
+                "total_requested": len(feed_ids),
+                "successful": len(results["successful"]),
+                "failed": len(results["failed"]),
+                "not_found": len(results["not_found"])
+            }
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error in batch delete: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Batch delete failed: {str(e)}"
+        )
+
