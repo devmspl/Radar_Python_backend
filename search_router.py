@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException,status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, String, func
 from typing import List, Optional, Dict, Any
@@ -1603,9 +1603,10 @@ def get_feeds_by_source(
     source_id: int,
     page: int = 1,
     limit: int = 20,
+    include_unpublished: bool = False,  # New parameter to include unpublished feeds
     db: Session = Depends(get_db)
 ):
-    """Get all feeds with full metadata and slides for a specific source."""
+    """Get ALL feeds (published and unpublished) for a specific source."""
     # First, verify the source exists
     source = db.query(Source).filter(
         Source.id == source_id,
@@ -1613,67 +1614,89 @@ def get_feeds_by_source(
     ).first()
     
     if not source:
-        raise HTTPException(status_code=404, detail=f"Source with ID {source_id} not found")
-    
-    # Get source metadata (handle missing description field)
-    source_meta = get_source_metadata(source)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Source with ID {source_id} not found"
+        )
     
     # Build query based on source type
     if source.source_type == "blog":
-        # For blog sources, get feeds from blogs with matching website
         feeds_query = db.query(Feed).options(
             joinedload(Feed.blog),
-            joinedload(Feed.slides)
+            joinedload(Feed.slides),
+            joinedload(Feed.category),  # Join category
+            joinedload(Feed.subcategory)  # Join subcategory
         ).join(Blog).filter(
-            Blog.website == source.website,
-            Feed.status == "ready"
-        ).order_by(Feed.created_at.desc())
+            Blog.website == source.website
+        )
+        
+        if not include_unpublished:
+            feeds_query = feeds_query.filter(Feed.status == "ready")
         
         total = feeds_query.count()
-        feeds = feeds_query.offset((page - 1) * limit).limit(limit).all()
+        feeds = feeds_query.order_by(Feed.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
     
     else:  # youtube source
-        # For YouTube sources, we need to match by channel name
+        # Get all YouTube feeds
         feeds_query = db.query(Feed).options(
             joinedload(Feed.blog),
-            joinedload(Feed.slides)
+            joinedload(Feed.slides),
+            joinedload(Feed.category),  # Join category
+            joinedload(Feed.subcategory)  # Join subcategory
         ).filter(
-            Feed.source_type == "youtube",
-            Feed.status == "ready"
-        ).order_by(Feed.created_at.desc())
+            Feed.source_type == "youtube"
+        )
         
-        # Filter results to match the channel
-        all_feeds = feeds_query.all()
+        if not include_unpublished:
+            feeds_query = feeds_query.filter(Feed.status == "ready")
+        
+        # Get all feeds first for filtering
+        all_feeds = feeds_query.order_by(Feed.created_at.desc()).all()
+        
+        # Filter to match channel name
         matching_feeds = []
-        
         for feed in all_feeds:
             meta = get_feed_metadata(feed, db)
-            channel_name = meta.get("channel_name")
-            if channel_name == source.name:
+            if meta.get("channel_name") == source.name:
                 matching_feeds.append(feed)
         
-        # Manual pagination for YouTube feeds
+        # Manual pagination
         total = len(matching_feeds)
         start_idx = (page - 1) * limit
         end_idx = start_idx + limit
         feeds = matching_feeds[start_idx:end_idx]
     
-    # Format response with feeds
+    # Format response with enhanced metadata
     items = []
     for feed in feeds:
+        # Get category and subcategory names
+        category_name = feed.category.name if feed.category else None
+        subcategory_name = feed.subcategory.name if feed.subcategory else None
+        
+        # Get feed metadata
         meta = get_feed_metadata(feed, db)
-        sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+        
+        # Add category info to metadata
+        meta_with_categories = {
+            **meta,
+            "category_name": category_name,
+            "subcategory_name": subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+        }
+        
+        # Format slides
+        sorted_slides = sorted(feed.slides, key=lambda x: x.order) if feed.slides else []
         
         items.append({
             "id": feed.id,
-            "blog_id": feed.blog_id,
-            "transcript_id": feed.transcript_id,
             "title": feed.title,
             "categories": feed.categories,
             "status": feed.status,
             "source_type": feed.source_type or "blog",
-            "ai_generated_content": feed.ai_generated_content or {},
-            "meta": meta,
+            "meta": meta_with_categories,
+            "slides_count": len(feed.slides),
             "slides": [
                 {
                     "id": slide.id,
@@ -1689,7 +1712,11 @@ def get_feeds_by_source(
                     "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
                 } for slide in sorted_slides
             ],
-            "slides_count": len(feed.slides),
+            "category_name": category_name,
+            "subcategory_name": subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
             "created_at": feed.created_at.isoformat() if feed.created_at else None,
             "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
             "ai_generated": bool(feed.ai_generated_content)
@@ -1697,7 +1724,10 @@ def get_feeds_by_source(
     
     has_more = (page * limit) < total
     
-    # Build source response with safe attribute access
+    # Get source metadata
+    source_meta = get_source_metadata(source)
+    
+    # Build source response
     source_response = {
         "id": source.id,
         "name": source.name,
@@ -1719,7 +1749,8 @@ def get_feeds_by_source(
         "page": page,
         "limit": limit,
         "total": total,
-        "has_more": has_more
+        "has_more": has_more,
+        "include_unpublished": include_unpublished
     }
 
 
