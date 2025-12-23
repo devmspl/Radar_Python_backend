@@ -12,7 +12,8 @@ from dependencies import get_current_user
 from models import (
     Feed, Blog, Transcript, Topic, Source, Concept, Domain, 
     ContentList, UserTopicFollow, UserSourceFollow, Bookmark,
-    Category, SubCategory, FeedConcept, DomainConcept,Topic,User
+    Category, SubCategory, FeedConcept, DomainConcept, Topic, User,
+    UserOnboarding
 )
 from feed_router import get_feed_metadata
 import os
@@ -2055,4 +2056,121 @@ def get_list_feeds_with_slides(
             "sort_order": sort_order,
             "include_slides": include_slides
         }
+    }
+
+
+# ------------------ User Subcategories Search API ------------------
+
+@router.get("/user-subcategories", response_model=Dict[str, Any])
+def search_user_subcategories(
+    query: Optional[str] = Query(None, description="Search query to match subcategory name or description"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Search subcategories based on user's selected categories from onboarding.
+    
+    This API:
+    - Searches SubCategory by name and description fields
+    - Returns only subcategories from categories the logged-in user has selected in onboarding
+    - Prioritizes subcategories with more feeds (higher feed count comes first)
+    - Includes feed count for each subcategory
+    
+    Authentication Required: Yes (Bearer Token)
+    """
+    user_id = current_user.id
+    
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "user-subcategories",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+    
+    # Step 2: Query subcategories from user's selected categories
+    query_obj = db.query(SubCategory).filter(
+        SubCategory.category_id.in_(user_category_ids),
+        SubCategory.is_active == True
+    )
+    
+    # Step 3: Apply search filter on name and description
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
+        query_obj = query_obj.filter(
+            or_(
+                SubCategory.name.ilike(search_term),
+                SubCategory.description.ilike(search_term)
+            )
+        )
+    
+    # Step 4: Get all matching subcategories
+    subcategories = query_obj.all()
+    
+    # Step 5: Calculate feed count for each subcategory and build response
+    subcategory_list = []
+    for subcategory in subcategories:
+        # Count feeds for this subcategory
+        feed_count = db.query(func.count(Feed.id)).filter(
+            Feed.subcategory_id == subcategory.id,
+            Feed.status == "ready"
+        ).scalar() or 0
+        
+        # Get category name
+        category = db.query(Category).filter(
+            Category.id == subcategory.category_id
+        ).first()
+        category_name = category.name if category else "Unknown"
+        
+        subcategory_list.append({
+            "id": subcategory.id,
+            "uuid": subcategory.uuid,
+            "name": subcategory.name,
+            "description": subcategory.description,
+            "category_id": subcategory.category_id,
+            "category_name": category_name,
+            "feed_count": feed_count,
+            "is_active": subcategory.is_active,
+            "created_at": subcategory.created_at.isoformat() if subcategory.created_at else None,
+            "updated_at": subcategory.updated_at.isoformat() if subcategory.updated_at else None
+        })
+    
+    # Step 6: Sort by feed_count (descending) - more feeds first
+    subcategory_list.sort(key=lambda x: x["feed_count"], reverse=True)
+    
+    # Step 7: Paginate results
+    total = len(subcategory_list)
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_items = subcategory_list[start_idx:end_idx]
+    
+    return {
+        "tab": "user-subcategories",
+        "query": query,
+        "items": paginated_items,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": (page * limit) < total,
+        "user_selected_categories": user_category_ids
     }
