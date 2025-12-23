@@ -1864,7 +1864,7 @@ def get_feeds_by_subcategory(
     subcategory_name: str = Query(..., description="Subcategory name to search for feeds"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
-    include_slides: bool = Query(False, description="Include slide data in response"),
+    include_slides: bool = Query(True, description="Include slide data in response"),
     db: Session = Depends(get_db)
 ):
     """
@@ -1875,6 +1875,7 @@ def get_feeds_by_subcategory(
     - Returns all feeds belonging to that subcategory
     - Returns feed count and subcategory details
     - Sorted by latest feeds first (created_at descending)
+    - Response format matches /publish/feeds/filter-by-type API
     
     Authentication: Not required (Public API)
     """
@@ -1896,14 +1897,16 @@ def get_feeds_by_subcategory(
         Category.id == subcategory.category_id
     ).first()
     
-    # Step 3: Query feeds for this subcategory
-    query_obj = db.query(Feed).filter(
+    # Step 3: Query feeds for this subcategory with all relationships
+    query_obj = db.query(Feed).options(
+        joinedload(Feed.slides),
+        joinedload(Feed.blog),
+        joinedload(Feed.category),
+        joinedload(Feed.subcategory)
+    ).filter(
         Feed.subcategory_id == subcategory.id,
         Feed.status == "ready"
     )
-    
-    if include_slides:
-        query_obj = query_obj.options(joinedload(Feed.slides))
     
     # Step 4: Get total count
     total_count = query_obj.count()
@@ -1912,50 +1915,84 @@ def get_feeds_by_subcategory(
     query_obj = query_obj.order_by(Feed.created_at.desc())
     feeds = query_obj.offset((page - 1) * limit).limit(limit).all()
     
-    # Step 6: Format feeds
+    # Step 6: Format feeds (matching /publish/feeds/filter-by-type format)
     formatted_feeds = []
     for feed in feeds:
-        # Get feed metadata
+        # Get category and subcategory names
+        feed_category_name = feed.category.name if feed.category else None
+        feed_subcategory_name = feed.subcategory.name if feed.subcategory else None
+        
+        # Get feed metadata (enhanced)
         feed_meta = get_feed_metadata(feed, db)
         
-        feed_data = {
-            "id": feed.id,
-            "title": feed.title,
-            "categories": feed.categories,
-            "content_type": feed.content_type.value if feed.content_type else "Blog",
-            "source_type": feed.source_type,
-            "skills": feed.skills or [],
-            "tools": feed.tools or [],
-            "roles": feed.roles or [],
-            "status": feed.status,
-            "category_id": feed.category_id,
-            "subcategory_id": feed.subcategory_id,
-            "created_at": feed.created_at.isoformat() if feed.created_at else None,
-            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
-            "metadata": feed_meta
-        }
+        # Get content type in display format
+        feed_content_type = "Blog"
+        if feed.content_type:
+            content_type_value = feed.content_type.value if hasattr(feed.content_type, 'value') else str(feed.content_type)
+            if content_type_value.upper() == 'BLOG':
+                feed_content_type = 'Blog'
+            elif content_type_value.upper() == 'WEBINAR':
+                feed_content_type = 'Webinar'
+            elif content_type_value.upper() == 'PODCAST':
+                feed_content_type = 'Podcast'
+            elif content_type_value.upper() == 'VIDEO':
+                feed_content_type = 'Video'
+            else:
+                feed_content_type = content_type_value
         
-        # Add AI generated content summary if available
-        if feed.ai_generated_content:
-            feed_data["summary"] = feed.ai_generated_content.get("summary", "")[:200] + "..." if len(feed.ai_generated_content.get("summary", "")) > 200 else feed.ai_generated_content.get("summary", "")
-            feed_data["key_points"] = feed.ai_generated_content.get("key_points", [])[:5]
-        
-        # Add slides if requested
-        if include_slides and feed.slides:
-            feed_data["slides"] = [
-                {
+        # Process slides with full details
+        slides_data = []
+        if feed.slides:
+            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+            for slide in sorted_slides:
+                slides_data.append({
                     "id": slide.id,
                     "order": slide.order,
                     "title": slide.title,
                     "body": slide.body,
-                    "bullets": slide.bullets,
-                    "background_color": slide.background_color
-                }
-                for slide in sorted(feed.slides, key=lambda s: s.order)
-            ]
-            feed_data["slide_count"] = len(feed.slides)
-        else:
-            feed_data["slide_count"] = len(feed.slides) if feed.slides else 0
+                    "bullets": slide.bullets or [],
+                    "background_color": slide.background_color,
+                    "source_refs": slide.source_refs or [],
+                    "render_markdown": bool(slide.render_markdown) if hasattr(slide, 'render_markdown') else True,
+                    "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                    "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                })
+        
+        # Build feed data matching format_published_feed_response
+        feed_data = {
+            "id": feed.id,
+            "feed_id": feed.id,
+            "feed_title": feed.title,
+            "blog_title": feed.blog.title if feed.blog else None,
+            "feed_categories": feed.categories or [],
+            "content_type": feed_content_type,
+            "source_type": feed.source_type or "blog",
+            "skills": feed.skills or [],
+            "tools": feed.tools or [],
+            "roles": feed.roles or [],
+            "status": feed.status,
+            "slides_count": len(slides_data),
+            "slides": slides_data if include_slides else [],
+            "meta": feed_meta,
+            # Category and subcategory info
+            "category_name": feed_category_name,
+            "subcategory_name": feed_subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{feed_category_name} {{ {feed_subcategory_name} }}" if feed_category_name and feed_subcategory_name else feed_category_name,
+            # Timestamps
+            "created_at": feed.created_at.isoformat() if feed.created_at else None,
+            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+            # AI generated content
+            "ai_generated": feed.ai_generated_content is not None
+        }
+        
+        # Add AI generated content summary and key_points if available
+        if feed.ai_generated_content:
+            summary = feed.ai_generated_content.get("summary", "")
+            feed_data["summary"] = summary[:200] + "..." if len(summary) > 200 else summary
+            feed_data["key_points"] = feed.ai_generated_content.get("key_points", [])[:5]
+            feed_data["conclusion"] = feed.ai_generated_content.get("conclusion", "")
         
         formatted_feeds.append(feed_data)
     
@@ -1971,13 +2008,11 @@ def get_feeds_by_subcategory(
             "created_at": subcategory.created_at.isoformat() if subcategory.created_at else None,
             "updated_at": subcategory.updated_at.isoformat() if subcategory.updated_at else None
         },
-        "feeds": {
-            "items": formatted_feeds,
-            "page": page,
-            "limit": limit,
-            "total": total_count,
-            "has_more": (page * limit) < total_count
-        },
+        "feeds": formatted_feeds,
+        "page": page,
+        "limit": limit,
+        "total": total_count,
+        "has_more": (page * limit) < total_count,
         "feed_count": total_count
     }
 
