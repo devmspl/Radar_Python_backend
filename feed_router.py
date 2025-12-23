@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Response, BackgroundTasks, Query
 from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 import os
@@ -1856,6 +1856,131 @@ def get_all_feeds(
         "has_more": has_more
     }
 
+
+# ------------------ Feeds by Subcategory API ------------------
+
+@router.get("/feeds-by-subcategory", response_model=Dict[str, Any])
+def get_feeds_by_subcategory(
+    subcategory_name: str = Query(..., description="Subcategory name to search for feeds"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    include_slides: bool = Query(False, description="Include slide data in response"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all feeds related to a specific subcategory by name.
+    
+    This API:
+    - Takes subcategory name as input
+    - Returns all feeds belonging to that subcategory
+    - Returns feed count and subcategory details
+    - Sorted by latest feeds first (created_at descending)
+    
+    Authentication: Not required (Public API)
+    """
+    
+    # Step 1: Find subcategory by name (case-insensitive search)
+    subcategory = db.query(SubCategory).filter(
+        SubCategory.name.ilike(f"%{subcategory_name.strip()}%"),
+        SubCategory.is_active == True
+    ).first()
+    
+    if not subcategory:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Subcategory '{subcategory_name}' not found"
+        )
+    
+    # Step 2: Get category info
+    category = db.query(Category).filter(
+        Category.id == subcategory.category_id
+    ).first()
+    
+    # Step 3: Query feeds for this subcategory
+    query_obj = db.query(Feed).filter(
+        Feed.subcategory_id == subcategory.id,
+        Feed.status == "ready"
+    )
+    
+    if include_slides:
+        query_obj = query_obj.options(joinedload(Feed.slides))
+    
+    # Step 4: Get total count
+    total_count = query_obj.count()
+    
+    # Step 5: Sort by created_at descending and paginate
+    query_obj = query_obj.order_by(Feed.created_at.desc())
+    feeds = query_obj.offset((page - 1) * limit).limit(limit).all()
+    
+    # Step 6: Format feeds
+    formatted_feeds = []
+    for feed in feeds:
+        # Get feed metadata
+        feed_meta = get_feed_metadata(feed, db)
+        
+        feed_data = {
+            "id": feed.id,
+            "title": feed.title,
+            "categories": feed.categories,
+            "content_type": feed.content_type.value if feed.content_type else "Blog",
+            "source_type": feed.source_type,
+            "skills": feed.skills or [],
+            "tools": feed.tools or [],
+            "roles": feed.roles or [],
+            "status": feed.status,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "created_at": feed.created_at.isoformat() if feed.created_at else None,
+            "updated_at": feed.updated_at.isoformat() if feed.updated_at else None,
+            "metadata": feed_meta
+        }
+        
+        # Add AI generated content summary if available
+        if feed.ai_generated_content:
+            feed_data["summary"] = feed.ai_generated_content.get("summary", "")[:200] + "..." if len(feed.ai_generated_content.get("summary", "")) > 200 else feed.ai_generated_content.get("summary", "")
+            feed_data["key_points"] = feed.ai_generated_content.get("key_points", [])[:5]
+        
+        # Add slides if requested
+        if include_slides and feed.slides:
+            feed_data["slides"] = [
+                {
+                    "id": slide.id,
+                    "order": slide.order,
+                    "title": slide.title,
+                    "body": slide.body,
+                    "bullets": slide.bullets,
+                    "background_color": slide.background_color
+                }
+                for slide in sorted(feed.slides, key=lambda s: s.order)
+            ]
+            feed_data["slide_count"] = len(feed.slides)
+        else:
+            feed_data["slide_count"] = len(feed.slides) if feed.slides else 0
+        
+        formatted_feeds.append(feed_data)
+    
+    return {
+        "subcategory": {
+            "id": subcategory.id,
+            "uuid": subcategory.uuid,
+            "name": subcategory.name,
+            "description": subcategory.description,
+            "category_id": subcategory.category_id,
+            "category_name": category.name if category else "Unknown",
+            "is_active": subcategory.is_active,
+            "created_at": subcategory.created_at.isoformat() if subcategory.created_at else None,
+            "updated_at": subcategory.updated_at.isoformat() if subcategory.updated_at else None
+        },
+        "feeds": {
+            "items": formatted_feeds,
+            "page": page,
+            "limit": limit,
+            "total": total_count,
+            "has_more": (page * limit) < total_count
+        },
+        "feed_count": total_count
+    }
+
     
 @router.get("/{feed_id}", response_model=dict)
 def get_feed_by_id(feed_id: int, db: Session = Depends(get_db)):
@@ -3016,4 +3141,3 @@ def delete_feeds_in_batch(
             status_code=500,
             detail=f"Batch delete failed: {str(e)}"
         )
-
