@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import logging
+import json
 
 from database import get_db
-from models import Bookmark, User, Feed, Blog, Slide,Transcript
-from schemas import BookmarkCreate, BookmarkUpdate, BookmarkResponse, BookmarkListResponse,BookmarkCreateResponse
+from models import Bookmark, User, Feed, Blog, Slide, Transcript, Source, Category, SubCategory, PublishedFeed
+from schemas import BookmarkCreate, BookmarkUpdate, BookmarkResponse, BookmarkListResponse, BookmarkCreateResponse
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -140,7 +141,165 @@ def extract_youtube_video_id(feed: Feed) -> Optional[str]:
     
     logger.warning(f"Could not extract valid YouTube video ID for feed {feed.id}")
     return None
+
+
+def format_feed_like_published_response(db: Session, feed: Feed, bookmark: "Bookmark" = None) -> Optional[Dict[str, Any]]:
+    """
+    Format feed response with EXACT same fields as /publish/feeds/by-category/{category_id} API.
+    Fields: id, feed_id, admin_id, admin_name, published_at, is_active, feed_title, blog_title,
+            feed_categories, content_type, skills, tools, roles, slides_count, slides, meta,
+            category_name, subcategory_name, category_id, subcategory_id, category_display, source
+    Plus bookmark-specific fields: bookmark_id, bookmark_notes, bookmark_tags, bookmark_created_at, bookmark_updated_at
+    """
+    try:
+        if not feed:
+            return None
+        
+        # Get published feed info if exists
+        published_feed = feed.published_feed
+        
+        # Get category and subcategory names
+        category_name = None
+        subcategory_name = None
+        if feed.category_id:
+            category = db.query(Category).filter(Category.id == feed.category_id).first()
+            if category:
+                category_name = category.name
+        
+        if feed.subcategory_id:
+            subcategory = db.query(SubCategory).filter(SubCategory.id == feed.subcategory_id).first()
+            if subcategory:
+                subcategory_name = subcategory.name
+        
+        # Process slides
+        slides_data = []
+        if feed.slides:
+            sorted_slides = sorted(feed.slides, key=lambda x: x.order)
+            for slide in sorted_slides:
+                slides_data.append({
+                    "id": slide.id,
+                    "order": slide.order,
+                    "title": slide.title,
+                    "body": slide.body,
+                    "bullets": slide.bullets,
+                    "background_color": slide.background_color,
+                    "background_image_prompt": None,
+                    "source_refs": slide.source_refs,
+                    "render_markdown": bool(slide.render_markdown),
+                    "created_at": slide.created_at.isoformat() if slide.created_at else None,
+                    "updated_at": slide.updated_at.isoformat() if slide.updated_at else None
+                })
+        
+        # Get enhanced metadata
+        meta_data = _get_feed_metadata_for_bookmark(db, feed)
+        
+        # Safely get content_type with fallback and convert to display format
+        feed_content_type = getattr(feed, 'content_type', 'BLOG')
+        if feed_content_type == 'BLOG':
+            feed_content_type = 'Blog'
+        elif feed_content_type == 'WEBINAR':
+            feed_content_type = 'Webinar'
+        elif feed_content_type == 'PODCAST':
+            feed_content_type = 'Podcast'
+        elif feed_content_type == 'VIDEO':
+            feed_content_type = 'Video'
+        
+        # Build the response with EXACT same fields as publish feeds by-category
+        response = {
+            "id": published_feed.id if published_feed else feed.id,
+            "feed_id": feed.id,
+            "admin_id": published_feed.admin_id if published_feed else None,
+            "admin_name": published_feed.admin_name if published_feed else None,
+            "published_at": published_feed.published_at.isoformat() if published_feed and published_feed.published_at else None,
+            "is_active": published_feed.is_active if published_feed else False,
+            "feed_title": feed.title,
+            "blog_title": feed.blog.title if feed.blog else None,
+            "feed_categories": feed.categories or [],
+            "content_type": feed_content_type,
+            "skills": getattr(feed, 'skills', []) or [],
+            "tools": getattr(feed, 'tools', []) or [],
+            "roles": getattr(feed, 'roles', []) or [],
+            "slides_count": len(slides_data),
+            "slides": slides_data,
+            "meta": meta_data,
+            "category_name": category_name,
+            "subcategory_name": subcategory_name,
+            "category_id": feed.category_id,
+            "subcategory_id": feed.subcategory_id,
+            "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+        }
+        
+        # Add bookmark-specific fields if bookmark is provided
+        if bookmark:
+            response["bookmark_id"] = bookmark.id
+            response["bookmark_notes"] = bookmark.notes
+            response["bookmark_tags"] = bookmark.tags
+            response["bookmark_created_at"] = bookmark.created_at.isoformat() if bookmark.created_at else None
+            response["bookmark_updated_at"] = bookmark.updated_at.isoformat() if bookmark.updated_at else None
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error formatting feed {feed.id if feed else 'None'}: {e}")
+        return None
+
+
+def _get_feed_metadata_for_bookmark(db: Session, feed: Feed) -> Dict[str, Any]:
+    """Get enhanced metadata for a feed in bookmark context."""
+    try:
+        if feed.source_type == "youtube":
+            # Get the actual YouTube video ID from the Transcript table
+            video_id = None
+            author = "YouTube Creator"
+            channel_name = None
+            thumbnail_url = None
+            
+            if feed.transcript_id:
+                transcript = db.query(Transcript).filter(Transcript.transcript_id == feed.transcript_id).first()
+                if transcript:
+                    if hasattr(transcript, 'video_id') and transcript.video_id:
+                        video_id = transcript.video_id
+                    if hasattr(transcript, 'channel_name') and transcript.channel_name:
+                        author = transcript.channel_name
+                        channel_name = transcript.channel_name
+                    elif hasattr(transcript, 'author') and transcript.author:
+                        author = transcript.author
+                    if hasattr(transcript, 'thumbnail_url') and transcript.thumbnail_url:
+                        thumbnail_url = transcript.thumbnail_url
+            
+            return {
+                "title": feed.title,
+                "original_title": feed.title,
+                "author": author,
+                "source_url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "#",
+                "source_type": "youtube",
+                "video_id": video_id,
+                "channel_name": channel_name,
+                "thumbnail_url": thumbnail_url or (f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg" if video_id else None),
+                "transcript_id": feed.transcript_id
+            }
+        else:
+            # Blog source
+            blog = feed.blog
+            return {
+                "title": feed.title,
+                "original_title": blog.title if blog else "Unknown",
+                "author": getattr(blog, 'author', 'Admin') if blog else 'Admin',
+                "source_url": getattr(blog, 'url', '#') if blog else '#',
+                "source_type": "blog",
+                "website": getattr(blog, 'website', '') if blog else '',
+                "thumbnail_url": getattr(blog, 'thumbnail_url', None) if blog else None
+            }
+    except Exception as e:
+        logger.error(f"Error getting metadata for feed {feed.id}: {e}")
+        return {
+            "title": feed.title if feed else "Unknown",
+            "source_type": feed.source_type if feed else "unknown"
+        }
+
+
 # ------------------ Bookmark API Endpoints ------------------
+
 
 @bookmark_router.post("/", response_model=BookmarkCreateResponse, status_code=status.HTTP_201_CREATED)
 def create_bookmark(
@@ -240,71 +399,349 @@ def get_bookmark(
         "feed": feed_with_details
     }
 
-@bookmark_router.get("/", response_model=BookmarkListResponse)
+@bookmark_router.get("/")
 def get_all_bookmarks(
     user_id: int = 1,  # In production, get from auth token
-    page: int = 1,
-    limit: int = 20,
-    tags: Optional[str] = None,  # Comma-separated tags to filter by
-    include_slides: bool = True,  # New parameter to include slides data
+    content_type: Optional[str] = Query(None, description="Filter by content types (comma-separated: Webinar,Blog,Podcast,Video)"),
+    skills: Optional[str] = Query(None, description="Filter by skills (comma-separated)"),
+    tools: Optional[str] = Query(None, description="Filter by tools (comma-separated)"),
+    roles: Optional[str] = Query(None, description="Filter by roles (comma-separated)"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    tags: Optional[str] = Query(None, description="Comma-separated tags to filter by"),
+    include_slides: bool = Query(True, description="Include slides data"),
+    include_source_info: bool = Query(True, description="Include source information"),
     db: Session = Depends(get_db)
 ):
-    """Get all bookmarks for a user with pagination, filtering, and complete feed data."""
-    # Validate pagination parameters
-    if page < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Page must be greater than 0"
-        )
-    if limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Limit must be between 1 and 100"
-        )
-    
-    # Build query
-    query = db.query(Bookmark).filter(Bookmark.user_id == user_id)
-    
-    # Filter by tags if provided
-    if tags:
-        tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
-        if tag_list:
-            # Filter bookmarks that have any of the specified tags
-            query = query.filter(Bookmark.tags.op('&&')(tag_list))
-    
-    # Count total
-    total = query.count()
-    
-    # Apply pagination
-    bookmarks = query.order_by(Bookmark.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
-    
-    # Format response with complete feed data
-    items = []
-    for bookmark in bookmarks:
-        feed_with_details = get_complete_feed_data(db, bookmark.feed_id)
+    """Get all bookmarks for a user with pagination, filtering, and complete feed data matching publish feeds by-category format."""
+    try:
+        # Parse comma-separated strings into lists
+        def parse_comma_separated(value: Optional[str]) -> List[str]:
+            if not value:
+                return []
+            return [item.strip() for item in value.split(',') if item.strip()]
         
-        items.append({
-            "id": bookmark.id,
-            "user_id": bookmark.user_id,
-            "feed_id": bookmark.feed_id,
-            "notes": bookmark.notes,
-            "tags": bookmark.tags,
-            "created_at": bookmark.created_at,
-            "updated_at": bookmark.updated_at,
-            "feed": feed_with_details
-        })
-    
-    has_more = (page * limit) < total
-    
-    logger.info(f"Retrieved {len(items)} bookmarks for user {user_id} with complete feed data")
-    
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "has_more": has_more
-    }
+        content_types_list = parse_comma_separated(content_type)
+        skills_list = parse_comma_separated(skills)
+        tools_list = parse_comma_separated(tools)
+        roles_list = parse_comma_separated(roles)
+        tag_list = parse_comma_separated(tags)
+        
+        # Validate content_types if provided
+        valid_content_types = ['WEBINAR', 'BLOG', 'PODCAST', 'VIDEO']
+        content_types_upper = []
+        
+        for ct in content_types_list:
+            ct_upper = ct.upper()
+            if ct_upper not in valid_content_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid content_type: {ct}. Valid types: Webinar, Blog, Podcast, Video"
+                )
+            content_types_upper.append(ct_upper)
+        
+        # Build base query
+        query = db.query(Bookmark).options(
+            joinedload(Bookmark.feed).joinedload(Feed.slides),
+            joinedload(Bookmark.feed).joinedload(Feed.blog),
+            joinedload(Bookmark.feed).joinedload(Feed.published_feed)
+        ).filter(Bookmark.user_id == user_id)
+        
+        # Filter by tags if provided
+        if tag_list:
+            query = query.filter(Bookmark.tags.op('&&')(tag_list))
+        
+        # Get all matching bookmarks for filtering
+        all_bookmarks = query.order_by(Bookmark.created_at.desc()).all()
+        
+        # Apply filters and collect data for statistics
+        matching_items = []
+        sources_map = {}
+        
+        for bookmark in all_bookmarks:
+            feed = bookmark.feed
+            if not feed:
+                continue
+            
+            # Apply content type filter
+            if content_types_upper:
+                feed_content_type = getattr(feed, 'content_type', None)
+                if not feed_content_type:
+                    continue
+                
+                feed_content_type_str = None
+                if hasattr(feed_content_type, 'value'):
+                    feed_content_type_str = feed_content_type.value
+                elif isinstance(feed_content_type, str):
+                    feed_content_type_str = feed_content_type
+                else:
+                    feed_content_type_str = str(feed_content_type)
+                
+                if not feed_content_type_str:
+                    continue
+                
+                feed_content_type_normalized = feed_content_type_str.upper()
+                if feed_content_type_normalized not in content_types_upper:
+                    continue
+            
+            # Apply skills filter
+            if skills_list:
+                feed_skills = feed.skills or []
+                if not isinstance(feed_skills, list):
+                    try:
+                        if isinstance(feed_skills, str):
+                            feed_skills = json.loads(feed_skills)
+                        else:
+                            feed_skills = []
+                    except:
+                        feed_skills = []
+                
+                feed_skills_lower = [s.lower() for s in feed_skills if isinstance(s, str)]
+                requested_skills_lower = [s.lower() for s in skills_list if isinstance(s, str)]
+                
+                if not any(skill in feed_skills_lower for skill in requested_skills_lower):
+                    continue
+            
+            # Apply tools filter
+            if tools_list:
+                feed_tools = feed.tools or []
+                if not isinstance(feed_tools, list):
+                    try:
+                        if isinstance(feed_tools, str):
+                            feed_tools = json.loads(feed_tools)
+                        else:
+                            feed_tools = []
+                    except:
+                        feed_tools = []
+                
+                feed_tools_lower = [t.lower() for t in feed_tools if isinstance(t, str)]
+                requested_tools_lower = [t.lower() for t in tools_list if isinstance(t, str)]
+                
+                if not any(tool in feed_tools_lower for tool in requested_tools_lower):
+                    continue
+            
+            # Apply roles filter
+            if roles_list:
+                feed_roles = feed.roles or []
+                if not isinstance(feed_roles, list):
+                    try:
+                        if isinstance(feed_roles, str):
+                            feed_roles = json.loads(feed_roles)
+                        else:
+                            feed_roles = []
+                    except:
+                        feed_roles = []
+                
+                feed_roles_lower = [r.lower() for r in feed_roles if isinstance(r, str)]
+                requested_roles_lower = [r.lower() for r in roles_list if isinstance(r, str)]
+                
+                if not any(role in feed_roles_lower for role in requested_roles_lower):
+                    continue
+            
+            # Format feed response with EXACT same fields as publish feeds by-category API
+            feed_data = format_feed_like_published_response(db, feed, bookmark)
+            if not feed_data:
+                continue
+            
+            # Get source info if requested
+            source_info = None
+            if include_source_info:
+                source_info = _get_source_for_bookmark_feed(db, feed)
+                feed_data["source"] = source_info
+                
+                if source_info and source_info.get("id"):
+                    source_id = source_info["id"]
+                    if source_id not in sources_map:
+                        sources_map[source_id] = {
+                            "source": source_info,
+                            "feed_count": 0
+                        }
+                    sources_map[source_id]["feed_count"] += 1
+            
+            matching_items.append(feed_data)
+        
+        # Apply pagination
+        total = len(matching_items)
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        paginated_items = matching_items[start_idx:end_idx]
+        
+        # Prepare sources summary
+        sources_summary = [
+            {
+                "source": source_data["source"],
+                "published_feeds_count": source_data["feed_count"],
+                "percentage_of_total": round((source_data["feed_count"] / total) * 100, 2) if total > 0 else 0
+            }
+            for source_data in sources_map.values()
+        ]
+        
+        # Sort sources by feed count (most popular first)
+        sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
+        
+        # Get content type breakdown
+        content_type_breakdown = {}
+        for feed_data in matching_items:
+            content_type_value = feed_data.get("content_type", "Unknown")
+            if content_type_value not in content_type_breakdown:
+                content_type_breakdown[content_type_value] = 0
+            content_type_breakdown[content_type_value] += 1
+        
+        # Get skills breakdown (now at top level, not in ai_generated_content)
+        skills_breakdown = {}
+        for feed_data in matching_items:
+            feed_skills = feed_data.get("skills", []) or []
+            for skill in feed_skills:
+                if skill not in skills_breakdown:
+                    skills_breakdown[skill] = 0
+                skills_breakdown[skill] += 1
+        
+        # Get tools breakdown (now at top level, not in ai_generated_content)
+        tools_breakdown = {}
+        for feed_data in matching_items:
+            feed_tools = feed_data.get("tools", []) or []
+            for tool in feed_tools:
+                if tool not in tools_breakdown:
+                    tools_breakdown[tool] = 0
+                tools_breakdown[tool] += 1
+        
+        # Get roles breakdown (now at top level, not in ai_generated_content)
+        roles_breakdown = {}
+        for feed_data in matching_items:
+            feed_roles = feed_data.get("roles", []) or []
+            for role in feed_roles:
+                if role not in roles_breakdown:
+                    roles_breakdown[role] = 0
+                roles_breakdown[role] += 1
+        
+        # Prepare applied filters
+        applied_filters = {}
+        if content_types_list:
+            applied_filters["content_types"] = content_types_list
+        if skills_list:
+            applied_filters["skills"] = skills_list
+        if tools_list:
+            applied_filters["tools"] = tools_list
+        if roles_list:
+            applied_filters["roles"] = roles_list
+        if tag_list:
+            applied_filters["tags"] = tag_list
+        
+        response_data = {
+            "items": paginated_items,
+            "filters": {
+                "applied": applied_filters,
+                "available_counts": {
+                    "content_types": content_type_breakdown,
+                    "top_skills": dict(sorted(skills_breakdown.items(), key=lambda x: x[1], reverse=True)[:10]),
+                    "top_tools": dict(sorted(tools_breakdown.items(), key=lambda x: x[1], reverse=True)[:10]),
+                    "top_roles": dict(sorted(roles_breakdown.items(), key=lambda x: x[1], reverse=True)[:10])
+                }
+            },
+            "statistics": {
+                "total_feeds": total,
+                "unique_sources": len(sources_map),
+                "content_type_breakdown": content_type_breakdown,
+                "sources_summary": sources_summary
+            },
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": end_idx < total
+        }
+        
+        logger.info(f"Retrieved {len(paginated_items)} bookmarks for user {user_id} with complete feed data")
+        
+        return response_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting bookmarks for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get bookmarks"
+        )
+
+
+def _get_source_for_bookmark_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
+    """Get source information for a feed in bookmark context."""
+    try:
+        if feed.source_type == "blog" and feed.blog:
+            # Find source by website
+            source = db.query(Source).filter(
+                Source.website == feed.blog.website,
+                Source.source_type == "blog"
+            ).first()
+            
+            if source:
+                # Count published feeds for this source
+                published_feed_count = db.query(PublishedFeed).join(Feed).join(Blog).filter(
+                    PublishedFeed.is_active == True,
+                    Blog.website == source.website
+                ).count()
+                
+                return {
+                    "id": source.id,
+                    "name": source.name,
+                    "website": source.website,
+                    "source_type": source.source_type,
+                    "published_feed_count": published_feed_count,
+                    "follower_count": source.follower_count,
+                    "is_active": source.is_active
+                }
+        
+        elif feed.source_type == "youtube":
+            # For YouTube, we might have multiple sources or a generic one
+            source = db.query(Source).filter(
+                Source.source_type == "youtube"
+            ).first()
+            
+            if source:
+                # Count published YouTube feeds
+                published_feed_count = db.query(PublishedFeed).join(Feed).filter(
+                    PublishedFeed.is_active == True,
+                    Feed.source_type == "youtube"
+                ).count()
+                
+                return {
+                    "id": source.id,
+                    "name": source.name,
+                    "website": source.website,
+                    "source_type": source.source_type,
+                    "published_feed_count": published_feed_count,
+                    "follower_count": source.follower_count,
+                    "is_active": source.is_active
+                }
+        
+        # Fallback: create a basic source info from feed data
+        if feed.source_type == "blog" and feed.blog:
+            website_name = feed.blog.website.replace("https://", "").replace("http://", "").split("/")[0]
+            return {
+                "id": None,
+                "name": website_name,
+                "website": feed.blog.website,
+                "source_type": "blog",
+                "published_feed_count": 1,
+                "follower_count": 0,
+                "is_active": True
+            }
+        else:
+            return {
+                "id": None,
+                "name": "YouTube",
+                "website": "https://www.youtube.com",
+                "source_type": "youtube",
+                "published_feed_count": 1,
+                "follower_count": 0,
+                "is_active": True
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting source for feed {feed.id}: {e}")
+        return None
+
+
 
 @bookmark_router.put("/{bookmark_id}", response_model=BookmarkResponse)
 def update_bookmark(
