@@ -532,7 +532,7 @@ def get_source_metadata(source: Source, db: Session) -> Dict[str, Any]:
 
 @router.get("/content", response_model=Dict[str, Any])
 def search_content(
-    query: str = Query(..., min_length=2, description="Search query"),
+    query: Optional[str] = Query(None, description="Search query"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     content_type: Optional[str] = Query(None, description="Filter by content type"),
@@ -540,7 +540,7 @@ def search_content(
     domain: Optional[str] = Query(None, description="Filter by domain"),
     topic: Optional[str] = Query(None, description="Filter by topic"),
     concept: Optional[str] = Query(None, description="Filter by concept"),
-    user_id: Optional[int] = Query(None, description="User ID for personalization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -548,18 +548,49 @@ def search_content(
     
     This is for Tab 1: Content (Summary/Highlights)
     """
-    # Base query
+    user_id = current_user.id
+    
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "content",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+    
+    # Step 2: Query feeds from user's selected categories
     query_obj = db.query(Feed).options(
         joinedload(Feed.blog),
         joinedload(Feed.slides),
         joinedload(Feed.category),
         joinedload(Feed.subcategory),
         joinedload(Feed.concepts)
-    ).filter(Feed.status == "ready")
+    ).filter(
+        Feed.category_id.in_(user_category_ids),
+        Feed.status == "ready"
+    )
     
-    # Text search
-    if query:
-        search_term = f"%{query.lower()}%"
+    # Step 3: Apply search filters
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
         query_obj = query_obj.filter(
             or_(
                 Feed.title.ilike(search_term),
@@ -568,7 +599,7 @@ def search_content(
             )
         )
     
-    # Filters
+    # Apply other filters
     if content_type:
         query_obj = query_obj.filter(Feed.content_type == content_type)
     
@@ -612,12 +643,12 @@ def search_content(
                 feed_id_list = [fid[0] for fid in feed_ids]
                 query_obj = query_obj.filter(Feed.id.in_(feed_id_list))
     
-    # Count and paginate
+    # Step 4: Sort and Paginate (using DB pagination for Feed performance)
     total = query_obj.count()
     query_obj = query_obj.order_by(Feed.created_at.desc())
     feeds = query_obj.offset((page - 1) * limit).limit(limit).all()
     
-    # Format results
+    # Step 5: Format results
     items = []
     for feed in feeds:
         items.append(format_feed_for_search(feed, db, user_id))
@@ -630,6 +661,7 @@ def search_content(
         "limit": limit,
         "total": total,
         "has_more": (page * limit) < total,
+        "user_selected_categories": user_category_ids,
         "filters": {
             "content_type": content_type,
             "source_type": source_type,
@@ -638,6 +670,7 @@ def search_content(
             "concept": concept
         }
     }
+
 
 # ------------------ Tab 2: Lists Search ------------------
 
@@ -648,27 +681,52 @@ def search_lists(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     source_type: Optional[str] = Query(None, description="Filter by source type: youtube, blog, or manual"),
-    user_id: Optional[int] = Query(None, description="User ID"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Search content lists (playlists or curated collections).
     
     This is for Tab 2: Lists
-    Auto-generated from YouTube playlists or created manually
     """
-    # Try to auto-create lists from existing YouTube playlists if no lists exist
-    all_lists = db.query(ContentList).count()
-    if all_lists == 0:
-        # Auto-create lists from YouTube playlists in transcripts
-        logger.info("No lists found, auto-creating from YouTube playlists...")
-        auto_create_lists_from_youtube(db)  # This will now work with the import
+    user_id = current_user.id
     
-    # Base query
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "lists",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+
+    # Try to auto-create lists from existing YouTube playlists if no lists exist
+    all_lists_count = db.query(ContentList).count()
+    if all_lists_count == 0:
+        auto_create_lists_from_youtube(db)
+    
+    # Step 2 & 3: Query lists matching search criteria
     query_obj = db.query(ContentList).filter(ContentList.is_active == True)
     
-    if query:
-        search_term = f"%{query.lower()}%"
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
         query_obj = query_obj.filter(
             or_(
                 ContentList.name.ilike(search_term),
@@ -680,117 +738,107 @@ def search_lists(
     if source_type:
         query_obj = query_obj.filter(ContentList.source_type == source_type)
     
-    # Count and paginate
-    total = query_obj.count()
-    query_obj = query_obj.order_by(ContentList.created_at.desc())
-    content_lists = query_obj.offset((page - 1) * limit).limit(limit).all()
+    # Step 4: Get all matching lists
+    content_lists = query_obj.all()
     
-    # Format results
-    items = []
+    # Step 5: Calculate feed counts within user's categories and build response items
+    items_list = []
     for content_list in content_lists:
-        # Get feed details
-        feed_details = []
-        all_feeds = []
-        
-        if content_list.feed_ids and len(content_list.feed_ids) > 0:
-            # Get feeds with their relationships
-            feeds = db.query(Feed).options(
-                joinedload(Feed.blog),
-                joinedload(Feed.slides),
-                joinedload(Feed.category),
-                joinedload(Feed.subcategory)
-            ).filter(
-                Feed.id.in_(content_list.feed_ids),
-                Feed.status == "ready"
-            ).all()
+        # Calculate feed count for this list FILTERED by user's selected categories
+        feed_ids = content_list.feed_ids or []
+        if not feed_ids:
+            continue
             
-            all_feeds = feeds
-            
-            # Format sample feeds (first 3)
-            for feed in feeds[:3]:
-                meta = get_feed_metadata(feed, db)
-                
-                # Extract summary
-                summary = ""
-                if feed.ai_generated_content and "summary" in feed.ai_generated_content:
-                    summary = feed.ai_generated_content["summary"]
-                    if len(summary) > 100:
-                        summary = summary[:97] + "..."
-                elif feed.slides and len(feed.slides) > 0:
-                    summary = feed.slides[0].body
-                    if len(summary) > 100:
-                        summary = summary[:97] + "..."
-                
-                # Get source info
-                source_info = {}
-                if feed.source_type == "youtube":
-                    source_info = {
-                        "type": "youtube",
-                        "name": meta.get("channel_name", "YouTube"),
-                        "url": meta.get("source_url", "#")
-                    }
-                elif feed.source_type == "blog" and feed.blog:
-                    source_info = {
-                        "type": "blog",
-                        "name": feed.blog.website,
-                        "url": feed.blog.website
-                    }
-                
-                feed_details.append({
-                    "id": feed.id,
-                    "title": feed.title,
-                    "summary": summary,
-                    "content_type": feed.content_type.value if feed.content_type else "Video",
-                    "source_type": feed.source_type,
-                    "source_info": source_info,
-                    "meta": meta
-                })
+        feed_count = db.query(func.count(Feed.id)).filter(
+            Feed.id.in_(feed_ids),
+            Feed.category_id.in_(user_category_ids),
+            Feed.status == "ready"
+        ).scalar() or 0
         
-        # Extract topics from all feeds
+        # Skip lists that have no feeds matching the user's categories
+        if feed_count == 0:
+            continue
+            
+        # Get sample feeds matching user categories (first 3)
+        sample_feeds_obj = db.query(Feed).filter(
+            Feed.id.in_(feed_ids),
+            Feed.category_id.in_(user_category_ids),
+            Feed.status == "ready"
+        ).limit(3).all()
+        
+        sample_feeds = []
         all_topics = set()
-        for feed in all_feeds:
+        for feed in sample_feeds_obj:
+            meta = get_feed_metadata(feed, db)
+            
+            # Extract topics for the list
             if feed.categories:
-                for category in feed.categories:
-                    all_topics.add(category)
-        
-        # Get list type based on source
-        list_type = "playlist" if content_list.source_type == "youtube" else "collection"
-        if content_list.source_type == "blog":
-            list_type = "blog_collection"
-        
-        # Get thumbnail from first feed
+                for cat in feed.categories:
+                    all_topics.add(cat)
+            
+            # Format sample feed
+            summary = ""
+            if feed.ai_generated_content and "summary" in feed.ai_generated_content:
+                summary = feed.ai_generated_content["summary"]
+                if len(summary) > 100: summary = summary[:97] + "..."
+            
+            source_info = {}
+            if feed.source_type == "youtube":
+                source_info = {"type": "youtube", "name": meta.get("channel_name", "YouTube"), "url": meta.get("source_url", "#")}
+            elif feed.source_type == "blog" and feed.blog:
+                source_info = {"type": "blog", "name": feed.blog.website, "url": feed.blog.website}
+            
+            sample_feeds.append({
+                "id": feed.id,
+                "title": feed.title,
+                "summary": summary,
+                "content_type": feed.content_type.value if feed.content_type else "Video",
+                "source_type": feed.source_type,
+                "source_info": source_info,
+                "meta": meta
+            })
+            
+        # Get thumbnail from first sample feed
         thumbnail_url = None
-        if all_feeds:
-            meta = get_feed_metadata(all_feeds[0], db)
+        if sample_feeds_obj:
+            meta = get_feed_metadata(sample_feeds_obj[0], db)
             thumbnail_url = meta.get("thumbnail_url")
-        
-        items.append({
+            
+        items_list.append({
             "id": content_list.id,
             "name": content_list.name,
             "description": content_list.description,
             "source_type": content_list.source_type,
             "source_id": content_list.source_id,
-            "list_type": list_type,
-            "feed_count": len(content_list.feed_ids) if content_list.feed_ids else 0,
-            "sample_feeds": feed_details,
+            "list_type": "playlist" if content_list.source_type == "youtube" else "collection",
+            "feed_count": feed_count,
+            "sample_feeds": sample_feeds,
             "topics": list(all_topics)[:10],
             "thumbnail_url": thumbnail_url,
             "created_at": content_list.created_at.isoformat() if content_list.created_at else None,
             "updated_at": content_list.updated_at.isoformat() if content_list.updated_at else None
         })
+        
+    # Step 6: Sort by feed_count (descending)
+    items_list.sort(key=lambda x: x["feed_count"], reverse=True)
+    
+    # Step 7: Paginate results
+    total = len(items_list)
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_items = items_list[start_idx:end_idx]
     
     return {
         "tab": "lists",
         "query": query,
-        "items": items,
+        "items": paginated_items,
         "page": page,
         "limit": limit,
         "total": total,
         "has_more": (page * limit) < total,
-        "filters": {
-            "source_type": source_type
-        }
+        "user_selected_categories": user_category_ids
     }
+
 
 
 # ------------------ Tab 3: Topics Search ------------------
@@ -801,150 +849,132 @@ def search_topics(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     domain: Optional[str] = Query(None, description="Filter by domain"),
-    current_user: User = Depends(get_current_user),  # Changed from user_id
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Search topics extracted from content via LLM.
     
     This is for Tab 3: Topics
-    Topics can be followed via topic_id
     """
-    # Extract user_id from current_user
-    user_id = current_user.id if current_user else None
+    user_id = current_user.id
     
-    # Get all unique topics from feed categories
-    all_feeds = db.query(Feed).filter(
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404, detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "topics",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+    
+    # Step 2 & 3: Get feeds matching user categories and search query
+    query_obj = db.query(Feed).filter(
+        Feed.category_id.in_(user_category_ids),
         Feed.status == "ready",
         Feed.categories.isnot(None)
-    ).all()
+    )
     
-    # Extract unique topics with counts
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
+        query_obj = query_obj.filter(cast(Feed.categories, String).ilike(search_term))
+        
+    # Step 4: Get all relevant feeds to extract topics
+    all_feeds = query_obj.all()
+    
+    # Step 5: Extract unique topics and calculate counts
     topics_dict = {}
+    
+    # Get followed topics for status
+    followed_topics = db.query(UserTopicFollow).filter(UserTopicFollow.user_id == user_id).all()
+    followed_topic_ids = [ft.topic_id for ft in followed_topics]
+    
     for feed in all_feeds:
         if feed.categories:
             for category_name in feed.categories:
                 if category_name not in topics_dict:
-                    # Count feeds for this topic
-                    feed_count = db.query(Feed).filter(
+                    # Filter by search query if present
+                    if query and query.strip() and query.strip().lower() not in category_name.lower():
+                        continue
+                        
+                    # Count feeds for this topic within user categories
+                    feed_count = db.query(func.count(Feed.id)).filter(
                         Feed.categories.contains([category_name]),
+                        Feed.category_id.in_(user_category_ids),
                         Feed.status == "ready"
-                    ).count()
+                    ).scalar() or 0
                     
-                    # Get or create Topic in database
-                    topic = db.query(Topic).filter(
-                        Topic.name == category_name
-                    ).first()
+                    if feed_count == 0:
+                        continue
+                        
+                    # Get topic metadata
+                    topic = db.query(Topic).filter(Topic.name == category_name).first()
+                    topic_id = topic.id if topic else None
+                    follower_count = topic.follower_count if topic else 0
+                    description = topic.description if topic else f"Content related to {category_name}"
                     
-                    # If topic doesn't exist in Topic table, create it
-                    if not topic:
-                        topic = Topic(
-                            name=category_name,
-                            description=f"Content related to {category_name}",
-                            follower_count=0,
-                            is_active=True,
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow()
-                        )
-                        db.add(topic)
-                        db.commit()
-                        db.refresh(topic)
-                    
-                    # Get follower count from Topic table
-                    follower_count = topic.follower_count
-                    
-                    # Check if current user is following this topic
-                    is_following = False
-                    if user_id and topic:
-                        user_follow = db.query(UserTopicFollow).filter(
-                            UserTopicFollow.user_id == user_id,
-                            UserTopicFollow.topic_id == topic.id
-                        ).first()
-                        is_following = user_follow is not None
-                    
-                    # Get unique sources for this topic
-                    topic_feeds = db.query(Feed).filter(
+                    # Get unique sources for this topic within user categories
+                    topic_feeds_sample = db.query(Feed).filter(
                         Feed.categories.contains([category_name]),
+                        Feed.category_id.in_(user_category_ids),
                         Feed.status == "ready"
-                    ).all()
+                    ).limit(10).all()
                     
                     unique_sources = set()
-                    for topic_feed in topic_feeds:
-                        if topic_feed.source_type == "youtube":
-                            meta = get_feed_metadata(topic_feed, db)
-                            channel_name = meta.get("channel_name")
-                            if channel_name:
-                                unique_sources.add(channel_name)
-                        elif topic_feed.source_type == "blog" and topic_feed.blog:
-                            unique_sources.add(topic_feed.blog.website)
+                    for t_feed in topic_feeds_sample:
+                        if t_feed.source_type == "youtube":
+                            meta = get_feed_metadata(t_feed, db)
+                            if meta.get("channel_name"): unique_sources.add(meta["channel_name"])
+                        elif t_feed.source_type == "blog" and t_feed.blog:
+                            unique_sources.add(t_feed.blog.website)
                     
                     topics_dict[category_name] = {
-                        "id": topic.id,
+                        "id": topic_id,
                         "name": category_name,
-                        "description": topic.description,
+                        "description": description,
                         "feed_count": feed_count,
                         "follower_count": follower_count,
-                        "source_count": len(unique_sources),
-                        "is_following": is_following,
-                        "popularity": feed_count + (follower_count * 2),
+                        "is_following": topic_id in followed_topic_ids if topic_id else False,
                         "sources": list(unique_sources)[:5]
                     }
     
-    # Convert to list and filter
-    topics_list = list(topics_dict.values())
+    # Step 6: Sort by feed_count (descending)
+    topic_list = list(topics_dict.values())
+    topic_list.sort(key=lambda x: x["feed_count"], reverse=True)
     
-    if query:
-        search_term = query.lower()
-        topics_list = [t for t in topics_list if search_term in t["name"].lower()]
-    
-    if domain and domain.strip():
-        # Filter by domain via concepts
-        domain_concepts = db.query(DomainConcept).join(Concept).join(Domain).filter(
-            Domain.name.ilike(f"%{domain}%")
-        ).all()
-        
-        if domain_concepts:
-            concept_ids = [dc.concept_id for dc in domain_concepts]
-            # Get feeds with these concepts
-            feed_ids = db.query(FeedConcept.feed_id).filter(
-                FeedConcept.concept_id.in_(concept_ids)
-            ).distinct().all()
-            
-            if feed_ids:
-                feed_id_list = [fid[0] for fid in feed_ids]
-                # Filter topics that appear in these feeds
-                filtered_topics = []
-                for topic in topics_list:
-                    # Check if any feed with this topic is in our filtered list
-                    feeds_with_topic = db.query(Feed).filter(
-                        Feed.categories.contains([topic["name"]]),
-                        Feed.id.in_(feed_id_list)
-                    ).count()
-                    
-                    if feeds_with_topic > 0:
-                        filtered_topics.append(topic)
-                
-                topics_list = filtered_topics
-    
-    # Sort and paginate
-    topics_list.sort(key=lambda x: x["popularity"], reverse=True)
-    total = len(topics_list)
+    # Step 7: Paginate results
+    total = len(topic_list)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
-    paginated_topics = topics_list[start_idx:end_idx]
+    paginated_items = topic_list[start_idx:end_idx]
     
     return {
         "tab": "topics",
         "query": query,
-        "items": paginated_topics,
+        "items": paginated_items,
         "page": page,
         "limit": limit,
         "total": total,
         "has_more": (page * limit) < total,
-        "filters": {
-            "domain": domain
-        }
+        "user_selected_categories": user_category_ids
     }
+
 
 # ------------------ Tab 4: Sources Search ------------------
 
@@ -956,22 +986,47 @@ def search_sources(
     source_type: Optional[str] = Query(None, description="Filter by source type"),
     domain: Optional[str] = Query(None, description="Filter by domain"),
     topic: Optional[str] = Query(None, description="Filter by topic"),
-    current_user: User = Depends(get_current_user),  # Changed from user_id
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Search sources (websites, YouTube channels, authors).
     
     This is for Tab 4: Sources
-    Sources can be followed
     """
-    # Extract user_id from current_user
-    user_id = current_user.id if current_user else None
+    user_id = current_user.id
     
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "sources",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+
+    # Step 2 & 3: Query sources matching search criteria
     query_obj = db.query(Source).filter(Source.is_active == True)
     
-    if query:
-        search_term = f"%{query.lower()}%"
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
         query_obj = query_obj.filter(
             or_(
                 Source.name.ilike(search_term),
@@ -981,63 +1036,55 @@ def search_sources(
     
     if source_type:
         query_obj = query_obj.filter(Source.source_type == source_type)
+        
+    # Step 4: Get all matching sources
+    sources = query_obj.all()
     
-    # Count and paginate
-    total = query_obj.count()
-    query_obj = query_obj.order_by(Source.created_at.desc())
-    sources = query_obj.offset((page - 1) * limit).limit(limit).all()
+    # Step 5: Calculate feed counts within user's categories and build response items
+    items_list = []
     
-    # Check follow status for all sources
-    followed_source_ids = []
-    if user_id:
-        followed_sources = db.query(UserSourceFollow).filter(
-            UserSourceFollow.user_id == user_id
-        ).all()
-        followed_source_ids = [fs.source_id for fs in followed_sources]
+    # Get all followed sources for status
+    followed_sources = db.query(UserSourceFollow).filter(UserSourceFollow.user_id == user_id).all()
+    followed_source_ids = [fs.source_id for fs in followed_sources]
     
-    # Format results
-    items = []
     for source in sources:
-        # Get feed count
+        # Calculate feed count for this source FILTERED by user's selected categories
         if source.source_type == "blog":
-            feed_count = db.query(Feed).join(Blog).filter(
-                Blog.website == source.website
-            ).count()
+            matching_feeds_query = db.query(Feed).join(Blog).filter(
+                Blog.website == source.website,
+                Feed.category_id.in_(user_category_ids),
+                Feed.status == "ready"
+            )
         else:
-            feed_count = db.query(Feed).filter(
-                Feed.source_type == "youtube"
-            ).count()
+            matching_feeds_query = db.query(Feed).filter(
+                Feed.source_type == "youtube",
+                Feed.category_id.in_(user_category_ids),
+                Feed.status == "ready"
+            )
+            
+        feed_count = matching_feeds_query.count()
         
-        # Get top topics for this source
-        if source.source_type == "blog":
-            source_feeds = db.query(Feed).join(Blog).filter(
-                Blog.website == source.website
-            ).all()
-        else:
-            source_feeds = db.query(Feed).filter(
-                Feed.source_type == "youtube"
-            ).all()
-        
+        # Skip sources that have no feeds matching the user's categories
+        if feed_count == 0:
+            continue
+            
+        # Get top topics for this source within user categories
+        source_feeds = matching_feeds_query.all()
         topic_counts = {}
         for feed in source_feeds:
             if feed.categories:
-                for category in feed.categories:
-                    topic_counts[category] = topic_counts.get(category, 0) + 1
+                for cat in feed.categories:
+                    topic_counts[cat] = topic_counts.get(cat, 0) + 1
         
         top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         
         # Get source metadata
         metadata = get_source_metadata(source, db)
-        
-        # Use metadata description if source description is empty
         source_description = getattr(source, 'description', '')
         if not source_description and metadata.get("description"):
             source_description = metadata["description"]
-        
-        # Check if user is following this specific source
-        is_following = source.id in followed_source_ids
-        
-        items.append({
+            
+        items_list.append({
             "id": source.id,
             "name": source.name,
             "website": source.website,
@@ -1046,59 +1093,24 @@ def search_sources(
             "feed_count": feed_count,
             "follower_count": source.follower_count,
             "top_topics": [topic for topic, count in top_topics],
-            "is_following": is_following,
+            "is_following": source.id in followed_source_ids,
             "created_at": source.created_at.isoformat() if source.created_at else None,
             "updated_at": source.updated_at.isoformat() if source.updated_at else None,
             "metadata": metadata
         })
-    
-    # Apply additional filters
-    filtered_items = items
-    
-    if domain and domain.strip():
-        # Filter by domain
-        filtered_items = []
-        for item in items:
-            # Check if source has content in this domain
-            source_feeds = db.query(Feed).filter(Feed.source_type == item["source_type"])
-            
-            if item["source_type"] == "blog":
-                source_feeds = source_feeds.join(Blog).filter(Blog.website == item["website"])
-            
-            feed_ids = [f.id for f in source_feeds.all()]
-            
-            # Check if any feed has concepts in this domain
-            domain_obj = db.query(Domain).filter(
-                Domain.name.ilike(f"%{domain}%")
-            ).first()
-            
-            if domain_obj:
-                domain_concepts = db.query(DomainConcept).filter(
-                    DomainConcept.domain_id == domain_obj.id
-                ).all()
-                concept_ids = [dc.concept_id for dc in domain_concepts]
-                
-                # Check if any feed has these concepts
-                has_domain = db.query(FeedConcept).filter(
-                    FeedConcept.feed_id.in_(feed_ids),
-                    FeedConcept.concept_id.in_(concept_ids)
-                ).first() is not None
-                
-                if has_domain:
-                    filtered_items.append(item)
-    
+        
+    # Apply topic filter if present
     if topic and topic.strip():
-        # Filter by topic
-        filtered_items = [item for item in filtered_items if topic in item["top_topics"]]
+        items_list = [item for item in items_list if topic.strip() in item["top_topics"]]
+        
+    # Step 6: Sort by feed_count (descending)
+    items_list.sort(key=lambda x: x["feed_count"], reverse=True)
     
-    # Sort by feed count (most feeds first)
-    filtered_items.sort(key=lambda x: x["feed_count"], reverse=True)
-    total = len(filtered_items)
-    
-    # Return only paginated items
+    # Step 7: Paginate results
+    total = len(items_list)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
-    paginated_items = filtered_items[start_idx:end_idx]
+    paginated_items = items_list[start_idx:end_idx]
     
     return {
         "tab": "sources",
@@ -1108,12 +1120,9 @@ def search_sources(
         "limit": limit,
         "total": total,
         "has_more": (page * limit) < total,
-        "filters": {
-            "source_type": source_type,
-            "domain": domain,
-            "topic": topic
-        }
+        "user_selected_categories": user_category_ids
     }
+
 
 # ------------------ Tab 5: Concepts Search ------------------
 
@@ -1124,7 +1133,7 @@ def search_concepts(
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     domain: Optional[str] = Query(None, description="Filter by domain"),
     topic: Optional[str] = Query(None, description="Filter by topic"),
-    user_id: Optional[int] = Query(None, description="User ID"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -1132,75 +1141,105 @@ def search_concepts(
     
     This is for Tab 5: Concepts
     """
+    user_id = current_user.id
+    
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "tab": "concepts",
+            "query": query,
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "has_more": False,
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+
+    # Step 2 & 3: Query concepts matching search criteria
     query_obj = db.query(Concept).filter(Concept.is_active == True)
     
-    if query:
-        search_term = f"%{query.lower()}%"
+    if query and query.strip():
+        search_term = f"%{query.strip().lower()}%"
         query_obj = query_obj.filter(Concept.name.ilike(search_term))
     
     if domain and domain.strip():
-        # Filter by domain
-        domain_obj = db.query(Domain).filter(
-            Domain.name.ilike(f"%{domain}%")
-        ).first()
-        
+        # Filter concepts by domain
+        domain_obj = db.query(Domain).filter(Domain.name.ilike(f"%{domain}%")).first()
         if domain_obj:
-            domain_concepts = db.query(DomainConcept).filter(
-                DomainConcept.domain_id == domain_obj.id
-            ).all()
-            concept_ids = [dc.concept_id for dc in domain_concepts]
-            query_obj = query_obj.filter(Concept.id.in_(concept_ids))
+            concept_ids = db.query(DomainConcept.concept_id).filter(DomainConcept.domain_id == domain_obj.id).all()
+            concept_id_list = [c[0] for c in concept_ids]
+            query_obj = query_obj.filter(Concept.id.in_(concept_id_list))
+            
+    # Step 4: Get all matching concepts
+    concepts = query_obj.all()
     
-    # Get all concepts
-    all_concepts = query_obj.all()
-    
-    # Apply topic filter
-    filtered_concepts = []
-    for concept in all_concepts:
-        # Check if this concept appears in feeds with the specified topic
+    # Step 5: Calculate feed counts within user's categories and build response items
+    items_list = []
+    for concept in concepts:
+        # Calculate feed count for this concept FILTERED by user's selected categories
+        feed_count = db.query(func.count(Feed.id)).join(FeedConcept).filter(
+            FeedConcept.concept_id == concept.id,
+            Feed.category_id.in_(user_category_ids),
+            Feed.status == "ready"
+        ).scalar() or 0
+        
+        # Skip concepts that have no feeds matching the user's categories
+        if feed_count == 0:
+            continue
+            
+        # Topic filter check (if topic provided)
         if topic and topic.strip():
-            concept_feeds = concept.feeds
-            has_topic = False
-            
-            for feed in concept_feeds:
-                if feed.categories and topic in feed.categories:
-                    has_topic = True
-                    break
-            
-            if not has_topic:
+            topic_feed_count = db.query(func.count(Feed.id)).join(FeedConcept).filter(
+                FeedConcept.concept_id == concept.id,
+                Feed.category_id.in_(user_category_ids),
+                Feed.status == "ready",
+                Feed.categories.contains([topic.strip()])
+            ).scalar() or 0
+            if topic_feed_count == 0:
                 continue
-        
-        # Calculate feed count
-        feed_count = len(concept.feeds)
-        
+                
         # Get domains
-        domains = [{"id": d.id, "name": d.name} for d in concept.domains]
+        concept_domains = [{"id": d.id, "name": d.name} for d in concept.domains]
         
         # Get related concepts
         related_concepts = []
         if concept.related_concepts:
-            related_objs = db.query(Concept).filter(
-                Concept.name.in_(concept.related_concepts[:5])
-            ).all()
+            related_objs = db.query(Concept).filter(Concept.name.in_(concept.related_concepts[:5])).all()
             related_concepts = [c.name for c in related_objs]
-        
-        filtered_concepts.append({
+            
+        items_list.append({
             "id": concept.id,
             "name": concept.name,
             "description": concept.description,
             "feed_count": feed_count,
             "popularity_score": concept.popularity_score,
             "related_concepts": related_concepts,
-            "domains": domains,
+            "domains": concept_domains,
             "created_at": concept.created_at.isoformat() if concept.created_at else None
         })
+        
+    # Step 6: Sort by feed_count (descending)
+    items_list.sort(key=lambda x: x["feed_count"], reverse=True)
     
-    # Sort and paginate
-    filtered_concepts.sort(key=lambda x: x["feed_count"], reverse=True)
-    total = len(filtered_concepts)
+    # Step 7: Paginate results
+    total = len(items_list)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
-    paginated_items = filtered_concepts[start_idx:end_idx]
+    paginated_items = items_list[start_idx:end_idx]
     
     return {
         "tab": "concepts",
@@ -1210,11 +1249,9 @@ def search_concepts(
         "limit": limit,
         "total": total,
         "has_more": (page * limit) < total,
-        "filters": {
-            "domain": domain,
-            "topic": topic
-        }
+        "user_selected_categories": user_category_ids
     }
+
 
 # ------------------ Unified Search Endpoint ------------------
 
@@ -1224,7 +1261,7 @@ def unified_search(
     tabs: str = Query("all", description="Tabs to search: all or comma-separated list"),
     page: int = Query(1, ge=1, description="Page number"),
     limit_per_tab: int = Query(5, ge=1, le=20, description="Results per tab"),
-    user_id: Optional[int] = Query(None, description="User ID for personalization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -1232,6 +1269,30 @@ def unified_search(
     
     Returns results from multiple tabs in one response.
     """
+    user_id = current_user.id
+    
+    # Step 1: Get user's onboarding data to find selected categories
+    user_onboarding = db.query(UserOnboarding).filter(
+        UserOnboarding.user_id == user_id
+    ).first()
+    
+    if not user_onboarding:
+        raise HTTPException(
+            status_code=404,
+            detail="User onboarding data not found. Please complete onboarding first."
+        )
+    
+    # Get user's domains of interest (category IDs)
+    user_category_ids = user_onboarding.domains_of_interest
+    
+    if not user_category_ids or len(user_category_ids) == 0:
+        return {
+            "query": query,
+            "tabs": tabs,
+            "results": {},
+            "message": "No categories selected in onboarding. Please select categories first."
+        }
+
     if not query or len(query.strip()) < 2:
         return {
             "query": query,
@@ -1250,7 +1311,7 @@ def unified_search(
     
     # Search each requested tab
     if "content" in tabs_list:
-        content_results = search_content(query, 1, limit_per_tab, user_id=user_id, db=db)
+        content_results = search_content(query, 1, limit_per_tab, current_user=current_user, db=db)
         results["content"] = {
             "items": content_results["items"][:limit_per_tab],
             "total": content_results["total"],
@@ -1258,7 +1319,7 @@ def unified_search(
         }
     
     if "lists" in tabs_list:
-        lists_results = search_lists(query, 1, limit_per_tab, user_id=user_id, db=db)
+        lists_results = search_lists(query, 1, limit_per_tab, current_user=current_user, db=db)
         results["lists"] = {
             "items": lists_results["items"][:limit_per_tab],
             "total": lists_results["total"],
@@ -1266,7 +1327,7 @@ def unified_search(
         }
     
     if "topics" in tabs_list:
-        topics_results = search_topics(query, 1, limit_per_tab, user_id=user_id, db=db)
+        topics_results = search_topics(query, 1, limit_per_tab, current_user=current_user, db=db)
         results["topics"] = {
             "items": topics_results["items"][:limit_per_tab],
             "total": topics_results["total"],
@@ -1274,7 +1335,7 @@ def unified_search(
         }
     
     if "sources" in tabs_list:
-        sources_results = search_sources(query, 1, limit_per_tab, user_id=user_id, db=db)
+        sources_results = search_sources(query, 1, limit_per_tab, current_user=current_user, db=db)
         results["sources"] = {
             "items": sources_results["items"][:limit_per_tab],
             "total": sources_results["total"],
@@ -1282,7 +1343,7 @@ def unified_search(
         }
     
     if "concepts" in tabs_list:
-        concepts_results = search_concepts(query, 1, limit_per_tab, user_id=user_id, db=db)
+        concepts_results = search_concepts(query, 1, limit_per_tab, current_user=current_user, db=db)
         results["concepts"] = {
             "items": concepts_results["items"][:limit_per_tab],
             "total": concepts_results["total"],
@@ -1296,6 +1357,7 @@ def unified_search(
         "page": page,
         "limit_per_tab": limit_per_tab
     }
+
 
 @router.get("/concept/{concept_id}", response_model=Dict[str, Any])
 def get_concept_by_id(
