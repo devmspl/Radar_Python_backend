@@ -2630,6 +2630,8 @@ def get_filtered_feeds_post(
     search_query: Optional[str] = None,
     source_type: Optional[str] = None,
     content_type: Optional[str] = None,
+    job_id: Optional[str] = None,
+    uid: Optional[str] = None,
     sort_by: str = "created_at",
     sort_order: str = "desc",
     date_field: str = "created_at",
@@ -2662,14 +2664,34 @@ def get_filtered_feeds_post(
                     detail="Invalid subcategory_ids format. Use comma-separated integers."
                 )
         
-        # Base query with joins for all related data
-        query = db.query(Feed).options(
-            joinedload(Feed.blog),
-            joinedload(Feed.slides),
-            joinedload(Feed.category),
-            joinedload(Feed.subcategory),
-            joinedload(Feed.concepts)
-        )
+        # Determine if we are filtering by a specific job/UID to show pending items
+        is_tuple_query = False
+        source_model = None
+        
+        # Base query logic - if UID or job_id is present, we start from source items to include pending feeds
+        if uid:
+            is_tuple_query = True
+            source_model = Blog
+            query = db.query(Blog, Feed).outerjoin(Feed, Blog.id == Feed.blog_id).filter(Blog.job_uid == uid)
+        elif job_id:
+            is_tuple_query = True
+            source_model = Transcript
+            # Check if it's a TranscriptJob ID or a Video ID
+            transcript_job = db.query(TranscriptJob).filter(TranscriptJob.job_id == job_id).first()
+            if transcript_job:
+                query = db.query(Transcript, Feed).outerjoin(Feed, Transcript.transcript_id == Feed.transcript_id).filter(Transcript.job_id == transcript_job.id)
+            else:
+                # Try finding by video_id
+                query = db.query(Transcript, Feed).outerjoin(Feed, Transcript.transcript_id == Feed.transcript_id).filter(Transcript.video_id == job_id)
+        else:
+            # Base query with joins for all related data
+            query = db.query(Feed).options(
+                joinedload(Feed.blog),
+                joinedload(Feed.slides),
+                joinedload(Feed.category),
+                joinedload(Feed.subcategory),
+                joinedload(Feed.concepts)
+            )
         
         # Filter by published status
         if published_status:
@@ -2690,9 +2712,14 @@ def get_filtered_feeds_post(
         if subcategory_ids_list:
             query = query.filter(Feed.subcategory_id.in_(subcategory_ids_list))
         
+        # REMOVED: Previous job_id/uid filtering logic as it's now handled in the base query initialization
+
         # Filter by source type
         if source_type:
-            query = query.filter(Feed.source_type == source_type)
+            db_source_type = source_type
+            if source_type == "website":
+                db_source_type = "blog"
+            query = query.filter(Feed.source_type == db_source_type)
         
         # Filter by content type
         if content_type:
@@ -2807,6 +2834,8 @@ def get_filtered_feeds_post(
                         "subcategory_ids": subcategory_ids,
                         "source_type": source_type,
                         "content_type": content_type,
+                        "job_id": job_id,
+                        "uid": uid,
                         "sort_by": sort_by,
                         "sort_order": sort_order,
                         "date_field": date_field,
@@ -2839,8 +2868,65 @@ def get_filtered_feeds_post(
         
         # Format the response
         feeds_data = []
-        for feed in feeds:
-            # Check if published
+        for row in feeds:
+            if is_tuple_query:
+                source_item, feed = row
+            else:
+                source_item, feed = None, row
+
+            if not feed:
+                # Construct a placeholder feed for pending items
+                category_name = getattr(source_item, 'category', 'Uncategorized') if source_item and source_model == Blog else 'Uncategorized'
+                subcategory_name = "Pending"
+                
+                feed_data = {
+                    "id": None,
+                    "title": getattr(source_item, 'title', 'Pending Feed'),
+                    "categories": [category_name],
+                    "content_type": "Blog" if source_model == Blog else "Video",
+                    "skills": [],
+                    "tools": [],
+                    "roles": [],
+                    "status": "pending",
+                    "source_type": "blog" if source_model == Blog else "youtube",
+                    "is_published": False,
+                    "slides_count": 0,
+                    "slides": [],
+                    "ai_generated_content": {
+                        "title": getattr(source_item, 'title', 'Pending'),
+                        "summary": "This item is currently being processed. Slides will be available soon.",
+                        "key_points": [],
+                        "conclusion": "Processing in progress..."
+                    },
+                    "created_at": getattr(source_item, 'created_at', None).isoformat() if hasattr(source_item, 'created_at') and source_item.created_at else None,
+                    "updated_at": None,
+                    "ai_generated": False,
+                    "category_name": category_name,
+                    "subcategory_name": subcategory_name,
+                    "category_id": None,
+                    "subcategory_id": None,
+                    "category_display": f"{category_name} (Processing)",
+                    "meta": {
+                        "original_title": getattr(source_item, 'title', ''),
+                        "source_url": getattr(source_item, 'url', '') if source_model == Blog else f"https://www.youtube.com/watch?v={getattr(source_item, 'video_id', '')}",
+                        "author": getattr(source_item, 'website', 'Unknown') if source_model == Blog else "YouTube",
+                        "source_type": "blog" if source_model == Blog else "youtube"
+                    },
+                    "topics": [],
+                    "concepts": []
+                }
+                
+                if source_model == Blog:
+                    feed_data["blog_id"] = source_item.id
+                    feed_data["website"] = source_item.website
+                else:
+                    feed_data["transcript_id"] = source_item.transcript_id
+                    feed_data["video_id"] = source_item.video_id
+                
+                feeds_data.append(feed_data)
+                continue
+
+            # Standard Feed formatting for existing feeds
             is_published = db.query(PublishedFeed).filter(
                 PublishedFeed.feed_id == feed.id,
                 PublishedFeed.is_active == True
@@ -2931,12 +3017,18 @@ def get_filtered_feeds_post(
             # Add source-specific IDs
             if feed.source_type == "blog":
                 feed_data["blog_id"] = feed.blog_id
-                if feed.blog:
+                if source_item:
+                    feed_data["website"] = source_item.website
+                    feed_data["author"] = getattr(source_item, 'author', 'Unknown')
+                elif feed.blog:
                     feed_data["website"] = feed.blog.website
                     feed_data["author"] = getattr(feed.blog, 'author', 'Unknown')
             elif feed.source_type == "youtube":
                 feed_data["transcript_id"] = feed.transcript_id
-                if feed.transcript_id:
+                if source_item:
+                    feed_data["video_id"] = source_item.video_id
+                    feed_data["channel_name"] = getattr(source_item, 'channel_name', 'YouTube Creator')
+                elif feed.transcript_id:
                     transcript = db.query(Transcript).filter(
                         Transcript.transcript_id == feed.transcript_id
                     ).first()
@@ -2970,6 +3062,8 @@ def get_filtered_feeds_post(
                 "search_query": search_query,
                 "source_type": source_type,
                 "content_type": content_type,
+                "job_id": job_id,
+                "uid": uid,
                 "sort_by": sort_by,
                 "sort_order": sort_order,
                 "date_field": date_field,

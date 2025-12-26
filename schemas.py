@@ -149,6 +149,8 @@ class FilterFeedsRequest(BaseModel):
     search_query: Optional[str] = None
     source_type: Optional[str] = None
     content_type: Optional[str] = None
+    job_id: Optional[str] = None
+    uid: Optional[str] = None
     sort_by: str = "created_at"  # "created_at", "updated_at", "title"
     sort_order: str = "desc"  # "asc" or "desc"
     date_field: str = "created_at"  # "created_at" or "updated_at" - which date field to filter on
