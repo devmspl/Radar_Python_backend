@@ -52,28 +52,87 @@ def validate_openai_client():
 
 
 def check_openai_availability() -> Dict[str, Any]:
-    """Check if OpenAI API is available and has quota."""
-    if not OPENAI_API_KEY:
-        return {"available": False, "reason": "OpenAI API key not configured"}
+    """Check if OpenAI API is available and has quota with detailed diagnostics."""
+    diagnostics = {
+        "env_var_present": False,
+        "key_format_valid": False,
+        "key_preview": "None",
+        "connection_test": "Not started",
+        "error_details": None
+    }
     
+    # 1. Check if ENV var is loaded
+    actual_key = os.getenv("OPENAI_API_KEY")
+    if not actual_key:
+        return {
+            "available": False, 
+            "reason": "OPENAI_API_KEY environment variable is missing from .env or system.",
+            "diagnostics": diagnostics
+        }
+    
+    diagnostics["env_var_present"] = True
+    diagnostics["key_preview"] = f"{actual_key[:7]}...{actual_key[-4:]}"
+    
+    # 2. Basic format check
+    if actual_key.startswith("sk-") and len(actual_key) > 20:
+        diagnostics["key_format_valid"] = True
+    else:
+        return {
+            "available": False,
+            "reason": "API Key format invalid. It should start with 'sk-' and be a long string.",
+            "diagnostics": diagnostics
+        }
+
     try:
-        # Try a simple, cheap API call to check quota
-        response = client.chat.completions.create(
+        # Re-initialize client just for this check to ensure it uses the latest env var
+        temp_client = OpenAI(api_key=actual_key)
+        
+        # 3. Try to list models (cheapest/free test of authentication)
+        diagnostics["connection_test"] = "Testing authentication (list models)..."
+        temp_client.models.list()
+        
+        # 4. Try a tiny completion check for Quota
+        diagnostics["connection_test"] = "Testing quota (chat completion)..."
+        temp_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "Say 'test'"}],
-            max_tokens=5,
-            timeout=10
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1
         )
-        return {"available": True, "reason": "OpenAI API is working"}
+        
+        return {
+            "available": True, 
+            "reason": "OpenAI API is working perfectly.",
+            "diagnostics": diagnostics
+        }
+        
     except RateLimitError as e:
-        logger.error(f"OpenAI quota exceeded: {e}")
-        return {"available": False, "reason": f"OpenAI quota exceeded: {str(e)}"}
+        diagnostics["error_details"] = str(e)
+        return {
+            "available": False, 
+            "reason": "OpenAI Quota Exceeded. You have no credits left.",
+            "diagnostics": diagnostics
+        }
     except APIError as e:
-        logger.error(f"OpenAI API error: {e}")
-        return {"available": False, "reason": f"OpenAI API error: {str(e)}"}
+        diagnostics["error_details"] = str(e)
+        # Check specifically for 401
+        if "401" in str(e) or "invalid_api_key" in str(e).lower():
+            return {
+                "available": False,
+                "reason": "The API Key is rejected by OpenAI. It might be deleted, revoked, or copied incorrectly.",
+                "diagnostics": diagnostics
+            }
+        return {
+            "available": False, 
+            "reason": f"OpenAI API error: {str(e)}",
+            "diagnostics": diagnostics
+        }
     except Exception as e:
-        logger.error(f"OpenAI check failed: {e}")
-        return {"available": False, "reason": f"OpenAI check failed: {str(e)}"}
+        diagnostics["error_details"] = str(e)
+        return {
+            "available": False, 
+            "reason": f"System error: {str(e)}",
+            "diagnostics": diagnostics
+        }
 
 
 def get_youtube_channel_info(video_id: str) -> Dict[str, Any]:
@@ -1617,6 +1676,11 @@ def process_transcript_feeds_creation(transcripts: List[Transcript], job_id: str
 
 # ------------------ Endpoints ------------------
 
+@router.get("/openai/status")
+def get_openai_status():
+    """Check OpenAI API quota and availability status"""
+    return check_openai_availability()
+
 @router.get("/sources/with-ids", response_model=List[dict])
 def get_sources_with_ids(
     page: int = 1,
@@ -2625,6 +2689,7 @@ def get_filtered_feeds_post(
     page: int = 1,
     limit: int = 20,
     published_status: Optional[str] = None,
+    status: Optional[str] = None,
     category_ids: Optional[str] = None,
     subcategory_ids: Optional[str] = None,
     search_query: Optional[str] = None,

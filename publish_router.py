@@ -431,13 +431,28 @@ def get_source_for_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
                 }
         
         elif feed.source_type == "youtube":
-            # For YouTube, we might have multiple sources or a generic one
-            source = db.query(Source).filter(
-                Source.source_type == "youtube"
-            ).first()
+            # Get metadata to find the channel_id
+            meta = get_feed_metadata(db, feed)
+            channel_id = meta.get("channel_id")
+            channel_name = meta.get("channel_name", "YouTube")
+            
+            # Try to find source by channel_id in the website URL
+            source = None
+            if channel_id:
+                source = db.query(Source).filter(
+                    Source.source_type == "youtube",
+                    Source.website.ilike(f"%{channel_id}%")
+                ).first()
+            
+            # If still not found, try to find by channel name
+            if not source and channel_name:
+                source = db.query(Source).filter(
+                    Source.source_type == "youtube",
+                    Source.name.ilike(channel_name)
+                ).first()
             
             if source:
-                # Count published YouTube feeds
+                # Count published feeds for this source
                 published_feed_count = db.query(PublishedFeed).join(Feed).filter(
                     PublishedFeed.is_active == True,
                     Feed.source_type == "youtube"
@@ -451,6 +466,17 @@ def get_source_for_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
                     "published_feed_count": published_feed_count,
                     "follower_count": source.follower_count,
                     "is_active": source.is_active
+                }
+            else:
+                # Fallback: create dynamic source info from meta
+                return {
+                    "id": None,
+                    "name": channel_name,
+                    "website": f"https://www.youtube.com/channel/{channel_id}" if channel_id else "https://www.youtube.com",
+                    "source_type": "youtube",
+                    "published_feed_count": 1,
+                    "follower_count": 0,
+                    "is_active": True
                 }
         
         # Fallback: create a basic source info from feed data
@@ -466,15 +492,20 @@ def get_source_for_feed(db: Session, feed: Feed) -> Optional[Dict[str, Any]]:
                 "is_active": True
             }
         else:
+            # Check meta one more time for better fallback name
+            meta = get_feed_metadata(db, feed)
+            name = meta.get("channel_name") or meta.get("author") or "YouTube"
+            url = meta.get("source_url") or "https://www.youtube.com"
             return {
                 "id": None,
-                "name": "YouTube",
-                "website": "https://www.youtube.com",
+                "name": name,
+                "website": url,
                 "source_type": "youtube",
-                "published_feed_count": 1,  # Approximate
+                "published_feed_count": 1,
                 "follower_count": 0,
                 "is_active": True
             }
+            
             
     except Exception as e:
         logger.error(f"Error getting source for feed {feed.id}: {e}")
@@ -2036,14 +2067,16 @@ def get_feeds_by_category_id(
                     source_info = get_source_for_feed(db, feed)
                     feed_data["source"] = source_info
                     
-                    if source_info and source_info.get("id"):
-                        source_id = source_info["id"]
-                        if source_id not in sources_map:
-                            sources_map[source_id] = {
+                    if source_info:
+                        # Use ID as key if available, otherwise use a composite key
+                        source_key = source_info.get("id") or f"{source_info.get('name')}_{source_info.get('website')}"
+                        
+                        if source_key not in sources_map:
+                            sources_map[source_key] = {
                                 "source": source_info,
                                 "feed_count": 0
                             }
-                        sources_map[source_id]["feed_count"] += 1
+                        sources_map[source_key]["feed_count"] += 1
                 
                 matching_feeds.append(feed_data)
         
@@ -2053,17 +2086,15 @@ def get_feeds_by_category_id(
         end_idx = start_idx + limit
         paginated_feeds = matching_feeds[start_idx:end_idx]
 
-        # Prepare sources summary
-        sources_summary = [
-            {
-                "source": source_data["source"],
-                "published_feeds_count": source_data["feed_count"],
-                "percentage_of_total": round((source_data["feed_count"] / total) * 100, 2) if total > 0 else 0
-            }
-            for source_data in sources_map.values()
-        ]
+        # Prepare sources summary (Flattened)
+        sources_summary = []
+        for source_data in sources_map.values():
+            entry = source_data["source"].copy()
+            entry["published_feeds_count"] = source_data["feed_count"]
+            entry["percentage_of_total"] = round((source_data["feed_count"] / total) * 100, 2) if total > 0 else 0
+            sources_summary.append(entry)
         
-        # Sort sources by feed count (most popular first)
+        # Sort sources by feed count
         sources_summary.sort(key=lambda x: x["published_feeds_count"], reverse=True)
 
         # Get content type breakdown
