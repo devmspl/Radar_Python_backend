@@ -1963,25 +1963,12 @@ def get_feeds_by_category_id(
                 
             feed = pf.feed
             
-            # Check if category name is in the categories list
-            feed_categories = feed.categories or []
-            if not isinstance(feed_categories, list):
-                try:
-                    import json
-                    if isinstance(feed_categories, str):
-                        feed_categories = json.loads(feed_categories)
-                    else:
-                        feed_categories = []
-                except:
-                    feed_categories = []
-            
-            # Case-insensitive category matching
             category_match = False
-            for cat in feed_categories:
-                if isinstance(cat, str) and cat.lower() == category.name.lower():
-                    category_match = True
-                    break
             
+            # Check direct category_id match
+            if feed.category_id == category.id:
+                category_match = True
+        
             if not category_match:
                 continue
             
