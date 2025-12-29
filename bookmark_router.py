@@ -227,6 +227,7 @@ def format_feed_like_published_response(db: Session, feed: Feed, bookmark: "Book
             "category_id": feed.category_id,
             "subcategory_id": feed.subcategory_id,
             "category_display": f"{category_name} {{ {subcategory_name} }}" if category_name and subcategory_name else category_name,
+            "is_bookmark": True
         }
         
         # Add bookmark-specific fields if bookmark is provided

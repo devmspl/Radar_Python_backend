@@ -69,6 +69,14 @@ async def custom_swagger_ui_html():
             "persistAuthorization": True,    # Keep authorization between refreshes
         }
     )
+
+from sync_sources import sync_sources
+
+@app.on_event("startup")
+def startup_event():
+    # Sync sources on startup
+    sync_sources()
+
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 @app.get("/openapi.json", include_in_schema=False)
 async def get_open_api_endpoint():

@@ -7,9 +7,12 @@ from typing import Optional
 from config import settings
 from database import get_db
 import models
+import utils
 
 # Use HTTPBearer instead of OAuth2PasswordBearer
 security = HTTPBearer()
+# Optional security for endpoints that can work with or without auth
+security_optional = HTTPBearer(auto_error=False)
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security), 
@@ -41,6 +44,36 @@ def get_current_user(
         raise credentials_exception
     return user
 
+def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional), 
+    db: Session = Depends(get_db)
+) -> Optional[models.User]:
+    """
+    Returns user if authenticated, else None.
+    Does NOT raise generic 401/403 errors if no token provided.
+    """
+    if not credentials:
+        return None
+        
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=[settings.ALGORITHM]
+        )
+        email: str = payload.get("sub")
+        if email is None:
+            return None
+            
+        user = db.query(models.User).filter(models.User.email == email).first()
+        return user
+        
+    except JWTError:
+        return None
+    except Exception:
+        return None
+
 # Add this function at the end of utils.py
 async def get_current_admin(current_user: models.User = Depends(get_current_user)):
     """
@@ -53,9 +86,6 @@ async def get_current_admin(current_user: models.User = Depends(get_current_user
         )
     return current_user
     
-import utils
-
-security = HTTPBearer()
 
 async def get_current_user_from_reset_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),

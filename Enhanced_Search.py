@@ -91,7 +91,7 @@ def format_feed_for_search(feed: Feed, db: Session, user_id: Optional[int] = Non
         "concepts": concepts,
         "slides_count": len(feed.slides) if feed.slides else 0,
         "meta": meta,
-        "is_bookmarked": is_bookmarked,
+        "is_bookmark": is_bookmarked,
         "created_at": feed.created_at.isoformat() if feed.created_at else None,
         "ai_generated": bool(feed.ai_generated_content)
     }

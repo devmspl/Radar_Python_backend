@@ -10,7 +10,7 @@ from googleapiclient.errors import HttpError
 from pydantic import BaseModel, Field  # ADD THIS IMPORT
 
 from database import get_db
-from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source, UserOnboarding,SubCategory
+from models import PublishedFeed, Category, Feed, User, Blog, Slide, Transcript, Source, UserOnboarding, SubCategory, Bookmark
 from schemas import (
     PublishFeedRequest, 
     PublishStatusResponse, 
@@ -20,6 +20,7 @@ from schemas import (
     UnpublishFeedRequest,
     PublishedFeedResponse
 )
+from dependencies import get_current_user_optional
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -332,13 +333,22 @@ def format_slide_response(slide: Slide) -> SlideResponse:
         updated_at=slide.updated_at
     )
 
-def format_published_feed_response(published_feed: PublishedFeed, db: Session) -> Optional[Dict[str, Any]]:
+def format_published_feed_response(published_feed: PublishedFeed, db: Session, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Format published feed response with all necessary data."""
     try:
         if not published_feed.feed:
             return None
             
         feed = published_feed.feed
+        
+        # Check bookmark status if user_id is provided
+        is_bookmark = False
+        if user_id:
+            bookmark = db.query(Bookmark).filter(
+                Bookmark.user_id == user_id,
+                Bookmark.feed_id == feed.id
+            ).first()
+            is_bookmark = True if bookmark else False
         
         # NEW: Get category and subcategory names
         category_name = None
@@ -391,6 +401,7 @@ def format_published_feed_response(published_feed: PublishedFeed, db: Session) -
             "slides_count": len(slides_data),
             "slides": slides_data,
             "meta": meta_data,
+            "is_bookmark": is_bookmark,
             # NEW: Add category and subcategory info
             "category_name": category_name,
             "subcategory_name": subcategory_name,
@@ -1008,7 +1019,8 @@ def get_published_feeds(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     active_only: bool = Query(True, description="Show only active published feeds"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Get all published feeds with slides included and enhanced metadata.
@@ -1053,6 +1065,15 @@ def get_published_feeds(
             # Get enhanced metadata with channel info, logos, and website data
             meta_data = get_feed_metadata(db, pf.feed, pf.feed.blog)
             
+            # Check bookmark status
+            is_bookmark = False
+            if user:
+                bookmark = db.query(Bookmark).filter(
+                    Bookmark.user_id == user.id,
+                    Bookmark.feed_id == pf.feed.id
+                ).first()
+                is_bookmark = True if bookmark else False
+            
             response_data.append(PublishedFeedResponse(
                 id=pf.id,
                 feed_id=pf.feed_id,
@@ -1065,7 +1086,8 @@ def get_published_feeds(
                 feed_categories=categories,
                 slides_count=slides_count,
                 slides=slides_data if slides_data else None,
-                meta=meta_data
+                meta=meta_data,
+                is_bookmark=is_bookmark
             ))
         
         return response_data
@@ -1083,10 +1105,13 @@ def get_published_feeds_by_source_id(
     page: int = 1,
     limit: int = 20,
     content_type: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get only PUBLISHED feeds by source ID."""
     try:
+        user_id = user.id if user else None
+        
         source = db.query(Source).filter(Source.id == source_id).first()
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -1127,7 +1152,7 @@ def get_published_feeds_by_source_id(
         # Format response
         feeds_data = []
         for pf in published_feeds:
-            feed_data = format_published_feed_response(pf, db)
+            feed_data = format_published_feed_response(pf, db, user_id=user_id)
             if feed_data:
                 feeds_data.append(feed_data)
         
@@ -1466,7 +1491,8 @@ class ContentTypeFilterRequest(BaseModel):
 @router.post("/feeds/filter-by-type", response_model=dict)
 def filter_published_feeds_by_type(
     request: ContentTypeFilterRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user_id: Optional[int] = None
 ):
     """
     Filter published feeds by content types (Webinar, Blog, Podcast, Video).
@@ -1513,7 +1539,7 @@ def filter_published_feeds_by_type(
         
         for pf in published_feeds:
             if pf.feed:
-                feed_data = format_published_feed_response(pf, db)
+                feed_data = format_published_feed_response(pf, db, user_id=user_id)
                 if feed_data:
                     # Add source information if requested
                     if request.include_source_info:
@@ -1627,7 +1653,8 @@ def filter_published_feeds_by_type_get(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     include_source_info: bool = Query(True, description="Include source information"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Filter published feeds by content types (GET version).
@@ -1638,7 +1665,8 @@ def filter_published_feeds_by_type_get(
         limit=limit,
         include_source_info=include_source_info
     )
-    return filter_published_feeds_by_type(request, db)
+    user_id = user.id if user else None
+    return filter_published_feeds_by_type(request, db, user_id=user_id)
 
 
 from typing import List, Optional, Dict
@@ -1900,15 +1928,19 @@ def get_feeds_by_category_id(
     tools: Optional[str] = Query(None, description="Filter by tools (comma-separated)"),
     roles: Optional[str] = Query(None, description="Filter by roles (comma-separated)"),
     page: int = Query(1, ge=1, description="Page number"),
+
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     include_source_info: bool = Query(True, description="Include source information"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Get published feeds by category ID with optional source information and filtering.
     Supports comma-separated values for filtering.
     """
     try:
+        user_id = user.id if user else None
+        
         # First get the category name from ID
         category = db.query(Category).filter(Category.id == category_id).first()
         
@@ -2048,7 +2080,7 @@ def get_feeds_by_category_id(
                     continue
             
             # Format feed response
-            feed_data = format_published_feed_response(pf, db)
+            feed_data = format_published_feed_response(pf, db, user_id=user_id)
             if feed_data:
                 if include_source_info:
                     source_info = get_source_for_feed(db, feed)

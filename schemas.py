@@ -391,6 +391,8 @@ class PublishedFeedResponse(BaseModel):
     slides_count: int
     slides: Optional[List[SlideResponse]] = None
     meta: Dict[str, Any]
+    is_bookmark: bool = False
+    
     class Config:
         from_attributes = True
 
