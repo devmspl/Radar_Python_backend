@@ -14,8 +14,9 @@ from schemas import (
     CategoryCreateResponse, SubCategoryResponse, CategoriesListResponse
 )
 from Subcategory_router import CRUDSubCategory
-from dependencies import get_current_admin 
-router = APIRouter(prefix="/admin", tags=["category"])
+from publish_router import get_feed_metadata
+from models import Source
+router = APIRouter(prefix="/admin", tags=["Admin Operations"])
 
 @router.post("/categories", response_model=schemas.CategoryResponse)
 def create_category(
@@ -403,4 +404,28 @@ def search_categories(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error searching categories: {str(e)}"
+        )
+@router.post("/sources/reset-counts", response_model=dict, tags=["Admin"])
+def reset_sources_counts_api(
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(get_current_admin)
+):
+    """
+    Directly reset all source follower counts to zero in the database.
+    """
+    try:
+        # Efficiently update all sources at once
+        updated_rows = db.query(Source).update({Source.follower_count: 0})
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": f"Successfully reset follower counts for {updated_rows} sources to 0",
+            "updated_count": updated_rows
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to reset source counts: {str(e)}"
         )
