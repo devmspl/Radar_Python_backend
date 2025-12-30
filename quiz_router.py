@@ -18,15 +18,7 @@ from sqlalchemy import func
 router = APIRouter(prefix="/quizzes", tags=["Quizzes"])
 
 logger = logging.getLogger(__name__)
-openai_api_key = os.getenv("OPENAI_API_KEY")
-client = None
-if openai_api_key:
-    try:
-        client = OpenAI(api_key=openai_api_key)
-    except Exception as e:
-        logger.error(f"Failed to initialize OpenAI client: {e}")
-else:
-    logger.warning("OPENAI_API_KEY not found. AI quiz generation will be disabled.")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize scheduler
 scheduler = BackgroundScheduler()

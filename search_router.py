@@ -19,12 +19,7 @@ router = APIRouter(prefix="/search", tags=["Feed Search"])
 logger = logging.getLogger(__name__)
 
 # Initialize API clients
-openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_client = None
-if openai_api_key:
-    openai_client = OpenAI(api_key=openai_api_key)
-else:
-    logger.warning("OPENAI_API_KEY not found. AI features will be disabled.")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # YouTube API client
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")

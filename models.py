@@ -251,9 +251,6 @@ class Feed(Base):
     status = Column(String(50), default="processing")
     ai_generated_content = Column(JSON, nullable=True)
     image_generation_enabled = Column(Boolean, default=True)
-    embedding = Column(JSON, nullable=True)  # Vector embedding for semantic search
-    click_count = Column(Integer, default=0) # CTR for behavioral learning
-    language = Column(String(10), default="en") # Content language
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     blog = relationship("Blog", back_populates="feeds")
@@ -522,8 +519,6 @@ class Concept(Base):
     description = Column(Text, nullable=True)
     related_concepts = Column(JSON, default=list)  # Array of related concept names
     popularity_score = Column(Integer, default=0)
-    embedding = Column(JSON, nullable=True)
-    click_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -537,8 +532,6 @@ class ContentList(Base):
     source_type = Column(String)  # 'youtube_playlist' or 'custom'
     source_id = Column(String)  # playlist_id for YouTube, custom_id for manual lists
     feed_ids = Column(JSON, default=list)  # Array of feed IDs in this list
-    embedding = Column(JSON, nullable=True)
-    click_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
