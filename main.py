@@ -5,7 +5,7 @@ from fastapi.openapi.utils import get_openapi
 from sqlalchemy.orm import Session
 from typing import List
 import models, schemas, utils, dependencies
-from database import get_db, engine
+from database import get_db, engine, run_migrations
 from config import settings
 from fastapi import File, UploadFile, Form
 import shutil
@@ -48,6 +48,7 @@ auth_router = APIRouter(
 
 # Create tables
 models.Base.metadata.create_all(bind=engine)
+run_migrations()
 
 app = FastAPI(
     title="RADAR_API",
