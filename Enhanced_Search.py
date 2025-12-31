@@ -888,249 +888,164 @@ def search_lists(
     db: Session = Depends(get_db)
 ):
     """
-    Search content lists (playlists or curated collections) with intelligent scoring.
-    
-    Features:
-    - Smart Ranking: Prioritizes exact matches, then partial matches, then content richness
-    - Fuzzy Search: Case-insensitive matching to ensure no relevant results are missed
-    - Optimized Filtering: Efficiently checks against user's selected categories
-    - Dynamic Context: Adapts to user's onboarding preferences
+    COMPREHENSIVE SEARCH PIPELINE for playlists.
+    Scans: Playlist Name/Desc, Feed Titles, Summaries, Category Names, Subcategory Names, 
+    Topics, and Channel/Source Names.
     """
     user_id = current_user.id
     
-    # Step 1: Get user's onboarding data to find selected categories
-    user_onboarding = db.query(UserOnboarding).filter(
-        UserOnboarding.user_id == user_id
-    ).first()
-    
-    if not user_onboarding:
-        raise HTTPException(
-            status_code=404,
-            detail="User onboarding data not found. Please complete onboarding first."
-        )
-    
-    # Get user's domains of interest (category IDs)
-    user_category_ids = user_onboarding.domains_of_interest
-    
-    if not user_category_ids or len(user_category_ids) == 0:
-        return {
-            "tab": "lists",
-            "query": query,
-            "items": [],
-            "page": page,
-            "limit": limit,
-            "total": 0,
-            "has_more": False,
-            "message": "No categories selected in onboarding. Please select categories first."
-        }
+    # 1. Fetch User Context for Prioritization
+    user_onboarding = db.query(UserOnboarding).filter(UserOnboarding.user_id == user_id).first()
+    user_category_ids = user_onboarding.domains_of_interest or [] if user_onboarding else []
+    bookmarked_fids = {b.feed_id for b in db.query(Bookmark).filter(Bookmark.user_id == user_id).all()}
 
-    # Step 2: Pre-fetch all Feed IDs that belong to user's categories
-    # This optimization avoids N+1 queries inside the loop for counting
-    relevant_feeds_query = db.query(Feed.id).filter(
-        Feed.category_id.in_(user_category_ids),
-        Feed.status == "ready"
-    )
-    # Create a set for O(1) lookups
-    relevant_feed_ids_set = {r[0] for r in relevant_feeds_query.all()}
-    
-    if not relevant_feed_ids_set:
-        return {
-            "tab": "lists",
-            "query": query,
-            "items": [],
-            "page": page,
-            "limit": limit,
-            "total": 0,
-            "has_more": False,
-            "message": "No content found for your selected categories."
-        }
-        
-    # Step 3: Fetch all active content lists to process in memory
-    # We fetch broadly here and filter/score in Python for maximum flexibility
+    # 2. Fetch All Lists
     lists_query = db.query(ContentList).filter(ContentList.is_active == True)
     if source_type:
         lists_query = lists_query.filter(ContentList.source_type == source_type)
     
     all_lists = lists_query.all()
+    if not all_lists and db.query(ContentList).count() == 0:
+        auto_create_lists_from_youtube(db)
+        all_lists = lists_query.all()
+
+    # 3. GLOBAL METADATA PIPELINE (Batch Fetch)
+    all_fids = set()
+    for cl in all_lists:
+        for fid in (cl.feed_ids or []):
+            try: all_fids.add(int(fid))
+            except: continue
     
-    # If no lists exist, try auto-create (fallback)
-    if len(all_lists) == 0:
-        # Only check count if query returned empty, maybe DB is really empty
-        total_cnt = db.query(ContentList).count()
-        if total_cnt == 0:
-            created = auto_create_lists_from_youtube(db)
-            if created > 0:
-                all_lists = lists_query.all()
-    
-    # Step 4: Score and Filter Lists
-    scored_items = []
-    
-    # Helper for clean string matching
-    def clean(s): return (s or "").lower().strip()
-    
-    search_terms = []
-    if query and query.strip():
-        # Use available fuzzy search helper
-        search_terms = build_fuzzy_search_terms(query)
-    
-    for content_list in all_lists:
-        feed_ids = content_list.feed_ids or []
-        if not feed_ids:
-            continue
-            
-        # Optimization: Calculate intersection with user's relevant feeds
-        # We only care about feeds in the list that match User's Categories
-        matched_feed_ids = [fid for fid in feed_ids if fid in relevant_feed_ids_set]
-        feed_count = len(matched_feed_ids)
+    feed_data_map = {}
+    if all_fids:
+        # Transcript has 'title' (Original Title), Blog has 'website'
+        feeds_data = db.query(
+            Feed.id, Feed.title, Feed.category_id, Feed.categories, Feed.ai_generated_content,
+            Feed.source_type, Category.name.label("cat_name"), SubCategory.name.label("sub_name"),
+            Transcript.title.label("orig_title"), Blog.website
+        ).outerjoin(Category, Feed.category_id == Category.id)\
+         .outerjoin(SubCategory, Feed.subcategory_id == SubCategory.id)\
+         .outerjoin(Transcript, Feed.transcript_id == Transcript.transcript_id)\
+         .outerjoin(Blog, Feed.blog_id == Blog.id)\
+         .filter(Feed.id.in_(list(all_fids))).all()
         
-        # Skip lists that have no feeds matching the user's categories
-        if feed_count == 0:
-            continue
+        for f in feeds_data:
+            summary = (f.ai_generated_content or {}).get("summary", "")
+            source_name = f.website if f.source_type == "blog" else ""
             
-        # Scoring Logic
+            feed_data_map[f.id] = {
+                "title": f.title or "",
+                "summary": summary or "",
+                "cat_name": f.cat_name or "",
+                "sub_name": f.sub_name or "",
+                "topics": " ".join(f.categories or []),
+                "source_name": source_name or "",
+                "orig_title": f.orig_title or "",
+                "cat_id": f.category_id
+            }
+
+    # 4. Relational Search Engineering
+    scored_items = []
+    q_lower = query.strip().lower() if query else None
+    
+    for cl in all_lists:
+        search_buffer_parts = [str(cl.name or ""), str(cl.description or ""), str(cl.source_id or "")]
+        
+        playlist_fids = []
+        for fid in (cl.feed_ids or []):
+            try: playlist_fids.append(int(fid))
+            except: continue
+
+        list_cat_ids = set()
+        for fid in playlist_fids:
+            if fid in feed_data_map:
+                fd = feed_data_map[fid]
+                search_buffer_parts.extend([
+                    fd["title"], fd["summary"], fd["cat_name"], 
+                    fd["sub_name"], fd["topics"], fd["source_name"], fd["orig_title"]
+                ])
+                if fd["cat_id"]: list_cat_ids.add(fd["cat_id"])
+
+        search_vector = " ".join(search_buffer_parts).lower()
+        
         s_score = 0.0
         is_match = False
-        
-        if not query or not query.strip():
-            # No Query: Score based on content richness (feed count)
-            # We use feed_count as base score so richer lists come first
-            s_score = float(feed_count)
+        reasons = set()
+
+        # CASE 1: Empty Query - Default Prioritization
+        if not q_lower:
+            s_score = float(len(playlist_fids)) * 1.0
             is_match = True
+        # CASE 2: Pipeline Search
         else:
-            # Query Present: detailed scoring
-            name = clean(content_list.name)
-            desc = clean(content_list.description)
-            src_id = clean(content_list.source_id)
+            # Tier 1: Exact Name Match
+            if q_lower in (cl.name or "").lower():
+                s_score += 500.0; is_match = True; reasons.add("Playlist Title Match")
             
-            for term in search_terms:
-                t = clean(term)
-                if not t: continue
-                
-                # Name Match (Highest Priority)
-                if t in name:
-                    s_score += 50.0
-                    is_match = True
-                    if name.startswith(t):
-                        s_score += 10.0
-                
-                # Description Match
-                if t in desc:
-                    s_score += 30.0
-                    is_match = True
-                
-                # Source ID Match
-                if t in src_id:
-                    s_score += 20.0
-                    is_match = True
+            # Tier 2: Deep Vector Match (Categories, Sources, Content)
+            if q_lower in search_vector:
+                s_score += 150.0; is_match = True; reasons.add("Content/Source Match")
             
-            # Bonus for content richness (up to 20 points)
-            if is_match:
-                s_score += min(feed_count, 20)
-                
+            # Tier 3: Individual Check for Category/Source specifically to boost
+            for fid in playlist_fids:
+                if fid in feed_data_map:
+                    fd = feed_data_map[fid]
+                    if q_lower in fd["cat_name"].lower() or q_lower in fd["sub_name"].lower():
+                        s_score += 100.0; reasons.add("Category Match")
+                    if q_lower in fd["source_name"].lower():
+                        s_score += 120.0; reasons.add("Channel/Source Match")
+
         if is_match:
+            # User Personalization Bonus
+            cat_bonus = sum(100 for cid in list_cat_ids if cid in user_category_ids)
+            s_score += min(cat_bonus, 500) # Cap onboarding bonus
+            if cat_bonus > 0: reasons.add("Recommended based on your interests")
+            
+            has_bookmark = any(fid in bookmarked_fids for fid in playlist_fids)
+            if has_bookmark: s_score += 50.0; reasons.add("Contains your bookmarks")
+
             scored_items.append({
-                "list": content_list,
-                "score": s_score,
-                "feed_count": feed_count,
-                "matched_ids": matched_feed_ids
+                "list": cl, "score": s_score, "fcount": len(playlist_fids),
+                "cats": list(set(fd["cat_name"] for fid in playlist_fids if fid in feed_data_map and feed_data_map[fid]["cat_name"])),
+                "is_bookmark": has_bookmark, "reasons": list(reasons)
             })
-            
-    # Step 5: Sort Results
-    # Sort by Score DESC. Python sort is stable.
+
+    # 5. Result Construction
     scored_items.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Step 6: Paginate in Memory
     total = len(scored_items)
-    start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    paginated_results = scored_items[start_idx:end_idx]
-    
-    # Step 7: Build Response Items
+    paginated = scored_items[(page - 1) * limit : page * limit]
+
     items_list = []
-    
-    # Pre-fetch details for the PAGINATED items only (Optimization)
-    for item in paginated_results:
-        content_list = item["list"]
-        matched_ids = item["matched_ids"]
-        
-        # Fetch sample feeds (only first 3 for display)
-        # We fetch full objects to get metadata
-        sample_feeds_obj = db.query(Feed).filter(
-            Feed.id.in_(matched_ids[:3])
-        ).all()
-        
-        all_topics = set()
+    for item in paginated:
+        cl = item["list"]
+        samples = db.query(Feed).filter(Feed.id.in_(cl.feed_ids[:3] or [])).all()
         sample_feeds = []
-        
-        for feed in sample_feeds_obj:
-            meta = get_feed_metadata(feed, db)
-            
-            if feed.categories:
-                for cat in feed.categories:
-                    all_topics.add(cat)
-            
-            summary = ""
-            if feed.ai_generated_content and "summary" in feed.ai_generated_content:
-                summary = feed.ai_generated_content["summary"]
-                if len(summary) > 100: summary = summary[:97] + "..."
-            
-            source_info = {}
-            if feed.source_type == "youtube":
-                source_info = {
-                    "type": "youtube", 
-                    "name": meta.get("channel_name", "YouTube"), 
-                    "url": meta.get("source_url", "#")
-                }
-            elif feed.source_type == "blog" and feed.blog:
-                source_info = {
-                    "type": "blog", 
-                    "name": feed.blog.website, 
-                    "url": feed.blog.website
-                }
-            
-            sample_feeds.append({
-                "id": feed.id,
-                "title": feed.title,
-                "summary": summary,
-                "content_type": feed.content_type.value if feed.content_type else "Video",
-                "source_type": feed.source_type,
-                "source_info": source_info,
-                "meta": meta
-            })
-            
-        # Get thumbnail from first sample feed
-        thumbnail_url = None
-        if sample_feeds_obj:
-            meta = get_feed_metadata(sample_feeds_obj[0], db)
-            thumbnail_url = meta.get("thumbnail_url")
-            
+        for f in samples:
+            meta = get_feed_metadata(f, db)
+            summary = (f.ai_generated_content or {}).get("summary", "")
+            sample_feeds.append({"id": f.id, "title": f.title, "summary": summary[:120], "meta": meta})
+
         items_list.append({
-            "id": content_list.id,
-            "name": content_list.name,
-            "description": content_list.description,
-            "source_type": content_list.source_type,
-            "source_id": content_list.source_id,
-            "list_type": "playlist" if content_list.source_type == "youtube" else "collection",
-            "feed_count": item["feed_count"],
+            "id": cl.id,
+            "name": cl.name,
+            "description": cl.description,
+            "source_type": cl.source_type,
+            "source_id": cl.source_id,
+            "list_type": "channel" if (cl.source_id or "").startswith("channel_") or (cl.source_id or "").startswith("UU") else "playlist",
+            "feed_count": item["fcount"],
+            "categories": item["cats"],
+            "is_bookmark": item["is_bookmark"],
             "sample_feeds": sample_feeds,
-            "topics": list(all_topics)[:10],
-            "thumbnail_url": thumbnail_url,
-            "created_at": content_list.created_at.isoformat() if content_list.created_at else None,
-            "updated_at": content_list.updated_at.isoformat() if content_list.updated_at else None,
-            "relevance_score": item["score"]
+            "thumbnail_url": sample_feeds[0]["meta"].get("thumbnail_url") if sample_feeds else None,
+            "relevance_score": item["score"],
+            "match_reasons": item["reasons"]
         })
-    
+
     return {
-        "tab": "lists",
-        "query": query,
-        "items": items_list,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "has_more": (page * limit) < total,
+        "tab": "lists", "query": query, "items": items_list,
+        "page": page, "limit": limit, "total": total, "has_more": (page * limit) < total,
         "user_selected_categories": user_category_ids
     }
-
 
 
 # ------------------ Tab 3: Topics Search ------------------
