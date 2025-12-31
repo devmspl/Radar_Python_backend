@@ -1657,93 +1657,183 @@ def search_concepts(
             detail="User onboarding data not found. Please complete onboarding first."
         )
     
-    # Get user's domains of interest (category IDs)
-    user_category_ids = user_onboarding.domains_of_interest
-    
-    if not user_category_ids or len(user_category_ids) == 0:
-        return {
-            "tab": "concepts",
-            "query": query,
-            "items": [],
-            "page": page,
-            "limit": limit,
-            "total": 0,
-            "has_more": False,
-            "message": "No categories selected in onboarding. Please select categories first."
-        }
+    # Step 1: Get user's onboarding data
+    user_onboarding = db.query(UserOnboarding).filter(UserOnboarding.user_id == user_id).first()
+    if not user_onboarding:
+        raise HTTPException(status_code=404, detail="User onboarding data not found.")
+    user_category_ids = user_onboarding.domains_of_interest or []
 
-    # Step 2 & 3: Query concepts matching search criteria
-    query_obj = db.query(Concept).filter(Concept.is_active == True)
-    
-    if query and query.strip():
-        search_term = f"%{query.strip().lower()}%"
-        query_obj = query_obj.filter(Concept.name.ilike(search_term))
-    
-    if domain and domain.strip():
-        # Filter concepts by domain
-        domain_obj = db.query(Domain).filter(Domain.name.ilike(f"%{domain}%")).first()
-        if domain_obj:
-            concept_ids = db.query(DomainConcept.concept_id).filter(DomainConcept.domain_id == domain_obj.id).all()
-            concept_id_list = [c[0] for c in concept_ids]
-            query_obj = query_obj.filter(Concept.id.in_(concept_id_list))
-            
-    # Step 4: Get all matching concepts
-    concepts = query_obj.all()
-    
-    # Step 5: Calculate feed counts within user's categories and build response items
-    items_list = []
-    for concept in concepts:
-        # Calculate feed count for this concept FILTERED by user's selected categories
-        feed_count = db.query(func.count(Feed.id)).join(FeedConcept).filter(
-            FeedConcept.concept_id == concept.id,
+    if not user_category_ids and not query:
+        return {"tab": "concepts", "query": query, "items": [], "page": page, "limit": limit, "total": 0, "has_more": False}
+
+    concepts_dict = {}
+
+    # === CASE 1: Empty Query - Show concepts from user categories ===
+    if not query or not query.strip():
+        # Get common concepts from user categories
+        relevant_concepts = db.query(Concept).join(FeedConcept).join(Feed).filter(
+            Concept.is_active == True,
             Feed.category_id.in_(user_category_ids),
             Feed.status == "ready"
-        ).scalar() or 0
+        ).distinct().all()
         
-        # Skip concepts that have no feeds matching the user's categories
-        if feed_count == 0:
-            continue
+        for concept in relevant_concepts:
+            concepts_dict[concept.id] = {
+                "concept": concept,
+                "priority": 100,
+                "in_user_categories": True
+            }
+
+    # === CASE 2: Query has VALUE - Deep Relational Search ===
+    else:
+        query_clean = query.strip().lower()
+        search_term = f"%{query_clean}%"
+        
+        # A. Direct Concept matches (Name, Description, Domain)
+        direct_matches = db.query(Concept).join(DomainConcept, isouter=True).join(Domain, isouter=True).filter(
+            Concept.is_active == True,
+            or_(
+                Concept.name.ilike(search_term),
+                Concept.description.ilike(search_term),
+                Domain.name.ilike(search_term)
+            )
+        ).distinct().all()
+        
+        for concept in direct_matches:
+            score = 150
+            if concept.name.lower().startswith(query_clean):
+                score = 300 
+            elif query_clean in concept.name.lower():
+                score = 250
+            concepts_dict[concept.id] = {"concept": concept, "priority": score, "match_type": "direct"}
             
-        # Topic filter check (if topic provided)
-        if topic and topic.strip():
-            topic_feed_count = db.query(func.count(Feed.id)).join(FeedConcept).filter(
-                FeedConcept.concept_id == concept.id,
+        # B. Relational Matching via Content (Feeds, Categories, SubCategories)
+        # We find concepts related to anything matching the query
+        relational_results = db.query(Concept).join(FeedConcept).join(Feed).join(Category, isouter=True).join(SubCategory, isouter=True).filter(
+            Concept.is_active == True,
+            or_(
+                Feed.title.ilike(search_term),
+                Feed.categories.contains([query_clean]),
+                Category.name.ilike(search_term),
+                SubCategory.name.ilike(search_term)
+            )
+        ).distinct().all()
+        
+        for concept in relational_results:
+            if concept.id not in concepts_dict:
+                concepts_dict[concept.id] = {
+                    "concept": concept,
+                    "priority": 100, # Base relational score
+                    "match_type": "relational"
+                }
+            else:
+                # If already exists, boost it for having content relevance too
+                concepts_dict[concept.id]["priority"] += 50
+
+        # Boost concepts based on user categories and global feed volume
+        for concept_id, data in concepts_dict.items():
+            # Bonus 1: User Onboarding Match
+            has_user_cat_feeds = db.query(FeedConcept).join(Feed).filter(
+                FeedConcept.concept_id == concept_id,
                 Feed.category_id.in_(user_category_ids),
-                Feed.status == "ready",
-                Feed.categories.contains([topic.strip()])
-            ).scalar() or 0
-            if topic_feed_count == 0:
-                continue
-                
+                Feed.status == "ready"
+            ).first() is not None
+            
+            if has_user_cat_feeds:
+                data["priority"] += 50
+                data["in_user_categories"] = True
+            else:
+                data["in_user_categories"] = False
+
+    # Step 3: Build response items & Calculate feed counts
+    items_list = []
+    for concept_id, data in concepts_dict.items():
+        concept = data["concept"]
+        
+        # Base filters for feeds
+        feed_filters = [
+            FeedConcept.concept_id == concept.id,
+            Feed.status == "ready"
+        ]
+        
+        # Apply topic filter if provided
+        if topic and topic.strip():
+            feed_filters.append(Feed.categories.contains([topic.strip()]))
+            
+        # 1. Total feed count (Matching search criteria + global context)
+        total_feed_count = db.query(func.count(Feed.id)).join(FeedConcept).filter(*feed_filters).scalar() or 0
+        
+        # 2. User relevant feeds (Within user's selected categories)
+        user_relevant_filters = feed_filters + [Feed.category_id.in_(user_category_ids)]
+        relevant_feeds_query = db.query(Feed).join(FeedConcept).filter(*user_relevant_filters).order_by(Feed.created_at.desc())
+        
+        user_feeds = relevant_feeds_query.limit(3).all()
+        user_feed_count = relevant_feeds_query.count()
+
+        # Skip if no feeds at all matching filters (e.g. if topic filter active and no matches)
+        if total_feed_count == 0:
+            continue
+
+        # Format feeds for JSON serialization (Avoids Internal Server Error)
+        formatted_feeds = []
+        for f in user_feeds:
+            # Safely get summary
+            summary = ""
+            if f.ai_generated_content and isinstance(f.ai_generated_content, dict):
+                summary = f.ai_generated_content.get("summary", "")[:150] + "..."
+            
+            # Safely get thumbnail
+            thumbnail = None
+            if f.source_type == "blog" and f.blog:
+                thumbnail = f"https://www.google.com/s2/favicons?domain={f.blog.website}&sz=64"
+            
+            formatted_feeds.append({
+                "id": f.id,
+                "title": f.title,
+                "summary": summary,
+                "thumbnail": thumbnail,
+                "source_type": f.source_type,
+                "created_at": f.created_at.isoformat() if f.created_at else None
+            })
+
         # Get domains
         concept_domains = [{"id": d.id, "name": d.name} for d in concept.domains]
+        domain_ids = [d.id for d in concept.domains]
         
-        # Get related concepts
-        related_concepts = []
-        if concept.related_concepts:
-            related_objs = db.query(Concept).filter(Concept.name.in_(concept.related_concepts[:5])).all()
-            related_concepts = [c.name for c in related_objs]
-            
+        # Related Concepts Logic
+        related_concepts_list = concept.related_concepts[:5] if concept.related_concepts else []
+        
+        # DYNAMIC FALLBACK: If no related concepts in DB, find concepts in same domains
+        if not related_concepts_list and domain_ids:
+            shared_domain_concepts = db.query(Concept.name).join(DomainConcept).filter(
+                DomainConcept.domain_id.in_(domain_ids),
+                Concept.id != concept.id,
+                Concept.is_active == True
+            ).limit(5).all()
+            related_concepts_list = [c[0] for c in shared_domain_concepts]
+        
         items_list.append({
             "id": concept.id,
             "name": concept.name,
             "description": concept.description,
-            "feed_count": feed_count,
+            "feed_count": total_feed_count,
+            "priority": data["priority"],
+            "in_user_categories": data["in_user_categories"],
             "popularity_score": concept.popularity_score,
-            "related_concepts": related_concepts,
+            "related_concepts": related_concepts_list,
             "domains": concept_domains,
             "created_at": concept.created_at.isoformat() if concept.created_at else None
         })
-        
-    # Step 6: Sort by feed_count (descending)
-    items_list.sort(key=lambda x: x["feed_count"], reverse=True)
-    
-    # Step 7: Paginate results
+
+    # Step 4: Sort by Priority FIRST, then by feed_count
+    items_list.sort(key=lambda x: (-x["priority"], -x["feed_count"]))
+
+    # Step 5: Paginate
     total = len(items_list)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     paginated_items = items_list[start_idx:end_idx]
-    
+
     return {
         "tab": "concepts",
         "query": query,
