@@ -405,7 +405,7 @@ def search_categories(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error searching categories: {str(e)}"
         )
-@router.post("/sources/reset-counts", response_model=dict, tags=["Admin"])
+@router.post("/sources/reset-counts", response_model=dict)
 def reset_sources_counts_api(
     db: Session = Depends(get_db),
     admin_user: models.User = Depends(get_current_admin)
