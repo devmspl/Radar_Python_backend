@@ -537,9 +537,14 @@ async def get_jobs_status(
     }
 
 
-@router.post("/pause/{job_type}", summary="⏸️ Pause Specific Job Type")
+@router.post(
+    "/pause/{job_type}", 
+    summary="⏸️ Pause Specific Job Type",
+    response_model=PauseResumeResponse,
+    description="Pause a specific type of background jobs. New jobs of this type will be blocked."
+)
 async def pause_job_type(
-    job_type: str,
+    job_type: JobTypeEnum,
     current_user: models.User = Depends(get_current_admin)
 ):
     """
@@ -552,15 +557,8 @@ async def pause_job_type(
     - `quiz_generation` - Quiz creation
     - `all` - All job types
     """
-    valid_types = ["feed_generation", "youtube_transcription", "blog_scraping", "quiz_generation", "all"]
-    if job_type not in valid_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid job type. Valid types: {valid_types}"
-        )
-    
-    result = job_manager.pause_job_type(job_type)
-    logger.info(f"⏸️ Admin {current_user.email} paused {job_type} jobs")
+    result = job_manager.pause_job_type(job_type.value)
+    logger.info(f"⏸️ Admin {current_user.email} paused {job_type.value} jobs")
     return {
         "success": True,
         "timestamp": datetime.utcnow().isoformat(),
@@ -569,9 +567,14 @@ async def pause_job_type(
     }
 
 
-@router.post("/resume/{job_type}", summary="▶️ Resume Specific Job Type")
+@router.post(
+    "/resume/{job_type}", 
+    summary="▶️ Resume Specific Job Type",
+    response_model=PauseResumeResponse,
+    description="Resume a specific type of background jobs that was previously paused."
+)
 async def resume_job_type(
-    job_type: str,
+    job_type: JobTypeEnum,
     current_user: models.User = Depends(get_current_admin)
 ):
     """
@@ -584,15 +587,8 @@ async def resume_job_type(
     - `quiz_generation` - Quiz creation
     - `all` - All job types
     """
-    valid_types = ["feed_generation", "youtube_transcription", "blog_scraping", "quiz_generation", "all"]
-    if job_type not in valid_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid job type. Valid types: {valid_types}"
-        )
-    
-    result = job_manager.resume_job_type(job_type)
-    logger.info(f"▶️ Admin {current_user.email} resumed {job_type} jobs")
+    result = job_manager.resume_job_type(job_type.value)
+    logger.info(f"▶️ Admin {current_user.email} resumed {job_type.value} jobs")
     return {
         "success": True,
         "timestamp": datetime.utcnow().isoformat(),
@@ -601,7 +597,12 @@ async def resume_job_type(
     }
 
 
-@router.post("/clear-state", summary="🧹 Clear Job Manager State")
+@router.post(
+    "/clear-state", 
+    summary="🧹 Clear Job Manager State",
+    response_model=ClearStateResponse,
+    description="Reset the job manager to a clean state. Use after stopping jobs to start fresh."
+)
 async def clear_job_state(
     current_user: models.User = Depends(get_current_admin)
 ):
