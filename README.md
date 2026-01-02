@@ -282,6 +282,25 @@ Radar_Python_backend/
 | **Bookmark**        | `/bookmark`        | Bookmark management         |
 | **Subcategory**     | `/subcategory`     | Subcategory management      |
 | **Scraping**        | `/scrape`          | Web scraping operations     |
+| **Job Manager**     | `/jobs`            | Background job control      |
+
+### 🛠️ Job Management (`/jobs`)
+
+Control background jobs and scheduled tasks (Admin only):
+
+| Method | Endpoint                          | Description                         |
+| ------ | --------------------------------- | ----------------------------------- |
+| `POST` | `/jobs/stop-all`                  | 🛑 Stop all running background jobs |
+| `POST` | `/jobs/resume-all`                | ▶️ Resume all jobs                  |
+| `GET`  | `/jobs/status`                    | 📊 Get current job status           |
+| `POST` | `/jobs/pause/{job_type}`          | ⏸️ Pause specific job type          |
+| `POST` | `/jobs/resume/{job_type}`         | ▶️ Resume specific job type         |
+| `POST` | `/jobs/clear-state`               | 🧹 Reset job manager state          |
+| `POST` | `/jobs/stop-scheduler`            | 🛑 Stop APScheduler (quiz updates)  |
+| `GET`  | `/jobs/running`                   | 📋 List all running jobs            |
+| `GET`  | `/jobs/db/transcription-jobs`     | 📺 Get transcription jobs from DB   |
+| `GET`  | `/jobs/db/scrape-jobs`            | 🕷️ Get scraping jobs from DB        |
+| `POST` | `/jobs/db/cancel-processing-jobs` | 🛑 Cancel all processing jobs in DB |
 
 ---
 

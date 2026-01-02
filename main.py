@@ -24,6 +24,7 @@ from onboarding_router import router as onboarding_router
 from bookmark_router import bookmark_router as bookmark_router
 from Subcategory_router import router as subcategory_router
 from Enhanced_Search import router as Enhanced_Search
+from job_manager import router as job_manager_router
 import traceback
 import sys
 import logging
@@ -765,6 +766,7 @@ app.include_router(publish_router)
 app.include_router(quiz_router)
 app.include_router(bookmark_router)
 app.include_router(Enhanced_Search)
+app.include_router(job_manager_router)
 
 if __name__ == "__main__":
     import uvicorn
