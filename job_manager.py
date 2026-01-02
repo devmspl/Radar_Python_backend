@@ -627,7 +627,11 @@ async def clear_job_state(
     }
 
 
-@router.post("/stop-scheduler", summary="🛑 Stop Quiz Scheduler")
+@router.post(
+    "/stop-scheduler", 
+    summary="🛑 Stop Quiz Scheduler",
+    description="Completely stop the APScheduler that handles automatic quiz updates."
+)
 async def stop_scheduler(
     current_user: models.User = Depends(get_current_admin)
 ):
@@ -659,7 +663,12 @@ async def stop_scheduler(
         }
 
 
-@router.get("/running", summary="📋 List Running Jobs")
+@router.get(
+    "/running", 
+    summary="📋 List Running Jobs",
+    response_model=RunningJobsResponse,
+    description="Get a detailed list of all currently running background jobs."
+)
 async def list_running_jobs(
     current_user: models.User = Depends(get_current_admin)
 ):
@@ -679,10 +688,14 @@ async def list_running_jobs(
 
 # ==================== Database Job Status ====================
 
-@router.get("/db/transcription-jobs", summary="📺 Get Transcription Jobs Status")
+@router.get(
+    "/db/transcription-jobs", 
+    summary="📺 Get Transcription Jobs Status",
+    description="Get status of YouTube transcription jobs from the database. Filter by status: queued, processing, completed, failed."
+)
 async def get_transcription_jobs_status(
-    status_filter: Optional[str] = None,
-    limit: int = 50,
+    status_filter: Optional[str] = Query(None, description="Filter by status: queued, processing, completed, failed"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of jobs to return"),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_admin)
 ):
